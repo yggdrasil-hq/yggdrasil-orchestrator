@@ -1,4 +1,4 @@
-# CLAUDE.md — Forge (Yggdrasil Orchestrator)
+# CLAUDE.md — Orchestrator
 
 > Canonical agent guide for this repo. `AGENTS.md` is a thin pointer to this
 > file. This repo is a **git submodule** of the Yggdrasil meta repo.
@@ -13,13 +13,13 @@
 
 ## What this repo is
 
-The Forge: Yggdrasil's stateless job executor. Receives a job spec from the
-Backend, provisions an ephemeral Docker container, runs the Pi coding agent,
+Yggdrasil's stateless job executor. Receives a job spec from the
+API, provisions an ephemeral Docker container, runs the Pi coding agent,
 streams events back, and tears down when done. Owns no durable state between runs.
 
-- **Role in Yggdrasil:** Forge (orchestrator)
+- **Role in Yggdrasil:** Orchestrator
 - **Stack:** Docker, Pi agent RPC/SDK integration (planned)
-- **Talks to:** Backend (job specs + streamed events), GitHub (clone, branch, PR via scoped token)
+- **Talks to:** API (job specs + streamed events), GitHub (clone, branch, PR via scoped token)
 
 ## Suite-wide context (up-links to the meta repo)
 

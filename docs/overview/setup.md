@@ -1,4 +1,4 @@
-# Forge — local setup
+# Orchestrator — local setup
 
 **Read this when:** you're setting up or running this component locally.
 

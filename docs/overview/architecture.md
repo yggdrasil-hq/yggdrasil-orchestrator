@@ -1,4 +1,4 @@
-# Forge — internal architecture
+# Orchestrator — internal architecture
 
 **Read this when:** you need to understand how this repo is structured internally
 (modules, layers, key directories).
