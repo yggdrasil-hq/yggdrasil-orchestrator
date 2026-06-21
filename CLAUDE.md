@@ -18,7 +18,7 @@ API, provisions an ephemeral Docker container, runs the Pi coding agent,
 streams events back, and tears down when done. Owns no durable state between runs.
 
 - **Role in Yggdrasil:** Orchestrator
-- **Stack:** Docker, Pi agent RPC/SDK integration (planned)
+- **Stack:** Go, Docker socket integration, Pi agent RPC/SDK (planned)
 - **Talks to:** API (job specs + streamed events), GitHub (clone, branch, PR via scoped token)
 
 ## Suite-wide context (up-links to the meta repo)

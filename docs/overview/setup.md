@@ -2,25 +2,32 @@
 
 **Read this when:** you're setting up or running this component locally.
 
-> TODO: fill in once the component is scaffolded.
+## Full stack (recommended)
 
-## Prerequisites
-
-> TODO (runtime versions, tooling)
-
-## Install & run
+From the meta repo root:
 
 ```bash
-# TODO
+./setup.sh
+docker compose -f deploy/docker-compose.dev.yml up --build orchestrator
+```
+
+Orchestrator edge: http://localhost:8080/orchestrator (via nginx). Requires Docker socket mount.
+
+## This repo only
+
+```bash
+cp .env.example .env
+go run ./cmd/server
+```
+
+Health: http://localhost:8080/health
+
+## Tests (CI parity)
+
+```bash
+docker compose -f docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from test
 ```
 
 ## Environment variables
 
-> TODO (and note: project-level env injection for containers is an open
-> question — see ../../../docs/roadmap/open-questions.md)
-
-## Tests
-
-```bash
-# TODO
-```
+See `.env.example`.

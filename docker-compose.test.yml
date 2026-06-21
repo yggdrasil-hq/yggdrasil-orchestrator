@@ -1,0 +1,7 @@
+name: yggdrasil-orchestrator-test
+
+services:
+  test:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.test
