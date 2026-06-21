@@ -6,4 +6,6 @@ COPY go.mod go.sum* ./
 RUN go mod download
 COPY . .
 
-CMD ["go", "test", "./..."]
+RUN chmod +x scripts/run-tests.sh
+
+CMD ["scripts/run-tests.sh"]
