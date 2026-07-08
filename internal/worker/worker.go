@@ -34,13 +34,28 @@ const (
 	defaultPlaceholderScript = "echo job $JOB_ID kind=$JOB_KIND; exit 0"
 )
 
+// modelEnvKeys are the per-project model config keys a job pod needs (ADR
+// 004) — stored as project_secrets rows, decrypted by FetchProjectSecrets,
+// and injected as plain job-pod env vars, same delivery path as the scoped
+// GitHub token. Only these three are ever copied into a job pod; the rest
+// of a project's secrets (if any) are not (that's the primary deployment's
+// concern, handled separately by runDeploy/EnsureProjectSecret).
+var modelEnvKeys = []string{"MODEL_BASE_URL", "MODEL_API_KEY", "MODEL_ID"}
+
 // Config configures a worker's poll loop.
 type Config struct {
 	WorkerID     string
 	PollInterval time.Duration
 
-	// PlaceholderImage/PlaceholderScript stand in for a real Pi agent run
-	// until pi.dev's RPC surface is defined (see docs/concepts/pi-agent.md).
+	// Images maps a job kind to a real agent-images image (ADR 004:
+	// yggdrasil-agent-images, resolved from SPEC_GRILL_IMAGE/
+	// FEATURE_BUILD_IMAGE/TEST_RUN_IMAGE). A kind absent from this map falls
+	// back to PlaceholderImage/PlaceholderScript below — lets a deployment
+	// keep working before agent-images has published real images anywhere.
+	Images map[queue.JobKind]string
+
+	// PlaceholderImage/PlaceholderScript stand in for a real Pi agent image,
+	// for any job kind not present in Images.
 	PlaceholderImage  string
 	PlaceholderScript string
 
@@ -118,8 +133,8 @@ func processOne(ctx context.Context, q *queue.Queue, clientset kubernetes.Interf
 
 // runInCluster executes a claimed job in the project's namespace (ADR 003):
 // `deploy` jobs apply the project's Helm chart to update its always-on
-// primary deployment (ADR 003 §9-13); every other kind runs as a real
-// Kubernetes Job via the placeholder-Pi-agent path (Phase 2).
+// primary deployment (ADR 003 §9-13); every other kind runs an agent-images
+// container (ADR 004) via runAgentJob.
 func runInCluster(ctx context.Context, clientset kubernetes.Interface, job *queue.Job, cfg Config) error {
 	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset, job.ProjectID)
 	if err != nil {
@@ -130,18 +145,68 @@ func runInCluster(ctx context.Context, clientset kubernetes.Interface, job *queu
 		return runDeploy(ctx, clientset, job.ProjectID, namespace, cfg)
 	}
 
+	return runAgentJob(ctx, clientset, job, namespace, cfg)
+}
+
+// runAgentJob runs a spec_grill/feature_build/test_run job as a Kubernetes
+// Job. It resolves which container image to use (a real agent-images image
+// per ADR 004 if configured for this job kind, else the placeholder dev
+// stand-in) and injects the project's model config (ADR 004: MODEL_BASE_URL/
+// MODEL_API_KEY/MODEL_ID, decrypted from project_secrets) as plain job-pod
+// env vars — the same delivery path already used for the scoped GitHub
+// token, not a Kubernetes Secret object.
+func runAgentJob(ctx context.Context, clientset kubernetes.Interface, job *queue.Job, namespace string, cfg Config) error {
+	env := map[string]string{
+		"JOB_ID":     job.ID,
+		"JOB_KIND":   string(job.Kind),
+		"PROJECT_ID": job.ProjectID,
+	}
+
+	secrets, err := cfg.APIClient.FetchProjectSecrets(ctx, job.ProjectID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch project secrets: %w", err)
+	}
+	for k, v := range filterModelEnv(secrets) {
+		env[k] = v
+	}
+
+	image, command := resolveAgentImage(cfg, job.Kind)
+
 	return k8s.RunJob(ctx, clientset, k8s.JobSpec{
-		Namespace: namespace,
-		Name:      "job-" + job.ID,
-		Image:     cfg.PlaceholderImage,
-		Command:   []string{"sh", "-c", cfg.PlaceholderScript},
-		Env: map[string]string{
-			"JOB_ID":     job.ID,
-			"JOB_KIND":   string(job.Kind),
-			"PROJECT_ID": job.ProjectID,
-		},
+		Namespace:        namespace,
+		Name:             "job-" + job.ID,
+		Image:            image,
+		Command:          command,
+		Env:              env,
 		RuntimeClassName: cfg.RuntimeClassName,
 	})
+}
+
+// resolveAgentImage returns the image to run for a job kind and the command
+// to run inside it. A kind with a configured real agent-images image (ADR
+// 004, cfg.Images) runs with no command override, so the image's own
+// ENTRYPOINT (agent-images' entrypoint.sh, which execs `pi --mode rpc`)
+// takes over. A kind with no configured image falls back to the placeholder
+// dev stand-in and its shell-script Command.
+func resolveAgentImage(cfg Config, kind queue.JobKind) (image string, command []string) {
+	if img, ok := cfg.Images[kind]; ok && img != "" {
+		return img, nil
+	}
+	return cfg.PlaceholderImage, []string{"sh", "-c", cfg.PlaceholderScript}
+}
+
+// filterModelEnv picks the per-project model config keys (ADR 004) out of a
+// project's full decrypted secrets map, so only those three ever land in a
+// job pod's env — not whatever else a project happens to store in
+// project_secrets.
+func filterModelEnv(secrets map[string]string) map[string]string {
+	env := make(map[string]string, len(modelEnvKeys))
+	for _, key := range modelEnvKeys {
+		if v, ok := secrets[key]; ok {
+			env[key] = v
+		}
+	}
+	return env
 }
 
 // runDeploy applies the project's Helm chart to its namespace via

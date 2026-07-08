@@ -58,6 +58,7 @@ func main() {
 	go worker.Run(ctx, q, clientset, worker.Config{
 		WorkerID:          id,
 		PollInterval:      resolvePollInterval(),
+		Images:            resolveAgentImages(),
 		PlaceholderImage:  os.Getenv("JOB_PLACEHOLDER_IMAGE"),
 		PlaceholderScript: os.Getenv("JOB_PLACEHOLDER_SCRIPT"),
 		RuntimeClassName:  resolveRuntimeClassName(),
@@ -130,6 +131,25 @@ func resolvePollInterval() time.Duration {
 		return 0
 	}
 	return d
+}
+
+// resolveAgentImages reads the per-job-kind agent-images image references
+// (ADR 004) — a kind whose env var is unset is simply absent from the map,
+// so worker.resolveAgentImage falls back to the placeholder dev stand-in for
+// that kind rather than failing startup. `deploy` has no entry: it never
+// runs Pi, it applies a Helm chart (ADR 003 §13).
+func resolveAgentImages() map[queue.JobKind]string {
+	images := map[queue.JobKind]string{}
+	if v := os.Getenv("SPEC_GRILL_IMAGE"); v != "" {
+		images[queue.KindSpecGrill] = v
+	}
+	if v := os.Getenv("FEATURE_BUILD_IMAGE"); v != "" {
+		images[queue.KindFeatureBuild] = v
+	}
+	if v := os.Getenv("TEST_RUN_IMAGE"); v != "" {
+		images[queue.KindTestRun] = v
+	}
+	return images
 }
 
 // resolveRuntimeClassName is nil unless the target cluster has a sandboxed

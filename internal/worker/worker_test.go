@@ -11,6 +11,7 @@ import (
 
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/apiclient"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/k8s"
+	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/queue"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
@@ -136,5 +137,79 @@ func TestRunDeploy_SurfacesSlugFetchError(t *testing.T) {
 	err = runDeploy(ctx, clientset, projectID, namespace, cfg)
 	if err == nil {
 		t.Fatal("expected runDeploy to return an error when the slug fetch fails, got nil")
+	}
+}
+
+// Proves a job kind with a configured agent-images image (ADR 004) runs
+// with no Command override, so the image's own ENTRYPOINT (pi --mode rpc)
+// takes over instead of the placeholder shell script.
+func TestResolveAgentImage_UsesConfiguredImageWithNoCommandOverride(t *testing.T) {
+	cfg := Config{
+		Images: map[queue.JobKind]string{
+			queue.KindSpecGrill: "registry.example.com/yggdrasil-agent-spec-grill:v1",
+		},
+		PlaceholderImage:  "busybox:1.36",
+		PlaceholderScript: "echo job $JOB_ID kind=$JOB_KIND; exit 0",
+	}
+
+	image, command := resolveAgentImage(cfg, queue.KindSpecGrill)
+	if image != "registry.example.com/yggdrasil-agent-spec-grill:v1" {
+		t.Fatalf("expected the configured spec_grill image, got %q", image)
+	}
+	if command != nil {
+		t.Fatalf("expected no command override for a real agent-images image, got %v", command)
+	}
+}
+
+// Proves a job kind absent from cfg.Images falls back to the placeholder
+// dev stand-in and its shell-script Command, rather than failing or running
+// with an empty image.
+func TestResolveAgentImage_FallsBackToPlaceholderWhenKindNotConfigured(t *testing.T) {
+	cfg := Config{
+		Images:            map[queue.JobKind]string{queue.KindSpecGrill: "registry.example.com/spec-grill:v1"},
+		PlaceholderImage:  "busybox:1.36",
+		PlaceholderScript: "echo job $JOB_ID kind=$JOB_KIND; exit 0",
+	}
+
+	image, command := resolveAgentImage(cfg, queue.KindFeatureBuild)
+	if image != "busybox:1.36" {
+		t.Fatalf("expected fallback to the placeholder image, got %q", image)
+	}
+	if len(command) != 3 || command[0] != "sh" || command[1] != "-c" {
+		t.Fatalf("expected the placeholder shell command, got %v", command)
+	}
+}
+
+// Proves only the three model config keys (ADR 004) are ever copied into a
+// job pod's env — an unrelated project secret must not leak into the
+// container just because it happened to be in project_secrets.
+func TestFilterModelEnv_OnlyCopiesModelKeys(t *testing.T) {
+	secrets := map[string]string{
+		"MODEL_BASE_URL": "https://api.example.com/v1",
+		"MODEL_API_KEY":  "sk-test",
+		"MODEL_ID":       "gpt-test",
+		"DATABASE_URL":   "postgres://should-not-leak",
+	}
+
+	env := filterModelEnv(secrets)
+
+	if len(env) != 3 {
+		t.Fatalf("expected exactly 3 keys, got %v", env)
+	}
+	if env["MODEL_BASE_URL"] != "https://api.example.com/v1" || env["MODEL_API_KEY"] != "sk-test" || env["MODEL_ID"] != "gpt-test" {
+		t.Fatalf("expected model keys to be copied verbatim, got %v", env)
+	}
+	if _, leaked := env["DATABASE_URL"]; leaked {
+		t.Fatal("expected DATABASE_URL not to be copied into job-pod env")
+	}
+}
+
+// Proves a project with no model config set (e.g. hasn't configured it yet)
+// doesn't error or inject empty-string env vars — job pods should be able
+// to fall back to Pi's own default model resolution.
+func TestFilterModelEnv_MissingKeysAreOmittedNotEmptyString(t *testing.T) {
+	env := filterModelEnv(map[string]string{})
+	if len(env) != 0 {
+		t.Fatalf("expected no keys when the project has no model config, got %v", env)
 	}
 }
