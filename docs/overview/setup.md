@@ -3,36 +3,43 @@
 **Read this when:** you're setting up or running this component locally.
 
 > Per ADR 003 (`../../docs/adr/003-orchestrator-kubernetes.md`), the
-> Orchestrator targets a Kubernetes cluster, not a Docker socket. Locally
-> that means you need *some* reachable cluster — this doc uses a throwaway
-> `k3d` cluster. Bundling a cluster automatically for self-hosted installs is
-> a tracked follow-up (open question #1's resolution in ADR 003), not yet
-> wired into this dev flow.
+> Orchestrator targets a Kubernetes cluster, not a Docker socket.
+> `deploy/docker-compose.dev.yml` bundles a disposable single-node **k3s**
+> cluster for this (services `k3s` + `k3s-kubeconfig`) — no separate cluster
+> setup needed for the full-stack dev flow below. Bundling a cluster for
+> *self-hosted installs* (as opposed to this dev flow) is a separate, still
+> tracked follow-up (ADR 003 §3).
 
-## One-time: local Kubernetes cluster
+## Local Kubernetes cluster (automatic)
 
-```bash
-brew install k3d kubectl   # or your platform's equivalent
-k3d cluster create yggdrasil-dev --network yggdrasil-dev_default
-mkdir -p deploy/.kube
-k3d kubeconfig write yggdrasil-dev --output deploy/.kube/config-host
-# The container reaches the cluster over the Docker network, not localhost:
-sed 's#server: https://0.0.0.0:[0-9]*#server: https://k3d-yggdrasil-dev-serverlb:6443#' \
-  deploy/.kube/config-host > deploy/.kube/config-container
-```
+`docker compose -f deploy/docker-compose.dev.yml up` brings up a `k3s`
+service (the cluster) and a `k3s-kubeconfig` one-shot service that rewrites
+k3s's self-signed kubeconfig into two forms:
 
-`deploy/docker-compose.dev.yml` mounts `deploy/.kube/config-container` into
-the orchestrator container and points `KUBECONFIG` at it — this file is
-gitignored (`deploy/.gitignore`), regenerate it after recreating the cluster.
+- `orchestrator_kubeconfig` (a Docker volume) — reachable as `k3s:6443`,
+  mounted into the `orchestrator` container and pointed to by `KUBECONFIG`.
+- `deploy/.kube/config-host` — reachable as `localhost:${DEV_K3S_PORT:-6443}`,
+  for your own `kubectl`/Helm from the host (e.g. the cert-manager step
+  below). Gitignored (`deploy/.gitignore`); regenerated on every `up`.
+
+Cluster state (installed charts, images pulled, etc.) persists in the
+`k3s_data` volume across restarts. For a clean cluster: `docker compose -f
+deploy/docker-compose.dev.yml down -v`.
+
+To point the Orchestrator at a different cluster instead (e.g. one you
+already run), remove the `k3s`/`k3s-kubeconfig` services and the
+`orchestrator` service's dependency on them, and mount/set `KUBECONFIG` to
+your own.
 
 ## One-time: ingress + TLS (cert-manager)
 
 Per ADR 003 §15, primary deployments are reached through an in-cluster
-ingress controller + cert-manager. `k3d` already bundles **Traefik** as its
+ingress controller + cert-manager. k3s already bundles **Traefik** as its
 default ingress controller (`kubectl get ingressclass` shows `traefik`) — no
 separate install needed locally. cert-manager itself isn't bundled:
 
 ```bash
+export KUBECONFIG=deploy/.kube/config-host
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
 kubectl wait --for=condition=Available --timeout=120s \
   deployment/cert-manager deployment/cert-manager-webhook deployment/cert-manager-cainjector \
@@ -70,16 +77,19 @@ From the meta repo root:
 docker compose -f deploy/docker-compose.dev.yml up --build orchestrator
 ```
 
-Orchestrator edge: http://localhost:8080/orchestrator (via nginx). Requires
-the local cluster above (or `KUBECONFIG`/in-cluster config pointing at some
-other reachable cluster) and Postgres (`DATABASE_URL`, set automatically by
-the root compose file).
+Orchestrator edge: http://localhost:8080/orchestrator (via nginx). The `k3s`
+cluster and Postgres (`DATABASE_URL`) come up automatically as compose
+dependencies — no separate cluster setup needed.
 
 ## This repo only
 
+Bring up just the bundled cluster, then run the Orchestrator binary directly
+against it:
+
 ```bash
 cp .env.example .env
-export KUBECONFIG=$(k3d kubeconfig write yggdrasil-dev)  # or your own cluster
+docker compose -f ../deploy/docker-compose.dev.yml up -d k3s-kubeconfig
+export KUBECONFIG=../deploy/.kube/config-host
 go run ./cmd/server
 ```
 
