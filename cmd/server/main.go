@@ -62,6 +62,9 @@ func main() {
 		PlaceholderScript: os.Getenv("JOB_PLACEHOLDER_SCRIPT"),
 		RuntimeClassName:  resolveRuntimeClassName(),
 		APIClient:         apiClient,
+		AppsDomain:        resolveWithDefault("APPS_BASE_DOMAIN", "yggdrasil.local"),
+		IngressClassName:  resolveWithDefault("INGRESS_CLASS_NAME", "traefik"),
+		CertIssuerName:    resolveWithDefault("CERT_ISSUER_NAME", "selfsigned-issuer"),
 	})
 
 	mux := http.NewServeMux()
@@ -138,4 +141,15 @@ func resolveRuntimeClassName() *string {
 		return &name
 	}
 	return nil
+}
+
+// resolveWithDefault reads an env var, falling back to a default when unset
+// — used for the ingress class/domain/cert-issuer values that are meant to
+// differ between a local k3d dev cluster and a self-hosted/managed one
+// (config, not code).
+func resolveWithDefault(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }

@@ -131,3 +131,39 @@ func TestFetchProjectChart_ReturnsErrorOnOtherNon200(t *testing.T) {
 		t.Fatal("expected an error for a 500 response, got nil")
 	}
 }
+
+func TestFetchProjectMetadata_ParsesSlug(t *testing.T) {
+	var gotPath string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"slug": "acme-web"})
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	slug, err := client.FetchProjectMetadata(context.Background(), "proj-123")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if gotPath != "/internal/projects/proj-123/slug" {
+		t.Fatalf("expected path %q, got %q", "/internal/projects/proj-123/slug", gotPath)
+	}
+	if slug != "acme-web" {
+		t.Fatalf("expected slug %q, got %q", "acme-web", slug)
+	}
+}
+
+func TestFetchProjectMetadata_ReturnsErrorOnNon200(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	_, err := client.FetchProjectMetadata(context.Background(), "proj-123")
+	if err == nil {
+		t.Fatal("expected an error for a 404 response, got nil")
+	}
+}

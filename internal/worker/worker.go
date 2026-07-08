@@ -52,6 +52,15 @@ type Config struct {
 	// APIClient fetches decrypted project secrets at deploy time (ADR 003
 	// §16). Required for `deploy` jobs.
 	APIClient *apiclient.Client
+
+	// AppsDomain/IngressClassName/CertIssuerName build the primary
+	// deployment's Ingress (ADR 003 §15: <project-slug>.apps.<domain>).
+	// Config values, not code, are what change between a local k3d dev
+	// cluster (Traefik, self-signed cert) and a self-hosted/managed cluster
+	// (ingress-nginx, a real ACME ClusterIssuer).
+	AppsDomain       string
+	IngressClassName string
+	CertIssuerName   string
 }
 
 // Run polls the queue on an interval, claiming at most one job per tick, and
@@ -142,7 +151,9 @@ func runInCluster(ctx context.Context, clientset kubernetes.Interface, job *queu
 // embedded placeholder chart so deploys never hard-fail on a missing chart.
 // Project secrets (ADR 003 §16) are fetched from the API and pushed into a
 // dedicated Kubernetes Secret before the chart is applied, so the
-// Deployment's envFrom reference resolves on first rollout.
+// Deployment's envFrom reference resolves on first rollout. Once the
+// Deployment/Service exist, an Ingress (ADR 003 §15) makes the primary
+// deployment reachable at <project-slug>.apps.<domain>.
 func runDeploy(ctx context.Context, clientset kubernetes.Interface, projectID, namespace string, cfg Config) error {
 	secrets, err := cfg.APIClient.FetchProjectSecrets(ctx, projectID)
 	if err != nil {
@@ -162,7 +173,22 @@ func runDeploy(ctx context.Context, clientset kubernetes.Interface, projectID, n
 		return fmt.Errorf("failed to initialize helm: %w", err)
 	}
 	values := map[string]interface{}{"secretsChecksum": secretsChecksum(secrets)}
-	return helm.Deploy(ctx, helmCfg, namespace, primaryReleaseName, chrt, values)
+	if err := helm.Deploy(ctx, helmCfg, namespace, primaryReleaseName, chrt, values); err != nil {
+		return err
+	}
+
+	slug, err := cfg.APIClient.FetchProjectMetadata(ctx, projectID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch project metadata: %w", err)
+	}
+	host := fmt.Sprintf("%s.apps.%s", slug, cfg.AppsDomain)
+	if err := k8s.EnsureProjectIngress(
+		ctx, clientset, namespace, host, primaryReleaseName, 80,
+		cfg.IngressClassName, "primary-tls", cfg.CertIssuerName,
+	); err != nil {
+		return fmt.Errorf("failed to ensure ingress: %w", err)
+	}
+	return nil
 }
 
 // resolveChart fetches the project's scaffolded chart (Phase 3c), falling

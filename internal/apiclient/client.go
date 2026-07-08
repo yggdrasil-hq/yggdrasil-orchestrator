@@ -93,3 +93,34 @@ func (c *Client) FetchProjectChart(ctx context.Context, projectID string) (files
 	}
 	return parsed.Files, true, nil
 }
+
+type slugResponse struct {
+	Slug string `json:"slug"`
+}
+
+// FetchProjectMetadata fetches a project's slug, used to build its primary
+// deployment's ingress host (ADR 003 §15: <project-slug>.apps.<domain>).
+func (c *Client) FetchProjectMetadata(ctx context.Context, projectID string) (slug string, err error) {
+	url := fmt.Sprintf("%s/internal/projects/%s/slug", c.baseURL, projectID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("API returned status %d fetching slug for project %s", resp.StatusCode, projectID)
+	}
+
+	var parsed slugResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return "", fmt.Errorf("failed to decode slug response: %w", err)
+	}
+	return parsed.Slug, nil
+}
