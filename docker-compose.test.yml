@@ -1,9 +1,26 @@
 name: yggdrasil-orchestrator-test
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: yggdrasil
+      POSTGRES_PASSWORD: yggdrasil
+      POSTGRES_DB: yggdrasil
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yggdrasil"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   test:
     build:
       context: .
       dockerfile: deploy/Dockerfile.test
+    environment:
+      DATABASE_URL: postgresql://yggdrasil:yggdrasil@postgres:5432/yggdrasil
     volumes:
       - ./test-results:/app/test-results
+    depends_on:
+      postgres:
+        condition: service_healthy

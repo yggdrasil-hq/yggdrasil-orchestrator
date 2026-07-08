@@ -13,13 +13,20 @@
 
 ## What this repo is
 
-Yggdrasil's stateless job executor. Receives a job spec from the
-API, provisions an ephemeral Docker container, runs the Pi coding agent,
-streams events back, and tears down when done. Owns no durable state between runs.
+Yggdrasil's Kubernetes-based job executor and project host. Consumes job/deploy
+specs from a Postgres-backed queue fed by the API, runs ephemeral Pods/Jobs for
+agent runs (Pi coding agent) in a project's namespace, and maintains each
+project's always-on primary deployment via Helm. Owns no durable *platform*
+state — durable *project* state (primary deployment data) lives in the target
+Kubernetes cluster, not in the Orchestrator process. See ADR 003
+(`../docs/adr/003-orchestrator-kubernetes.md`) for the full design.
 
 - **Role in Yggdrasil:** Orchestrator
-- **Stack:** Go, Docker socket integration, Pi agent RPC/SDK (planned)
-- **Talks to:** API (job specs + streamed events), GitHub (clone, branch, PR via scoped token)
+- **Stack:** Go, Kubernetes client-go, Helm Go SDK, Postgres-backed job queue,
+  Pi agent RPC/SDK (planned)
+- **Talks to:** API (Postgres-backed job/deploy queue + streamed events),
+  GitHub (clone, branch, PR via scoped token), target Kubernetes cluster,
+  container registry
 
 ## Suite-wide context (up-links to the meta repo)
 
