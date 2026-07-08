@@ -1,0 +1,13 @@
+replicaCount: 1
+
+image:
+  repository: nginxdemos/hello
+  tag: latest
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi

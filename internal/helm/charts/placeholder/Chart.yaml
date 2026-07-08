@@ -1,0 +1,10 @@
+apiVersion: v2
+name: placeholder
+description: >-
+  Stand-in primary-deployment chart (ADR 003 Phase 3). Real per-project charts
+  scaffolded into each project's primary repo are tracked as Phase 3c; this
+  chart exists only to prove the "deploy job -> helm upgrade --install ->
+  running primary deployment" mechanics independently of that.
+type: application
+version: 0.1.0
+appVersion: "1.0"

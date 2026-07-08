@@ -19,14 +19,17 @@ import (
 // falling back to KUBECONFIG / the default kubeconfig path for local
 // development.
 func NewClient() (*kubernetes.Clientset, error) {
-	config, err := restConfig()
+	config, err := RESTConfig()
 	if err != nil {
 		return nil, err
 	}
 	return kubernetes.NewForConfig(config)
 }
 
-func restConfig() (*rest.Config, error) {
+// RESTConfig resolves the REST config for the Orchestrator's single target
+// cluster, for callers (e.g. internal/helm) that need it directly rather
+// than through a typed Kubernetes clientset.
+func RESTConfig() (*rest.Config, error) {
 	if config, err := rest.InClusterConfig(); err == nil {
 		return config, nil
 	}

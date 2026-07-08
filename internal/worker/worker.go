@@ -3,14 +3,25 @@ package worker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
+	"sort"
 	"time"
 
+	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/apiclient"
+	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/helm"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/k8s"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/queue"
 	"k8s.io/client-go/kubernetes"
 )
+
+// primaryReleaseName is constant within a project's own namespace — no
+// collision risk since each project already gets its own namespace
+// (ADR 003 §5), and each project has exactly one always-on primary
+// deployment (ADR 003 §9).
+const primaryReleaseName = "primary"
 
 const (
 	defaultPollInterval     = 2 * time.Second
@@ -36,6 +47,10 @@ type Config struct {
 	// runtime (gVisor/Kata, ADR 003 §6) installed — not available on every
 	// cluster (e.g. a local k3d dev cluster).
 	RuntimeClassName *string
+
+	// APIClient fetches decrypted project secrets at deploy time (ADR 003
+	// §16). Required for `deploy` jobs.
+	APIClient *apiclient.Client
 }
 
 // Run polls the queue on an interval, claiming at most one job per tick, and
@@ -91,12 +106,18 @@ func processOne(ctx context.Context, q *queue.Queue, clientset kubernetes.Interf
 	}
 }
 
-// runInCluster executes a claimed job as a real Kubernetes Job in the
-// project's namespace (ADR 003).
+// runInCluster executes a claimed job in the project's namespace (ADR 003):
+// `deploy` jobs apply the project's Helm chart to update its always-on
+// primary deployment (ADR 003 §9-13); every other kind runs as a real
+// Kubernetes Job via the placeholder-Pi-agent path (Phase 2).
 func runInCluster(ctx context.Context, clientset kubernetes.Interface, job *queue.Job, cfg Config) error {
 	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset, job.ProjectID)
 	if err != nil {
 		return fmt.Errorf("failed to provision namespace: %w", err)
+	}
+
+	if job.Kind == queue.KindDeploy {
+		return runDeploy(ctx, clientset, job.ProjectID, namespace, cfg)
 	}
 
 	return k8s.RunJob(ctx, clientset, k8s.JobSpec{
@@ -111,4 +132,48 @@ func runInCluster(ctx context.Context, clientset kubernetes.Interface, job *queu
 		},
 		RuntimeClassName: cfg.RuntimeClassName,
 	})
+}
+
+// runDeploy applies the project's Helm chart to its namespace via
+// `helm upgrade --install` (ADR 003 §13). It uses a placeholder chart
+// bundled in the Orchestrator (internal/helm) until per-project charts are
+// scaffolded into project repos (tracked as Phase 3c). Project secrets
+// (ADR 003 §16) are fetched from the API and pushed into a dedicated
+// Kubernetes Secret before the chart is applied, so the Deployment's
+// envFrom reference resolves on first rollout.
+func runDeploy(ctx context.Context, clientset kubernetes.Interface, projectID, namespace string, cfg Config) error {
+	secrets, err := cfg.APIClient.FetchProjectSecrets(ctx, projectID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch project secrets: %w", err)
+	}
+	if err := k8s.EnsureProjectSecret(ctx, clientset, namespace, secrets); err != nil {
+		return fmt.Errorf("failed to push project secrets: %w", err)
+	}
+
+	helmCfg, err := helm.NewConfiguration(namespace)
+	if err != nil {
+		return fmt.Errorf("failed to initialize helm: %w", err)
+	}
+	values := map[string]interface{}{"secretsChecksum": secretsChecksum(secrets)}
+	return helm.Deploy(ctx, helmCfg, namespace, primaryReleaseName, values)
+}
+
+// secretsChecksum hashes a project's secrets deterministically (sorted
+// keys) so the chart's pod template annotation changes whenever secret
+// *content* changes, forcing a rollout even when nothing else did.
+func secretsChecksum(secrets map[string]string) string {
+	keys := make([]string, 0, len(secrets))
+	for k := range secrets {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	h := sha256.New()
+	for _, k := range keys {
+		h.Write([]byte(k))
+		h.Write([]byte{0})
+		h.Write([]byte(secrets[k]))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }

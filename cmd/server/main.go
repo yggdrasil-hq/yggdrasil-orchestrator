@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/apiclient"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/k8s"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/queue"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/worker"
@@ -42,6 +43,16 @@ func main() {
 		log.Fatalf("failed to build Kubernetes client: %v", err)
 	}
 
+	apiInternalURL := os.Getenv("API_INTERNAL_URL")
+	if apiInternalURL == "" {
+		log.Fatal("API_INTERNAL_URL is required")
+	}
+	internalAPIToken := os.Getenv("INTERNAL_API_TOKEN")
+	if internalAPIToken == "" {
+		log.Fatal("INTERNAL_API_TOKEN is required")
+	}
+	apiClient := apiclient.New(apiInternalURL, internalAPIToken)
+
 	id := resolveWorkerID()
 	q := queue.New(pool)
 	go worker.Run(ctx, q, clientset, worker.Config{
@@ -50,6 +61,7 @@ func main() {
 		PlaceholderImage:  os.Getenv("JOB_PLACEHOLDER_IMAGE"),
 		PlaceholderScript: os.Getenv("JOB_PLACEHOLDER_SCRIPT"),
 		RuntimeClassName:  resolveRuntimeClassName(),
+		APIClient:         apiClient,
 	})
 
 	mux := http.NewServeMux()

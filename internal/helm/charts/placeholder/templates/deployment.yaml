@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: yggdrasil-orchestrator
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Release.Name }}
+      annotations:
+        # Forces a rollout when project-env's *content* changes even if
+        # nothing else in the chart did — Kubernetes doesn't restart Pods
+        # just because a referenced Secret was updated (envFrom is read once
+        # at container start).
+        checksum/project-env: {{ .Values.secretsChecksum | default "" | quote }}
+    spec:
+      containers:
+        - name: app
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - containerPort: 80
+          # Name must match k8s.ProjectSecretName (internal/k8s/secret.go).
+          envFrom:
+            - secretRef:
+                name: project-env
+                optional: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
