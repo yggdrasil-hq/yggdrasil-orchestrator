@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/k8s"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/queue"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/worker"
 )
@@ -36,9 +37,20 @@ func main() {
 	}
 	defer pool.Close()
 
+	clientset, err := k8s.NewClient()
+	if err != nil {
+		log.Fatalf("failed to build Kubernetes client: %v", err)
+	}
+
 	id := resolveWorkerID()
 	q := queue.New(pool)
-	go worker.Run(ctx, q, id, resolvePollInterval())
+	go worker.Run(ctx, q, clientset, worker.Config{
+		WorkerID:          id,
+		PollInterval:      resolvePollInterval(),
+		PlaceholderImage:  os.Getenv("JOB_PLACEHOLDER_IMAGE"),
+		PlaceholderScript: os.Getenv("JOB_PLACEHOLDER_SCRIPT"),
+		RuntimeClassName:  resolveRuntimeClassName(),
+	})
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
@@ -103,4 +115,15 @@ func resolvePollInterval() time.Duration {
 		return 0
 	}
 	return d
+}
+
+// resolveRuntimeClassName is nil unless the target cluster has a sandboxed
+// runtime (gVisor/Kata, ADR 003 §6) installed and configured via
+// JOB_RUNTIME_CLASS — not every cluster (e.g. a local k3d dev cluster) has
+// one available.
+func resolveRuntimeClassName() *string {
+	if name := os.Getenv("JOB_RUNTIME_CLASS"); name != "" {
+		return &name
+	}
+	return nil
 }
