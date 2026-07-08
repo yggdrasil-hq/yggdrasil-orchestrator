@@ -69,3 +69,65 @@ func TestFetchProjectSecrets_EmptySecretsIsNotAnError(t *testing.T) {
 		t.Fatalf("expected empty secrets map, got: %v", secrets)
 	}
 }
+
+func TestFetchProjectChart_FoundParsesFiles(t *testing.T) {
+	var gotPath string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"files": map[string]string{
+				"Chart.yaml": "apiVersion: v2\nname: primary\n",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	files, found, err := client.FetchProjectChart(context.Background(), "proj-123")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true")
+	}
+	if gotPath != "/internal/projects/proj-123/chart" {
+		t.Fatalf("expected path %q, got %q", "/internal/projects/proj-123/chart", gotPath)
+	}
+	if files["Chart.yaml"] == "" {
+		t.Fatalf("expected Chart.yaml content to be parsed, got: %v", files)
+	}
+}
+
+func TestFetchProjectChart_NotFoundIsNotAnError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	files, found, err := client.FetchProjectChart(context.Background(), "proj-123")
+	if err != nil {
+		t.Fatalf("expected no error for a 404, got: %v", err)
+	}
+	if found {
+		t.Fatal("expected found=false")
+	}
+	if files != nil {
+		t.Fatalf("expected nil files, got: %v", files)
+	}
+}
+
+func TestFetchProjectChart_ReturnsErrorOnOtherNon200(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	_, _, err := client.FetchProjectChart(context.Background(), "proj-123")
+	if err == nil {
+		t.Fatal("expected an error for a 500 response, got nil")
+	}
+}

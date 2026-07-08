@@ -14,6 +14,7 @@ import (
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/helm"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/k8s"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/queue"
+	"helm.sh/helm/v3/pkg/chart"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -135,12 +136,13 @@ func runInCluster(ctx context.Context, clientset kubernetes.Interface, job *queu
 }
 
 // runDeploy applies the project's Helm chart to its namespace via
-// `helm upgrade --install` (ADR 003 §13). It uses a placeholder chart
-// bundled in the Orchestrator (internal/helm) until per-project charts are
-// scaffolded into project repos (tracked as Phase 3c). Project secrets
-// (ADR 003 §16) are fetched from the API and pushed into a dedicated
-// Kubernetes Secret before the chart is applied, so the Deployment's
-// envFrom reference resolves on first rollout.
+// `helm upgrade --install` (ADR 003 §13). It fetches the project's real
+// chart scaffolded into its primary repo (Phase 3c); if none is scaffolded
+// yet (old project, or scaffold failed), it falls back to the Orchestrator's
+// embedded placeholder chart so deploys never hard-fail on a missing chart.
+// Project secrets (ADR 003 §16) are fetched from the API and pushed into a
+// dedicated Kubernetes Secret before the chart is applied, so the
+// Deployment's envFrom reference resolves on first rollout.
 func runDeploy(ctx context.Context, clientset kubernetes.Interface, projectID, namespace string, cfg Config) error {
 	secrets, err := cfg.APIClient.FetchProjectSecrets(ctx, projectID)
 	if err != nil {
@@ -150,12 +152,40 @@ func runDeploy(ctx context.Context, clientset kubernetes.Interface, projectID, n
 		return fmt.Errorf("failed to push project secrets: %w", err)
 	}
 
+	chrt, err := resolveChart(ctx, cfg, projectID)
+	if err != nil {
+		return err
+	}
+
 	helmCfg, err := helm.NewConfiguration(namespace)
 	if err != nil {
 		return fmt.Errorf("failed to initialize helm: %w", err)
 	}
 	values := map[string]interface{}{"secretsChecksum": secretsChecksum(secrets)}
-	return helm.Deploy(ctx, helmCfg, namespace, primaryReleaseName, values)
+	return helm.Deploy(ctx, helmCfg, namespace, primaryReleaseName, chrt, values)
+}
+
+// resolveChart fetches the project's scaffolded chart (Phase 3c), falling
+// back to the embedded placeholder if the project has none yet.
+func resolveChart(ctx context.Context, cfg Config, projectID string) (*chart.Chart, error) {
+	files, found, err := cfg.APIClient.FetchProjectChart(ctx, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch project chart: %w", err)
+	}
+	if !found {
+		log.Printf("project %s has no scaffolded chart yet; falling back to placeholder", projectID)
+		return helm.LoadPlaceholderChart()
+	}
+
+	byteFiles := make(map[string][]byte, len(files))
+	for path, content := range files {
+		byteFiles[path] = []byte(content)
+	}
+	chrt, err := helm.LoadChartFromFiles(byteFiles)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load project %s's scaffolded chart: %w", projectID, err)
+	}
+	return chrt, nil
 }
 
 // secretsChecksum hashes a project's secrets deterministically (sorted

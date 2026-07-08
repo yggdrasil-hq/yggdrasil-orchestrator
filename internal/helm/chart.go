@@ -10,12 +10,10 @@ import (
 	"helm.sh/helm/v3/pkg/chart/loader"
 )
 
-// The Phase 3 (ADR 003) stand-in for a project's real, per-project Helm
-// chart — that chart is scaffolded into the project's primary repo during
-// project_init, which isn't built yet (tracked as Phase 3c). This lets the
-// Orchestrator prove "deploy job -> helm upgrade --install -> running
-// primary deployment" mechanically, independent of where the chart comes
-// from.
+// A fallback for projects with no chart scaffolded yet (Phase 3c scaffolds
+// a real chart into each project's primary repo during project creation;
+// this stands in when that hasn't happened — an old project, or a failed
+// scaffold) — so deploys never hard-fail due to a missing chart.
 //
 //go:embed charts/placeholder
 var placeholderChartFS embed.FS
@@ -23,7 +21,7 @@ var placeholderChartFS embed.FS
 const placeholderChartRoot = "charts/placeholder"
 
 func loadPlaceholderChart() (*chart.Chart, error) {
-	var files []*loader.BufferedFile
+	files := make(map[string][]byte)
 	err := fs.WalkDir(placeholderChartFS, placeholderChartRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -36,16 +34,33 @@ func loadPlaceholderChart() (*chart.Chart, error) {
 			return err
 		}
 		relPath := strings.TrimPrefix(path, placeholderChartRoot+"/")
-		files = append(files, &loader.BufferedFile{Name: relPath, Data: data})
+		files[relPath] = data
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to read embedded placeholder chart: %w", err)
 	}
 
-	c, err := loader.LoadFiles(files)
+	c, err := LoadChartFromFiles(files)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load embedded placeholder chart: %w", err)
+	}
+	return c, nil
+}
+
+// LoadChartFromFiles builds a Helm chart from an in-memory file map keyed
+// by path relative to the chart root (e.g. "Chart.yaml",
+// "templates/deployment.yaml") — shared by the embedded placeholder loader
+// above and the real per-project chart fetched via apiclient.FetchProjectChart.
+func LoadChartFromFiles(files map[string][]byte) (*chart.Chart, error) {
+	bufferedFiles := make([]*loader.BufferedFile, 0, len(files))
+	for name, data := range files {
+		bufferedFiles = append(bufferedFiles, &loader.BufferedFile{Name: name, Data: data})
+	}
+
+	c, err := loader.LoadFiles(bufferedFiles)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load chart: %w", err)
 	}
 	return c, nil
 }

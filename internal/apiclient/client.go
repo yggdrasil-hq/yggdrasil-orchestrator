@@ -56,3 +56,40 @@ func (c *Client) FetchProjectSecrets(ctx context.Context, projectID string) (map
 	}
 	return parsed.Secrets, nil
 }
+
+type chartResponse struct {
+	Files map[string]string `json:"files"`
+}
+
+// FetchProjectChart fetches a project's scaffolded Helm chart (ADR 003
+// §12) — files keyed by path relative to the chart root (e.g.
+// "Chart.yaml", "templates/deployment.yaml"). found is false (not an
+// error) if the project has no chart scaffolded yet, so callers can fall
+// back to the Orchestrator's embedded placeholder chart.
+func (c *Client) FetchProjectChart(ctx context.Context, projectID string) (files map[string]string, found bool, err error) {
+	url := fmt.Sprintf("%s/internal/projects/%s/chart", c.baseURL, projectID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, false, fmt.Errorf("API returned status %d fetching chart for project %s", resp.StatusCode, projectID)
+	}
+
+	var parsed chartResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, false, fmt.Errorf("failed to decode chart response: %w", err)
+	}
+	return parsed.Files, true, nil
+}
