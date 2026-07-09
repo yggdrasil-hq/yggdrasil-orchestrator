@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/apiclient"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/k8s"
+	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/messages"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/queue"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/worker"
 )
@@ -42,6 +44,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to build Kubernetes client: %v", err)
 	}
+	restConfig, err := k8s.RESTConfig()
+	if err != nil {
+		log.Fatalf("failed to build Kubernetes REST config: %v", err)
+	}
 
 	apiInternalURL := os.Getenv("API_INTERNAL_URL")
 	if apiInternalURL == "" {
@@ -55,14 +61,18 @@ func main() {
 
 	id := resolveWorkerID()
 	q := queue.New(pool)
+	msgs := messages.New(pool)
 	go worker.Run(ctx, q, clientset, worker.Config{
 		WorkerID:          id,
 		PollInterval:      resolvePollInterval(),
+		MaxConcurrentJobs: resolveMaxConcurrentJobs(),
 		Images:            resolveAgentImages(),
 		PlaceholderImage:  os.Getenv("JOB_PLACEHOLDER_IMAGE"),
 		PlaceholderScript: os.Getenv("JOB_PLACEHOLDER_SCRIPT"),
 		RuntimeClassName:  resolveRuntimeClassName(),
 		APIClient:         apiClient,
+		RESTConfig:        restConfig,
+		Messages:          msgs,
 		AppsDomain:        resolveWithDefault("APPS_BASE_DOMAIN", "yggdrasil.local"),
 		IngressClassName:  resolveWithDefault("INGRESS_CLASS_NAME", "traefik"),
 		CertIssuerName:    resolveWithDefault("CERT_ISSUER_NAME", "selfsigned-issuer"),
@@ -131,6 +141,22 @@ func resolvePollInterval() time.Duration {
 		return 0
 	}
 	return d
+}
+
+// resolveMaxConcurrentJobs reads how many jobs this replica may run at once
+// (ADR 006 item 1) — unset or invalid falls back to worker.Run's own
+// default rather than failing startup.
+func resolveMaxConcurrentJobs() int {
+	raw := os.Getenv("MAX_CONCURRENT_JOBS")
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		log.Printf("invalid MAX_CONCURRENT_JOBS %q, ignoring: %v", raw, err)
+		return 0
+	}
+	return n
 }
 
 // resolveAgentImages reads the per-job-kind agent-images image references

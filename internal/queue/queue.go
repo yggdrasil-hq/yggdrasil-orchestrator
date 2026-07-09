@@ -7,6 +7,7 @@ package queue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -86,15 +87,24 @@ func (q *Queue) Claim(ctx context.Context, workerID string) (*Job, error) {
 	return &j, nil
 }
 
-// Complete marks a claimed job as successfully finished.
+// Complete marks a claimed job as successfully finished. Guarded to only
+// transition from 'running': a job the API already marked 'cancelled'
+// (WatchCancellation, below) must not be silently flipped back to
+// 'completed' by a session that was already mid-teardown when the
+// cancellation landed.
 func (q *Queue) Complete(ctx context.Context, id string) error {
 	_, err := q.pool.Exec(ctx, `
-		UPDATE jobs SET status = 'completed', completed_at = now() WHERE id = $1
+		UPDATE jobs SET status = 'completed', completed_at = now()
+		WHERE id = $1 AND status = 'running'
 	`, id)
 	return err
 }
 
-// Fail marks a claimed job as failed and records the cause.
+// Fail marks a claimed job as failed and records the cause. Guarded to only
+// transition from 'running', for the same reason as Complete — a cancelled
+// job's own session unwinding (via ctx cancellation) surfaces as an error
+// here too, and must not overwrite the 'cancelled' status the API already
+// recorded.
 func (q *Queue) Fail(ctx context.Context, id string, cause error) error {
 	_, err := q.pool.Exec(ctx, `
 		UPDATE jobs
@@ -102,7 +112,51 @@ func (q *Queue) Fail(ctx context.Context, id string, cause error) error {
 		    completed_at = now(),
 		    attempts = attempts + 1,
 		    last_error = $2
-		WHERE id = $1
+		WHERE id = $1 AND status = 'running'
 	`, id, cause.Error())
 	return err
+}
+
+// WatchCancellation blocks until jobID's job is cancelled (status set to
+// 'cancelled' by the API's cancel endpoint) or ctx ends, whichever happens
+// first. nil means cancelled; ctx.Err() means ctx ended first — the
+// ordinary "the run finished on its own" case, not a failure. Held for a
+// running spec_grill job's entire session (driveSpecGrillSession), not just
+// while waiting on a human reply, so a cancellation lands even mid-turn.
+func (q *Queue) WatchCancellation(ctx context.Context, jobID string) error {
+	conn, err := q.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to acquire a connection to listen for cancellations: %w", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, "LISTEN job_cancellations"); err != nil {
+		return fmt.Errorf("failed to listen for job cancellations: %w", err)
+	}
+
+	for {
+		cancelled, err := q.isCancelled(ctx, conn, jobID)
+		if err != nil {
+			return err
+		}
+		if cancelled {
+			return nil
+		}
+
+		// Check (above) then wait, not wait then check — see
+		// messages.Store.WaitForReply's identical comment: a cancellation
+		// that lands between this call starting and the LISTEN above taking
+		// effect would otherwise be missed entirely.
+		if _, err := conn.Conn().WaitForNotification(ctx); err != nil {
+			return fmt.Errorf("failed waiting for a job cancellation notification: %w", err)
+		}
+	}
+}
+
+func (q *Queue) isCancelled(ctx context.Context, conn *pgxpool.Conn, jobID string) (bool, error) {
+	var status string
+	if err := conn.QueryRow(ctx, `SELECT status FROM jobs WHERE id = $1`, jobID).Scan(&status); err != nil {
+		return false, fmt.Errorf("failed to check job %s status: %w", jobID, err)
+	}
+	return status == string(StatusCancelled), nil
 }

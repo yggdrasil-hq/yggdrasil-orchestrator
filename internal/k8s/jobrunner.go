@@ -7,6 +7,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -42,14 +43,19 @@ type JobSpec struct {
 	// Resources overrides the default request/limit if set. Leave nil to use
 	// the package defaults (fine for the Phase 2 placeholder container).
 	Resources *corev1.ResourceRequirements
+
+	// Stdin, when true, opens the container's stdin (PodSpec.Stdin) so the
+	// Orchestrator can later Attach to it and drive an interactive process —
+	// e.g. Pi's JSONL RPC mode (ADR 006). Leave false for one-shot jobs whose
+	// container reads no stdin (the placeholder script; `deploy` never uses
+	// this path at all).
+	Stdin bool
 }
 
-// RunJob creates spec as a Kubernetes Job and blocks until it succeeds,
-// fails, or ctx is cancelled. Retries are intentionally left to the
-// Orchestrator's own Postgres-backed queue (ADR 003) rather than Kubernetes's
-// Job backoff, so BackoffLimit is always 0 — letting both layers retry would
-// double up retry/attempt accounting.
-func RunJob(ctx context.Context, clientset kubernetes.Interface, spec JobSpec) error {
+// buildJob constructs the Kubernetes Job object for spec. Pure and
+// side-effect-free so CreateJob is the only place that talks to the API
+// server.
+func buildJob(spec JobSpec) *batchv1.Job {
 	var envVars []corev1.EnvVar
 	for k, v := range spec.Env {
 		envVars = append(envVars, corev1.EnvVar{Name: k, Value: v})
@@ -72,7 +78,7 @@ func RunJob(ctx context.Context, clientset kubernetes.Interface, spec JobSpec) e
 		}
 	}
 
-	job := &batchv1.Job{
+	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      spec.Name,
 			Namespace: spec.Namespace,
@@ -90,6 +96,7 @@ func RunJob(ctx context.Context, clientset kubernetes.Interface, spec JobSpec) e
 							Image:     spec.Image,
 							Command:   spec.Command,
 							Env:       envVars,
+							Stdin:     spec.Stdin,
 							Resources: *resources,
 						},
 					},
@@ -97,12 +104,83 @@ func RunJob(ctx context.Context, clientset kubernetes.Interface, spec JobSpec) e
 			},
 		},
 	}
+}
 
+// CreateJob creates spec as a Kubernetes Job and returns as soon as the API
+// server accepts it — it does not wait for the pod to start or finish.
+// RunJob (waits for standard Job success/failure) and attach-driven callers
+// (ADR 006, which decide completion from an RPC event stream instead of Job
+// status) both build on this.
+func CreateJob(ctx context.Context, clientset kubernetes.Interface, spec JobSpec) error {
+	job := buildJob(spec)
 	if _, err := clientset.BatchV1().Jobs(spec.Namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("failed to create job %s/%s: %w", spec.Namespace, spec.Name, err)
 	}
+	return nil
+}
 
+// RunJob creates spec as a Kubernetes Job and blocks until it succeeds,
+// fails, or ctx is cancelled. Retries are intentionally left to the
+// Orchestrator's own Postgres-backed queue (ADR 003) rather than Kubernetes's
+// Job backoff, so BackoffLimit is always 0 — letting both layers retry would
+// double up retry/attempt accounting.
+//
+// Not used for attach-driven jobs (ADR 006): Pi's RPC-mode process never
+// exits on its own, so Job.Status never reaches Succeeded and this would
+// block forever. Those callers use CreateJob + WaitForJobPod + Attach, and
+// tear the Job down explicitly via DeleteJob once the RPC event stream
+// signals completion.
+func RunJob(ctx context.Context, clientset kubernetes.Interface, spec JobSpec) error {
+	if err := CreateJob(ctx, clientset, spec); err != nil {
+		return err
+	}
 	return waitForCompletion(ctx, clientset, spec.Namespace, spec.Name)
+}
+
+// WaitForJobPod blocks until a Job's pod exists and is running, returning
+// its name. A Job's pod name isn't known until Kubernetes schedules it
+// (unlike a Deployment's fixed name), so Attach needs this first.
+func WaitForJobPod(ctx context.Context, clientset kubernetes.Interface, namespace, jobName string) (string, error) {
+	ticker := time.NewTicker(defaultPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-ticker.C:
+			pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+				LabelSelector: "job-name=" + jobName,
+			})
+			if err != nil {
+				return "", fmt.Errorf("failed to list pods for job %s/%s: %w", namespace, jobName, err)
+			}
+			for _, pod := range pods.Items {
+				switch pod.Status.Phase {
+				case corev1.PodRunning:
+					return pod.Name, nil
+				case corev1.PodFailed:
+					return "", fmt.Errorf("pod %s/%s failed before becoming attachable", namespace, pod.Name)
+				}
+			}
+		}
+	}
+}
+
+// DeleteJob deletes a Job (and, via Foreground propagation, its pod).
+// Attach-driven job kinds (ADR 006) decide completion from the RPC event
+// stream rather than Kubernetes Job status, so nothing else ever deletes
+// the Job for them — this is that explicit teardown call. Deleting an
+// already-gone Job is not an error.
+func DeleteJob(ctx context.Context, clientset kubernetes.Interface, namespace, name string) error {
+	propagation := metav1.DeletePropagationForeground
+	err := clientset.BatchV1().Jobs(namespace).Delete(ctx, name, metav1.DeleteOptions{
+		PropagationPolicy: &propagation,
+	})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete job %s/%s: %w", namespace, name, err)
+	}
+	return nil
 }
 
 func waitForCompletion(ctx context.Context, clientset kubernetes.Interface, namespace, name string) error {

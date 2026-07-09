@@ -1,15 +1,18 @@
-// Package apiclient is the Orchestrator's first (and so far only) outbound
-// call path back to the API — used at deploy time to fetch decrypted
-// project secrets (ADR 003 §16) via a shared-bearer-token-authenticated
-// internal endpoint, rather than smuggling plaintext through the Postgres
-// job queue.
+// Package apiclient is the Orchestrator's outbound call path back to the
+// API — a shared-bearer-token-authenticated internal endpoint per need
+// (decrypted project secrets at deploy time, ADR 003 §16; a spec_grill
+// job's payload at claim time, ADR 006 item 5), rather than smuggling any
+// of this through the Postgres job queue.
 package apiclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+
+	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/rpc"
 )
 
 type Client struct {
@@ -123,4 +126,93 @@ func (c *Client) FetchProjectMetadata(ctx context.Context, projectID string) (sl
 		return "", fmt.Errorf("failed to decode slug response: %w", err)
 	}
 	return parsed.Slug, nil
+}
+
+// FeatureSpecRepo is one of a feature's linked repos, as needed to clone it
+// (ADR 006 item 6 — consumed by base/entrypoint.sh's TARGET_REPOS).
+type FeatureSpecRepo struct {
+	CloneURL  string `json:"cloneUrl"`
+	IsPrimary bool   `json:"isPrimary"`
+}
+
+// FeatureSpec is a spec_grill job's payload: the feature title (the first
+// prompt sent to Pi), the project's linked repos, and a job-scoped GitHub
+// installation token freshly minted by the API for this fetch — short-lived
+// or (ADR 005 §14), unlike the model config secrets, which is why it isn't
+// delivered through FetchProjectSecrets/project_secrets.
+type FeatureSpec struct {
+	Title       string            `json:"title"`
+	Repos       []FeatureSpecRepo `json:"repos"`
+	GithubToken string            `json:"githubToken"`
+}
+
+// FetchFeatureSpec fetches a spec_grill job's payload (ADR 006 item 5). A
+// feature is scoped to its project, so both IDs are required — mirrors the
+// API's own FeatureRepository.findById(projectId, featureId).
+func (c *Client) FetchFeatureSpec(ctx context.Context, projectID, featureID string) (FeatureSpec, error) {
+	url := fmt.Sprintf("%s/internal/projects/%s/features/%s/spec", c.baseURL, projectID, featureID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return FeatureSpec{}, fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return FeatureSpec{}, fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return FeatureSpec{}, fmt.Errorf("API returned status %d fetching spec for feature %s", resp.StatusCode, featureID)
+	}
+
+	var spec FeatureSpec
+	if err := json.NewDecoder(resp.Body).Decode(&spec); err != nil {
+		return FeatureSpec{}, fmt.Errorf("failed to decode feature spec response: %w", err)
+	}
+	return spec, nil
+}
+
+type jobEventRequest struct {
+	Type     string `json:"type"`
+	Question string `json:"question,omitempty"`
+	Markdown string `json:"markdown,omitempty"`
+	Message  string `json:"message,omitempty"`
+}
+
+// PostJobEvent relays one curated event (ADR 006 items 7-8) from a running
+// job's Pi RPC session to the API for persistence. Errors are the caller's
+// to decide how to handle — a failed relay shouldn't necessarily fail the
+// job itself, since the job's actual outcome (e.g. an ADR submitted) is
+// independent of whether this side-channel post succeeded.
+func (c *Client) PostJobEvent(ctx context.Context, jobID string, event rpc.CuratedEvent) error {
+	body, err := json.Marshal(jobEventRequest{
+		Type:     string(event.Type),
+		Question: event.Question,
+		Markdown: event.Markdown,
+		Message:  event.Message,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to encode job event: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/internal/jobs/%s/events", c.baseURL, jobID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("API returned status %d posting event for job %s", resp.StatusCode, jobID)
+	}
+	return nil
 }

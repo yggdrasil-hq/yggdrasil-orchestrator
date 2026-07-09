@@ -213,3 +213,181 @@ func TestFilterModelEnv_MissingKeysAreOmittedNotEmptyString(t *testing.T) {
 		t.Fatalf("expected no keys when the project has no model config, got %v", env)
 	}
 }
+
+// Proves the concurrency limiter (ADR 006 item 1) actually caps how many
+// slots can be held at once, rather than just being a no-op wrapper.
+func TestLimiter_TryAcquireRespectsCapacity(t *testing.T) {
+	l := newLimiter(2)
+
+	if !l.tryAcquire() {
+		t.Fatal("expected the first acquire (of 2) to succeed")
+	}
+	if !l.tryAcquire() {
+		t.Fatal("expected the second acquire (of 2) to succeed")
+	}
+	if l.tryAcquire() {
+		t.Fatal("expected a third acquire to fail once the limiter is saturated")
+	}
+
+	l.release()
+	if !l.tryAcquire() {
+		t.Fatal("expected an acquire to succeed again after a release freed a slot")
+	}
+}
+
+// Proves a non-positive capacity doesn't produce a limiter that blocks
+// every acquire forever (a nil/zero-buffer channel would) — it should fall
+// back to a capacity of 1, matching Run's "at least sequential" behavior.
+func TestLimiter_NonPositiveCapacityFallsBackToOne(t *testing.T) {
+	l := newLimiter(0)
+	if !l.tryAcquire() {
+		t.Fatal("expected a zero-capacity limiter to still allow one acquire (falls back to 1)")
+	}
+	if l.tryAcquire() {
+		t.Fatal("expected a second acquire to fail with the capacity-1 fallback")
+	}
+}
+
+// Proves specGrillEnv (ADR 006 item 5) fetches the feature spec and shapes
+// it into the two job-pod env vars entrypoint.sh will eventually consume.
+func TestSpecGrillEnv_FetchesAndBuildsTargetReposAndToken(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"title": "Add dark mode",
+			"repos": []map[string]any{
+				{"cloneUrl": "https://github.com/acme/web.git", "isPrimary": true},
+				{"cloneUrl": "https://github.com/acme/worker.git", "isPrimary": false},
+			},
+			"githubToken": "ghs_test-token",
+		})
+	}))
+	defer server.Close()
+
+	featureID := "feat-456"
+	job := &queue.Job{ID: "job-1", ProjectID: "proj-123", Kind: queue.KindSpecGrill, FeatureID: &featureID}
+	cfg := Config{APIClient: apiclient.New(server.URL, "test-token")}
+
+	env, spec, err := specGrillEnv(context.Background(), cfg, job)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if gotPath != "/internal/projects/proj-123/features/feat-456/spec" {
+		t.Fatalf("expected path %q, got %q", "/internal/projects/proj-123/features/feat-456/spec", gotPath)
+	}
+	if env["GITHUB_TOKEN"] != "ghs_test-token" {
+		t.Fatalf("expected GITHUB_TOKEN %q, got %q", "ghs_test-token", env["GITHUB_TOKEN"])
+	}
+	if spec.Title != "Add dark mode" {
+		t.Fatalf("expected the fetched spec's title to be returned too, got %q", spec.Title)
+	}
+
+	var repos []map[string]any
+	if err := json.Unmarshal([]byte(env["TARGET_REPOS"]), &repos); err != nil {
+		t.Fatalf("expected TARGET_REPOS to be valid JSON, got %q: %v", env["TARGET_REPOS"], err)
+	}
+	if len(repos) != 2 || repos[0]["cloneUrl"] != "https://github.com/acme/web.git" || repos[0]["isPrimary"] != true {
+		t.Fatalf("unexpected TARGET_REPOS contents: %v", repos)
+	}
+}
+
+// Proves a spec_grill job dispatched without a feature_id fails loudly
+// instead of silently fetching nothing — this is a dispatch bug (ADR 002
+// always sets one), not a runtime condition worth falling back from.
+func TestSpecGrillEnv_ErrorsWhenFeatureIDMissing(t *testing.T) {
+	job := &queue.Job{ID: "job-1", ProjectID: "proj-123", Kind: queue.KindSpecGrill, FeatureID: nil}
+	cfg := Config{APIClient: apiclient.New("http://unused.invalid", "test-token")}
+
+	_, _, err := specGrillEnv(context.Background(), cfg, job)
+	if err == nil {
+		t.Fatal("expected an error when job.FeatureID is nil")
+	}
+}
+
+// Proves a failed spec fetch surfaces as an error rather than silently
+// running the job with an empty/missing GitHub token and repo list.
+func TestSpecGrillEnv_SurfacesFetchError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	featureID := "feat-456"
+	job := &queue.Job{ID: "job-1", ProjectID: "proj-123", Kind: queue.KindSpecGrill, FeatureID: &featureID}
+	cfg := Config{APIClient: apiclient.New(server.URL, "test-token")}
+
+	_, _, err := specGrillEnv(context.Background(), cfg, job)
+	if err == nil {
+		t.Fatal("expected an error when the API returns a non-200 response")
+	}
+}
+
+// Proves runAgentJob actually merges specGrillEnv's output into the
+// created pod's env for a spec_grill job — not just that specGrillEnv
+// computes the right map in isolation.
+func TestRunAgentJob_SpecGrillIncludesFetchedRepoAndTokenEnv(t *testing.T) {
+	clientset := testClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/secrets"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": map[string]string{}})
+		case strings.HasSuffix(r.URL.Path, "/spec"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"title": "Add dark mode",
+				"repos": []map[string]any{
+					{"cloneUrl": "https://github.com/acme/web.git", "isPrimary": true},
+				},
+				"githubToken": "ghs_test-token",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	projectID := "test-" + time.Now().Format("150405")
+	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset, projectID)
+	if err != nil {
+		t.Fatalf("failed to provision namespace: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = clientset.CoreV1().Namespaces().Delete(context.Background(), namespace, metav1.DeleteOptions{})
+	})
+
+	featureID := "feat-456"
+	jobID := "specgrill-" + time.Now().Format("150405")
+	job := &queue.Job{ID: jobID, ProjectID: projectID, Kind: queue.KindSpecGrill, FeatureID: &featureID}
+
+	cfg := Config{
+		APIClient:         apiclient.New(server.URL, "test-token"),
+		PlaceholderImage:  "busybox:1.36",
+		PlaceholderScript: "exit 0",
+	}
+
+	if err := runAgentJob(ctx, clientset, job, namespace, cfg); err != nil {
+		t.Fatalf("runAgentJob failed: %v", err)
+	}
+
+	createdJob, err := clientset.BatchV1().Jobs(namespace).Get(ctx, "job-"+jobID, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to fetch created job: %v", err)
+	}
+
+	env := map[string]string{}
+	for _, e := range createdJob.Spec.Template.Spec.Containers[0].Env {
+		env[e.Name] = e.Value
+	}
+	if env["GITHUB_TOKEN"] != "ghs_test-token" {
+		t.Fatalf("expected GITHUB_TOKEN to be injected into the pod, got %v", env)
+	}
+	if !strings.Contains(env["TARGET_REPOS"], "acme/web") {
+		t.Fatalf("expected TARGET_REPOS to include the fetched repo, got %q", env["TARGET_REPOS"])
+	}
+}

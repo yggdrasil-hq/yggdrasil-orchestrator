@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/queue"
@@ -218,5 +219,147 @@ func TestFail(t *testing.T) {
 	}
 	if lastError != "boom" {
 		t.Fatalf("expected last_error 'boom', got %q", lastError)
+	}
+}
+
+// TestComplete_DoesNotOverwriteCancelled proves a session that was already
+// cancelled (the API's cancel endpoint got there first) can't have its
+// eventual Complete call — the session unwinding after ctx cancellation —
+// flip status back to 'completed'.
+func TestComplete_DoesNotOverwriteCancelled(t *testing.T) {
+	q, pool := setupTestQueue(t)
+	ctx := context.Background()
+
+	insertJob(t, ctx, pool, "spec_grill")
+	claimed, err := q.Claim(ctx, "worker-1")
+	if err != nil || claimed == nil {
+		t.Fatalf("failed to claim fixture job: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET status = 'cancelled' WHERE id = $1`, claimed.ID); err != nil {
+		t.Fatalf("failed to mark job cancelled: %v", err)
+	}
+
+	if err := q.Complete(ctx, claimed.ID); err != nil {
+		t.Fatalf("complete failed: %v", err)
+	}
+
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id = $1`, claimed.ID).Scan(&status); err != nil {
+		t.Fatalf("failed to read back status: %v", err)
+	}
+	if status != string(queue.StatusCancelled) {
+		t.Fatalf("expected status to stay cancelled, got %s", status)
+	}
+}
+
+// TestFail_DoesNotOverwriteCancelled is Complete's counterpart: the far more
+// likely real path, since a cancelled session's runTurn/WaitForReply return
+// ctx.Err(), which worker.runClaimedJob reports via Fail, not Complete.
+func TestFail_DoesNotOverwriteCancelled(t *testing.T) {
+	q, pool := setupTestQueue(t)
+	ctx := context.Background()
+
+	insertJob(t, ctx, pool, "spec_grill")
+	claimed, err := q.Claim(ctx, "worker-1")
+	if err != nil || claimed == nil {
+		t.Fatalf("failed to claim fixture job: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET status = 'cancelled' WHERE id = $1`, claimed.ID); err != nil {
+		t.Fatalf("failed to mark job cancelled: %v", err)
+	}
+
+	if err := q.Fail(ctx, claimed.ID, errors.New("context canceled")); err != nil {
+		t.Fatalf("fail failed: %v", err)
+	}
+
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id = $1`, claimed.ID).Scan(&status); err != nil {
+		t.Fatalf("failed to read back status: %v", err)
+	}
+	if status != string(queue.StatusCancelled) {
+		t.Fatalf("expected status to stay cancelled, got %s", status)
+	}
+}
+
+func TestWatchCancellation_ReturnsWhenAlreadyCancelled(t *testing.T) {
+	q, pool := setupTestQueue(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	insertJob(t, ctx, pool, "spec_grill")
+	claimed, err := q.Claim(ctx, "worker-1")
+	if err != nil || claimed == nil {
+		t.Fatalf("failed to claim fixture job: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET status = 'cancelled' WHERE id = $1`, claimed.ID); err != nil {
+		t.Fatalf("failed to mark job cancelled: %v", err)
+	}
+
+	if err := q.WatchCancellation(ctx, claimed.ID); err != nil {
+		t.Fatalf("expected WatchCancellation to return nil for an already-cancelled job, got: %v", err)
+	}
+}
+
+func TestWatchCancellation_UnblocksWhenCancelledLater(t *testing.T) {
+	q, pool := setupTestQueue(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	insertJob(t, ctx, pool, "spec_grill")
+	claimed, err := q.Claim(ctx, "worker-1")
+	if err != nil || claimed == nil {
+		t.Fatalf("failed to claim fixture job: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- q.WatchCancellation(ctx, claimed.ID) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("expected WatchCancellation to still be waiting, but it returned: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET status = 'cancelled' WHERE id = $1`, claimed.ID); err != nil {
+		t.Fatalf("failed to mark job cancelled: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `SELECT pg_notify('job_cancellations', $1)`, claimed.ID); err != nil {
+		t.Fatalf("failed to notify: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected WatchCancellation to return nil once cancelled, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for WatchCancellation to unblock")
+	}
+}
+
+func TestWatchCancellation_RespectsContextCancellation(t *testing.T) {
+	q, pool := setupTestQueue(t)
+	ctx := context.Background()
+
+	insertJob(t, ctx, pool, "spec_grill")
+	claimed, err := q.Claim(ctx, "worker-1")
+	if err != nil || claimed == nil {
+		t.Fatalf("failed to claim fixture job: %v", err)
+	}
+
+	watchCtx, watchCancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- q.WatchCancellation(watchCtx, claimed.ID) }()
+
+	time.Sleep(50 * time.Millisecond)
+	watchCancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected WatchCancellation to return an error when its context is cancelled")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("WatchCancellation did not return after its context was cancelled")
 	}
 }
