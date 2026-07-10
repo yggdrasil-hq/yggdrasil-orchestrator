@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/apiclient"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/k8s"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/queue"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/rpc"
@@ -97,7 +99,7 @@ func runSpecGrillJob(ctx context.Context, q *queue.Queue, clientset kubernetes.I
 		return fmt.Errorf("pod never became attachable: %w", err)
 	}
 
-	initialPrompt := fmt.Sprintf("New feature: %s", spec.Title)
+	initialPrompt := buildInitialPrompt(spec)
 
 	return driveSpecGrillSession(ctx, clientset, cfg.RESTConfig, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, func(ev rpc.CuratedEvent) {
 		if err := cfg.APIClient.PostJobEvent(ctx, job.ID, ev); err != nil {
@@ -108,6 +110,49 @@ func runSpecGrillJob(ctx context.Context, q *queue.Queue, clientset kubernetes.I
 			log.Printf("worker: failed to relay event %s for job %s: %v", ev.Type, job.ID, err)
 		}
 	})
+}
+
+// buildInitialPrompt states the job's constraints explicitly instead of
+// leaving the agent to (re)discover them — verified against a real stuck
+// run: a bare "New feature: <title>" prompt relied entirely on the model's
+// own initiative to think to read grill-with-docs/SKILL.md before doing
+// anything else, which isn't guaranteed, and gave no indication of where
+// (or whether) repos were already on disk. This lists each repo's actual
+// local path so the agent doesn't need to guess or re-derive it, mirroring
+// entrypoint.sh's own clone layout (primary at /workspace, sub-repos at
+// /workspace/<repo-name>) exactly.
+func buildInitialPrompt(spec apiclient.FeatureSpec) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "New feature: %s\n\n", spec.Title)
+	b.WriteString("This is a spec_grill job. You have read-only access to the repo(s) below — ")
+	b.WriteString("already cloned to the paths listed, nothing left to fetch. Your only job is ")
+	b.WriteString("to explore, interview the user, and call submit_adr; you cannot and must not ")
+	b.WriteString("modify these repos in any way. Read /root/.pi/agent/skills/grill-with-docs/SKILL.md ")
+	b.WriteString("first — it governs this entire run.\n\nRepos:\n")
+	for _, repo := range spec.Repos {
+		dir := repoLocalDir(repo)
+		role := "sub-repo"
+		if repo.IsPrimary {
+			role = "primary"
+		}
+		fmt.Fprintf(&b, "- %s (%s): %s\n", dir, role, repo.CloneURL)
+	}
+	return b.String()
+}
+
+// repoLocalDir mirrors entrypoint.sh's clone layout: the primary repo lands
+// directly in /workspace, every sub-repo in /workspace/<repo-name> (the
+// clone URL's path segment with any .git suffix stripped). Keep these two
+// in sync if the layout ever changes.
+func repoLocalDir(repo apiclient.FeatureSpecRepo) string {
+	if repo.IsPrimary {
+		return "/workspace"
+	}
+	name := strings.TrimSuffix(repo.CloneURL, ".git")
+	if idx := strings.LastIndex(name, "/"); idx != -1 {
+		name = name[idx+1:]
+	}
+	return "/workspace/" + name
 }
 
 // driveSpecGrillSession drives a spec_grill job's Pi RPC session turn by
@@ -163,6 +208,15 @@ func driveSpecGrillSession(
 		}
 		handle(curated)
 		if curated.Terminal() {
+			if curated.Type == rpc.EventRunFailed {
+				// Unlike reportSessionError's EventRunFailed (a dead
+				// stream/ctx cancellation), this one comes straight from
+				// rpc.Translate reading a genuine agent_end error while the
+				// session was otherwise healthy — an error return here is
+				// what makes runClaimedJob call q.Fail instead of
+				// q.Complete.
+				return fmt.Errorf("agent run ended with an error: %s", curated.Message)
+			}
 			return nil
 		}
 

@@ -17,10 +17,13 @@ const (
 	// terminate:true (both tools set that flag; only the tool identity
 	// distinguishes them) — is what ends a spec_grill run (ADR 006 item 11).
 	EventSubmitADR CuratedEventType = "submit_adr"
-	// EventRunFailed is synthesized locally (never present in Pi's own
-	// stream) when the attach stream itself ends unexpectedly — the
-	// container crashed, the connection dropped, or ctx was cancelled
-	// before a terminating contract event was ever seen.
+	// EventRunFailed is either synthesized locally (by reportSessionError,
+	// worker/specgrill.go) when the attach stream itself ends unexpectedly —
+	// the container crashed, the connection dropped, or ctx was cancelled
+	// before a terminating contract event was ever seen — or translated
+	// directly from Pi's own agent_end event (see translateAgentEnd) when Pi
+	// reports a request-level error (e.g. the configured model rejecting the
+	// call) without ever exiting or closing the stream itself.
 	EventRunFailed CuratedEventType = "run_failed"
 	// EventRunCancelled is synthesized locally (never present in Pi's own
 	// stream), like EventRunFailed, but for the expected case: a human
@@ -61,22 +64,45 @@ type toolExecutionEndEvent struct {
 	Result   contractToolResult `json:"result"`
 }
 
+// agentEndEvent mirrors just enough of Pi's own agent_end event (raw RPC
+// taxonomy, not this suite's code, so decoded best-effort like the rest of
+// Pi's own shapes) to detect one specific case: the agent ending with an
+// unrecoverable request-level error (e.g. the configured MODEL_ID/base URL
+// rejecting the call with a 404) rather than a normal contract-tool-driven
+// turn end. Verified against a real run hitting an invalid model.
+type agentEndEvent struct {
+	Messages []struct {
+		StopReason   string `json:"stopReason"`
+		ErrorMessage string `json:"errorMessage"`
+	} `json:"messages"`
+}
+
 // Translate maps a raw Pi RPC event to a curated Event (ADR 006 item 7),
 // scoped for now to the yggdrasil-contract extension's tool-call-based
 // signals (ask_user/submit_adr) — the ones needed to detect completion
-// (item 11), and the only ones this suite can decode with full confidence
-// today, since the extension's shape is this suite's own code. Plain
-// assistant text (agent_text) is intentionally not translated yet: Pi's own
-// message event shapes aren't confirmed against a real integration.
+// (item 11) — plus one raw Pi event, agent_end, but only far enough to catch
+// a request-level failure (translateAgentEnd); a clean agent_end is left
+// untranslated since a contract tool call, not agent_end, is what ends a
+// turn normally. Plain assistant text (agent_text) is intentionally not
+// translated yet: Pi's own message event shapes aren't confirmed against a
+// real integration beyond what's needed here.
 //
 // ok is false for any event this suite doesn't curate (including
 // tool_execution_end for tools other than ask_user/submit_adr, e.g. a
-// non-contract bash call) — the caller should just keep reading.
+// non-contract bash call, and a clean agent_end) — the caller should just
+// keep reading.
 func Translate(ev Event) (curated CuratedEvent, ok bool) {
-	if ev.Type != "tool_execution_end" {
+	switch ev.Type {
+	case "tool_execution_end":
+		return translateToolExecutionEnd(ev)
+	case "agent_end":
+		return translateAgentEnd(ev)
+	default:
 		return CuratedEvent{}, false
 	}
+}
 
+func translateToolExecutionEnd(ev Event) (CuratedEvent, bool) {
 	var parsed toolExecutionEndEvent
 	if err := json.Unmarshal(ev.Raw, &parsed); err != nil {
 		return CuratedEvent{}, false
@@ -90,4 +116,30 @@ func Translate(ev Event) (curated CuratedEvent, ok bool) {
 	default:
 		return CuratedEvent{}, false
 	}
+}
+
+// translateAgentEnd catches what the read loop used to miss entirely
+// (worker/specgrill.go's runTurn): Pi's RPC process doesn't exit or close
+// the stream after a request-level failure like a 404 from an invalid
+// model — it just goes idle waiting for the next command, so nothing else
+// in this package would ever notice the run was over. A clean agent_end
+// (no message with stopReason "error") isn't curated here — ok is false —
+// since that's not how a successful turn ends (see Translate's doc comment).
+func translateAgentEnd(ev Event) (CuratedEvent, bool) {
+	var parsed agentEndEvent
+	if err := json.Unmarshal(ev.Raw, &parsed); err != nil {
+		return CuratedEvent{}, false
+	}
+
+	for _, m := range parsed.Messages {
+		if m.StopReason != "error" {
+			continue
+		}
+		message := m.ErrorMessage
+		if message == "" {
+			message = "agent run ended with an error"
+		}
+		return CuratedEvent{Type: EventRunFailed, Message: message}, true
+	}
+	return CuratedEvent{}, false
 }

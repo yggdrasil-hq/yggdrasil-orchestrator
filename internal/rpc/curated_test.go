@@ -81,6 +81,33 @@ func TestTranslate_IgnoresMalformedResult(t *testing.T) {
 	}
 }
 
+func TestTranslate_AgentEndWithErrorIsRunFailed(t *testing.T) {
+	ev := rawEvent(t, `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error","errorMessage":"404: {\"message\":\"Not Found\",\"code\":404}"}],"willRetry":false}`)
+
+	curated, ok := rpc.Translate(ev)
+	if !ok {
+		t.Fatal("expected an agent_end carrying a stopReason:error message to be curated")
+	}
+	if curated.Type != rpc.EventRunFailed {
+		t.Fatalf("expected type %q, got %q", rpc.EventRunFailed, curated.Type)
+	}
+	if curated.Message != `404: {"message":"Not Found","code":404}` {
+		t.Fatalf("expected errorMessage to be carried through, got %q", curated.Message)
+	}
+	if !curated.Terminal() {
+		t.Fatal("expected this EventRunFailed to be terminal")
+	}
+}
+
+func TestTranslate_CleanAgentEndIsNotCurated(t *testing.T) {
+	ev := rawEvent(t, `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"endTurn"}],"willRetry":false}`)
+
+	_, ok := rpc.Translate(ev)
+	if ok {
+		t.Fatal("expected a clean agent_end (no error stopReason) not to be curated — a contract tool call ends the turn, not agent_end")
+	}
+}
+
 func TestRunFailedIsTerminal(t *testing.T) {
 	ev := rpc.CuratedEvent{Type: rpc.EventRunFailed, Message: "attach stream ended"}
 	if !ev.Terminal() {

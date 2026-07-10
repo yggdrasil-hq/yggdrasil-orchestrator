@@ -323,13 +323,13 @@ func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]
 
 // specGrillEnv fetches a spec_grill job's payload (ADR 006 item 5) and
 // returns both the extra job-pod env vars it needs — TARGET_REPOS
-// (JSON-encoded FeatureSpecRepo list, for base/entrypoint.sh's not-yet-built
-// clone step, ADR 006 item 6) and GITHUB_TOKEN (a fresh, job-scoped
-// installation token minted by that same API call — not a project_secrets
-// value, since installation tokens are short-lived and per-job, ADR 005
-// §14) — and the fetched spec itself. Every spec_grill job is dispatched
-// with a feature_id (ADR 002); one missing is a dispatch bug, not a
-// condition to fall back from.
+// (JSON-encoded FeatureSpecRepo list, consumed by base/entrypoint.sh's
+// clone step, ADR 006 item 6) and GITHUB_TOKEN (a fresh, job-scoped,
+// contents:read-only installation token minted by that same API call — not
+// a project_secrets value, since installation tokens are short-lived and
+// per-job, ADR 005 §14/§16) — and the fetched spec itself. Every spec_grill
+// job is dispatched with a feature_id (ADR 002); one missing is a dispatch
+// bug, not a condition to fall back from.
 func specGrillEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]string, apiclient.FeatureSpec, error) {
 	if job.FeatureID == nil {
 		return nil, apiclient.FeatureSpec{}, fmt.Errorf("spec_grill job %s has no feature_id", job.ID)
