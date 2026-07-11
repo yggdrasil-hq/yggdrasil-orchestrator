@@ -163,3 +163,10 @@ func TestRunCancelledIsTerminal(t *testing.T) {
 		t.Fatal("expected EventRunCancelled to be terminal")
 	}
 }
+
+func TestRunStartedIsNotTerminal(t *testing.T) {
+	ev := rpc.CuratedEvent{Type: rpc.EventRunStarted}
+	if ev.Terminal() {
+		t.Fatal("expected EventRunStarted not to be terminal — it only signals the pod is up, the run has barely begun")
+	}
+}

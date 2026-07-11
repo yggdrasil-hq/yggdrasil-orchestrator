@@ -95,14 +95,7 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, clientset kubernetes.In
 		}
 	}()
 
-	podName, err := k8s.WaitForJobPod(ctx, clientset, namespace, name)
-	if err != nil {
-		return fmt.Errorf("pod never became attachable: %w", err)
-	}
-
-	initialPrompt := buildInitialPrompt(job.Kind, spec)
-
-	return driveAgentSession(ctx, clientset, cfg.RESTConfig, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, func(ev rpc.CuratedEvent) {
+	handle := func(ev rpc.CuratedEvent) {
 		if err := cfg.APIClient.PostJobEvent(ctx, job.ID, ev); err != nil {
 			// A failed relay is a visibility gap, not a job failure: the
 			// job's actual outcome (an ADR submitted, a PR opened, or not)
@@ -110,7 +103,28 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, clientset kubernetes.In
 			// side-channel post to the API succeeded.
 			log.Printf("worker: failed to relay event %s for job %s: %v", ev.Type, job.ID, err)
 		}
-	})
+	}
+
+	podName, err := k8s.WaitForJobPod(ctx, clientset, namespace, name)
+	if err != nil {
+		// ADR 011 item 3: without this, a pod that never becomes attachable
+		// leaves the feature stuck in 'queued' forever — runClaimedJob's
+		// q.Fail only touches the jobs row, and no event would otherwise
+		// ever be posted for this job.
+		handle(rpc.CuratedEvent{
+			Type:    rpc.EventRunFailed,
+			Message: fmt.Sprintf("pod never became attachable: %v", err),
+		})
+		return fmt.Errorf("pod never became attachable: %w", err)
+	}
+	// ADR 011 item 2: synthesized the moment the pod is confirmed up, not
+	// decoded from Pi — feature_build has no non-terminal curated event to
+	// hang this off of, so it can't wait for the first turn to complete.
+	handle(rpc.CuratedEvent{Type: rpc.EventRunStarted})
+
+	initialPrompt := buildInitialPrompt(job.Kind, spec)
+
+	return driveAgentSession(ctx, clientset, cfg.RESTConfig, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, handle)
 }
 
 // buildInitialPrompt picks the prompt shape for the job's kind (ADR 010

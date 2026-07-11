@@ -36,6 +36,15 @@ const (
 	// regardless of Status): the two outcomes (Status "success"/"failure")
 	// are distinguished by the caller, not by whether the run ended.
 	EventSubmitBuildResult CuratedEventType = "submit_build_result"
+	// EventRunStarted is synthesized locally (never present in Pi's own
+	// stream, like EventRunFailed/EventRunCancelled) the moment the job's
+	// pod is confirmed up (k8s.WaitForJobPod succeeds), before Pi has even
+	// received its first prompt (ADR 011 item 2). Fired from the one call
+	// site shared by spec_grill and feature_build, with no job-kind
+	// branching: the API's guarded write this drives is what makes it a
+	// no-op for spec_grill (whose feature sits in 'draft', not 'queued').
+	// Never terminal.
+	EventRunStarted CuratedEventType = "run_started"
 )
 
 // CuratedEvent is one product-meaningful event translated from Pi's raw
