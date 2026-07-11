@@ -10,6 +10,7 @@ import (
 
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/apiclient"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/k8s"
+	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/queue"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/rpc"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/rand"
@@ -19,9 +20,9 @@ const testStandInImage = "busybox:1.36"
 
 // startAttachablePod creates a Job running script (a busybox `sh -c`
 // script) with stdin attached, waits for its pod to become attachable, and
-// returns everything driveSpecGrillSession needs. script stands in for
+// returns everything driveAgentSession needs. script stands in for
 // Pi + the yggdrasil-contract extension without needing a real agent-images
-// image: it reads whatever driveSpecGrillSession sends as the initial
+// image: it reads whatever driveAgentSession sends as the initial
 // prompt and reacts however the test wants.
 func startAttachablePod(t *testing.T, ctx context.Context, script string) (namespace, podName, jobName string) {
 	t.Helper()
@@ -97,7 +98,7 @@ func (d delayedCancel) WatchCancellation(ctx context.Context, _ string) error {
 	}
 }
 
-// Proves driveSpecGrillSession correctly identifies submit_adr as the
+// Proves driveAgentSession correctly identifies submit_adr as the
 // run-ending signal (ADR 006 item 11) — not agent_end, and not the tool
 // result's own terminate:true (ask_user sets that too) — and hands the
 // curated event to its caller before returning.
@@ -114,7 +115,7 @@ func TestDriveSpecGrillSession_SubmitADREndsSessionAndIsCurated(t *testing.T) {
 	namespace, podName, _ := startAttachablePod(t, ctx, script)
 
 	var received []rpc.CuratedEvent
-	err = driveSpecGrillSession(ctx, clientset, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+	err = driveAgentSession(ctx, clientset, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
 	})
 	if err != nil {
@@ -132,11 +133,74 @@ func TestDriveSpecGrillSession_SubmitADREndsSessionAndIsCurated(t *testing.T) {
 	}
 }
 
+// Proves driveAgentSession treats a successful submit_build_result
+// (feature_build's terminating tool, ADR 010 items 7-8) the same way
+// submit_adr ends a spec_grill run: session ends cleanly (nil error), one
+// curated event, PRUrl/Summary carried through.
+func TestDriveAgentSession_SubmitBuildResultSuccessEndsSessionCleanly(t *testing.T) {
+	clientset := testClient(t)
+	restConfig, err := k8s.RESTConfig()
+	if err != nil {
+		t.Skipf("no Kubernetes REST config available; skipping: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	script := `read line; echo '{"type":"tool_execution_end","toolName":"submit_build_result","result":{"details":{"kind":"submit_build_result","status":"success","prUrl":"https://github.com/acme/web/pull/42","summary":"Added dark mode."},"terminate":true}}'; cat`
+	namespace, podName, _ := startAttachablePod(t, ctx, script)
+
+	var received []rpc.CuratedEvent
+	err = driveAgentSession(ctx, clientset, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "Implement this feature: dark mode", func(ev rpc.CuratedEvent) {
+		received = append(received, ev)
+	})
+	if err != nil {
+		t.Fatalf("expected the session to end cleanly on a successful submit_build_result, got: %v", err)
+	}
+
+	if len(received) != 1 || received[0].Type != rpc.EventSubmitBuildResult {
+		t.Fatalf("expected exactly one submit_build_result event, got %+v", received)
+	}
+	if received[0].PRUrl != "https://github.com/acme/web/pull/42" {
+		t.Fatalf("expected the PR URL to be carried through, got %q", received[0].PRUrl)
+	}
+}
+
+// Proves a failed submit_build_result (the agent concluded the feature
+// couldn't be completed) still ends the session — Terminal() is true either
+// way (ADR 010 item 7) — but returns a non-nil error, so runClaimedJob
+// calls q.Fail instead of q.Complete, unlike the success case above.
+func TestDriveAgentSession_SubmitBuildResultFailureEndsSessionAsError(t *testing.T) {
+	clientset := testClient(t)
+	restConfig, err := k8s.RESTConfig()
+	if err != nil {
+		t.Skipf("no Kubernetes REST config available; skipping: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	script := `read line; echo '{"type":"tool_execution_end","toolName":"submit_build_result","result":{"details":{"kind":"submit_build_result","status":"failure","summary":"ADR referenced a package that does not exist."},"terminate":true}}'; cat`
+	namespace, podName, _ := startAttachablePod(t, ctx, script)
+
+	var received []rpc.CuratedEvent
+	err = driveAgentSession(ctx, clientset, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "Implement this feature: dark mode", func(ev rpc.CuratedEvent) {
+		received = append(received, ev)
+	})
+	if err == nil {
+		t.Fatal("expected a non-nil error when submit_build_result reports failure")
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("expected the error to carry the summary, got: %v", err)
+	}
+	if len(received) != 1 || received[0].Type != rpc.EventSubmitBuildResult || received[0].Status != "failure" {
+		t.Fatalf("expected exactly one failed submit_build_result event, got %+v", received)
+	}
+}
+
 // Proves ask_user does NOT end the run despite its own tool result also
 // setting terminate:true — the session should keep waiting for a human
 // reply rather than treating this as completion. Uses blockingReplyWaiter
 // (no reply ever arrives) so the only way this test passes is if
-// driveSpecGrillSession is still running after a few seconds — a real
+// driveAgentSession is still running after a few seconds — a real
 // completion would return almost immediately.
 func TestDriveSpecGrillSession_AskUserIsNotTerminal(t *testing.T) {
 	clientset := testClient(t)
@@ -154,7 +218,7 @@ func TestDriveSpecGrillSession_AskUserIsNotTerminal(t *testing.T) {
 	var received []rpc.CuratedEvent
 	sessionDone := make(chan error, 1)
 	go func() {
-		sessionDone <- driveSpecGrillSession(ctx, clientset, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+		sessionDone <- driveAgentSession(ctx, clientset, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
 			mu.Lock()
 			received = append(received, ev)
 			mu.Unlock()
@@ -163,7 +227,7 @@ func TestDriveSpecGrillSession_AskUserIsNotTerminal(t *testing.T) {
 
 	select {
 	case err := <-sessionDone:
-		t.Fatalf("expected driveSpecGrillSession to still be waiting on a reply, but it returned: %v", err)
+		t.Fatalf("expected driveAgentSession to still be waiting on a reply, but it returned: %v", err)
 	case <-time.After(3 * time.Second):
 		// Still running, as expected — the assertions below are what
 		// actually prove why.
@@ -183,7 +247,7 @@ func TestDriveSpecGrillSession_AskUserIsNotTerminal(t *testing.T) {
 // queued in job_messages, ADR 006 items 9-10) actually gets sent back to
 // Pi as the next prompt, resuming the session — not just parked forever.
 // The stand-in script only emits submit_adr after reading a *second* line
-// from stdin, so this only passes if driveSpecGrillSession genuinely wrote
+// from stdin, so this only passes if driveAgentSession genuinely wrote
 // the reply back to the pod.
 func TestDriveSpecGrillSession_ReplyResumesSessionAndReachesSubmitADR(t *testing.T) {
 	clientset := testClient(t)
@@ -195,14 +259,14 @@ func TestDriveSpecGrillSession_ReplyResumesSessionAndReachesSubmitADR(t *testing
 	defer cancel()
 
 	// line2 is itself a JSONL prompt command (e.g. {"type":"prompt","message":"use-oauth"}),
-	// not a bare string — driveSpecGrillSession sends replies the same way it sends the
+	// not a bare string — driveAgentSession sends replies the same way it sends the
 	// initial prompt. Extract just the message field before embedding it in this script's
 	// own JSON output; echoing line2 raw would nest unescaped quotes and produce invalid JSON.
 	script := `read line1; echo '{"type":"tool_execution_end","toolName":"ask_user","result":{"details":{"kind":"ask_user","question":"Which auth model?"},"terminate":true}}'; read line2; reply=$(echo "$line2" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p'); echo "{\"type\":\"tool_execution_end\",\"toolName\":\"submit_adr\",\"result\":{\"details\":{\"kind\":\"submit_adr\",\"markdown\":\"reply was: $reply\"},\"terminate\":true}}"; cat`
 	namespace, podName, _ := startAttachablePod(t, ctx, script)
 
 	var received []rpc.CuratedEvent
-	err = driveSpecGrillSession(ctx, clientset, restConfig, fixedReplyWaiter{reply: "use-oauth"}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+	err = driveAgentSession(ctx, clientset, restConfig, fixedReplyWaiter{reply: "use-oauth"}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
 	})
 	if err != nil {
@@ -243,7 +307,7 @@ func TestDriveSpecGrillSession_AttachFailureSurfacesAsRunFailed(t *testing.T) {
 	namespace, podName, _ := startAttachablePod(t, ctx, script)
 
 	var received []rpc.CuratedEvent
-	err = driveSpecGrillSession(ctx, clientset, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+	err = driveAgentSession(ctx, clientset, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
 	})
 
@@ -279,7 +343,7 @@ func TestDriveSpecGrillSession_CancellationMidTurnEndsSessionAsCancelled(t *test
 
 	var received []rpc.CuratedEvent
 	start := time.Now()
-	err = driveSpecGrillSession(ctx, clientset, restConfig, blockingReplyWaiter{}, delayedCancel{after: 500 * time.Millisecond}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+	err = driveAgentSession(ctx, clientset, restConfig, blockingReplyWaiter{}, delayedCancel{after: 500 * time.Millisecond}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
 	})
 	elapsed := time.Since(start)
@@ -310,7 +374,7 @@ func TestDriveSpecGrillSession_CancellationWhileAwaitingReplyEndsSessionAsCancel
 	namespace, podName, _ := startAttachablePod(t, ctx, script)
 
 	var received []rpc.CuratedEvent
-	err = driveSpecGrillSession(ctx, clientset, restConfig, blockingReplyWaiter{}, delayedCancel{after: 500 * time.Millisecond}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+	err = driveAgentSession(ctx, clientset, restConfig, blockingReplyWaiter{}, delayedCancel{after: 500 * time.Millisecond}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
 	})
 
@@ -334,7 +398,7 @@ func TestDriveSpecGrillSession_CancellationWhileAwaitingReplyEndsSessionAsCancel
 // Title alone ("Project initialization") carries no signal the container
 // could use to tell the two cases apart on its own.
 func TestBuildInitialPrompt_NamesTheSkillMatchingFeatureType(t *testing.T) {
-	projectInit := buildInitialPrompt(apiclient.FeatureSpec{
+	projectInit := buildInitialPrompt(queue.KindSpecGrill, apiclient.FeatureSpec{
 		Title:       "Project initialization",
 		FeatureType: "project_init",
 		Repos:       []apiclient.FeatureSpecRepo{{CloneURL: "https://github.com/acme/web.git", IsPrimary: true}},
@@ -346,7 +410,7 @@ func TestBuildInitialPrompt_NamesTheSkillMatchingFeatureType(t *testing.T) {
 		t.Fatalf("project_init prompt must not also name feature-grill/SKILL.md, got: %s", projectInit)
 	}
 
-	normal := buildInitialPrompt(apiclient.FeatureSpec{
+	normal := buildInitialPrompt(queue.KindSpecGrill, apiclient.FeatureSpec{
 		Title:       "Add dark mode",
 		FeatureType: "normal",
 		Repos:       []apiclient.FeatureSpecRepo{{CloneURL: "https://github.com/acme/web.git", IsPrimary: true}},
@@ -359,5 +423,26 @@ func TestBuildInitialPrompt_NamesTheSkillMatchingFeatureType(t *testing.T) {
 	}
 	if !strings.Contains(normal, "Add dark mode") {
 		t.Fatalf("expected normal-feature prompt to include the feature title, got: %s", normal)
+	}
+}
+
+// TestBuildInitialPrompt_FeatureBuildPointsAtImplementSkill verifies ADR
+// 010 item 6: a feature_build job gets the short prompt naming the
+// implement skill, not spec_grill's fuller repo-listing form — the skill
+// file itself, not the Orchestrator, documents the repo/branch/ADR-file
+// assumptions for this job kind.
+func TestBuildInitialPrompt_FeatureBuildPointsAtImplementSkill(t *testing.T) {
+	prompt := buildInitialPrompt(queue.KindFeatureBuild, apiclient.FeatureSpec{
+		Title: "Add dark mode",
+		Repos: []apiclient.FeatureSpecRepo{{CloneURL: "https://github.com/acme/web.git", IsPrimary: true}},
+	})
+	if !strings.Contains(prompt, "implement/SKILL.md") {
+		t.Fatalf("expected feature_build prompt to name implement/SKILL.md, got: %s", prompt)
+	}
+	if !strings.Contains(prompt, "Add dark mode") {
+		t.Fatalf("expected feature_build prompt to include the feature title, got: %s", prompt)
+	}
+	if strings.Contains(prompt, "feature-grill/SKILL.md") || strings.Contains(prompt, "project-init/SKILL.md") {
+		t.Fatalf("feature_build prompt must not name a spec_grill skill, got: %s", prompt)
 	}
 }

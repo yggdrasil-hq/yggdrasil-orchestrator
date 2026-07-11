@@ -161,6 +161,30 @@ func TestResolveAgentImage_UsesConfiguredImageWithNoCommandOverride(t *testing.T
 	}
 }
 
+// Proves the same per-kind lookup (ADR 004) resolves feature_build's own
+// configured image (FEATURE_BUILD_IMAGE) independently of spec_grill's —
+// ADR 010 item 4 widens runInCluster's routing to key off this same map for
+// both kinds, so a config with only one of the two images set must not
+// accidentally resolve the other kind's image.
+func TestResolveAgentImage_UsesConfiguredImagePerKindIndependently(t *testing.T) {
+	cfg := Config{
+		Images: map[queue.JobKind]string{
+			queue.KindSpecGrill:    "registry.example.com/yggdrasil-agent-spec-grill:v1",
+			queue.KindFeatureBuild: "registry.example.com/yggdrasil-agent-feature-build:v1",
+		},
+		PlaceholderImage:  "busybox:1.36",
+		PlaceholderScript: "echo job $JOB_ID kind=$JOB_KIND; exit 0",
+	}
+
+	image, command := resolveAgentImage(cfg, queue.KindFeatureBuild)
+	if image != "registry.example.com/yggdrasil-agent-feature-build:v1" {
+		t.Fatalf("expected the configured feature_build image, got %q", image)
+	}
+	if command != nil {
+		t.Fatalf("expected no command override for a real agent-images image, got %v", command)
+	}
+}
+
 // Proves a job kind absent from cfg.Images falls back to the placeholder
 // dev stand-in and its shell-script Command, rather than failing or running
 // with an empty image.
@@ -248,12 +272,15 @@ func TestLimiter_NonPositiveCapacityFallsBackToOne(t *testing.T) {
 	}
 }
 
-// Proves specGrillEnv (ADR 006 item 5) fetches the feature spec and shapes
-// it into the two job-pod env vars entrypoint.sh will eventually consume.
-func TestSpecGrillEnv_FetchesAndBuildsTargetReposAndToken(t *testing.T) {
-	var gotPath string
+// Proves agentRepoEnv (ADR 006 item 5, widened by ADR 010 item 2) fetches
+// the feature spec and shapes it into the job-pod env vars entrypoint.sh
+// will eventually consume, and that it passes the job's own kind through
+// to the API as the query param FetchFeatureSpec expects.
+func TestAgentRepoEnv_FetchesAndBuildsTargetReposAndToken(t *testing.T) {
+	var gotPath, gotQuery string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"title": "Add dark mode",
@@ -270,7 +297,7 @@ func TestSpecGrillEnv_FetchesAndBuildsTargetReposAndToken(t *testing.T) {
 	job := &queue.Job{ID: "job-1", ProjectID: "proj-123", Kind: queue.KindSpecGrill, FeatureID: &featureID}
 	cfg := Config{APIClient: apiclient.New(server.URL, "test-token")}
 
-	env, spec, err := specGrillEnv(context.Background(), cfg, job)
+	env, spec, err := agentRepoEnv(context.Background(), cfg, job)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -278,11 +305,20 @@ func TestSpecGrillEnv_FetchesAndBuildsTargetReposAndToken(t *testing.T) {
 	if gotPath != "/internal/projects/proj-123/features/feat-456/spec" {
 		t.Fatalf("expected path %q, got %q", "/internal/projects/proj-123/features/feat-456/spec", gotPath)
 	}
+	if gotQuery != "kind=spec_grill" {
+		t.Fatalf("expected query %q, got %q", "kind=spec_grill", gotQuery)
+	}
 	if env["GITHUB_TOKEN"] != "ghs_test-token" {
 		t.Fatalf("expected GITHUB_TOKEN %q, got %q", "ghs_test-token", env["GITHUB_TOKEN"])
 	}
 	if spec.Title != "Add dark mode" {
 		t.Fatalf("expected the fetched spec's title to be returned too, got %q", spec.Title)
+	}
+	if _, ok := env["ADR_MARKDOWN"]; ok {
+		t.Fatalf("expected no ADR_MARKDOWN for a spec_grill job, got %v", env)
+	}
+	if _, ok := env["FEATURE_BRANCH"]; ok {
+		t.Fatalf("expected no FEATURE_BRANCH for a spec_grill job, got %v", env)
 	}
 
 	var repos []map[string]any
@@ -294,14 +330,56 @@ func TestSpecGrillEnv_FetchesAndBuildsTargetReposAndToken(t *testing.T) {
 	}
 }
 
-// Proves a spec_grill job dispatched without a feature_id fails loudly
-// instead of silently fetching nothing — this is a dispatch bug (ADR 002
-// always sets one), not a runtime condition worth falling back from.
-func TestSpecGrillEnv_ErrorsWhenFeatureIDMissing(t *testing.T) {
+// Proves a feature_build job's kind reaches the API too, and that
+// ADR_MARKDOWN/FEATURE_BRANCH (ADR 010 items 1-3) get set from the
+// response's adrMarkdown/branch fields — the two env vars entrypoint.sh
+// needs to satisfy the implement skill's documented assumptions.
+func TestAgentRepoEnv_FeatureBuildIncludesAdrMarkdownAndBranch(t *testing.T) {
+	var gotQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"title": "Add dark mode",
+			"repos": []map[string]any{
+				{"cloneUrl": "https://github.com/acme/web.git", "isPrimary": true},
+			},
+			"githubToken": "ghs_write-scoped-token",
+			"adrMarkdown": "# Add dark mode\n\n...",
+			"branch":      "yggdrasil/add-dark-mode-feat-456",
+		})
+	}))
+	defer server.Close()
+
+	featureID := "feat-456"
+	job := &queue.Job{ID: "job-1", ProjectID: "proj-123", Kind: queue.KindFeatureBuild, FeatureID: &featureID}
+	cfg := Config{APIClient: apiclient.New(server.URL, "test-token")}
+
+	env, _, err := agentRepoEnv(context.Background(), cfg, job)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if gotQuery != "kind=feature_build" {
+		t.Fatalf("expected query %q, got %q", "kind=feature_build", gotQuery)
+	}
+	if env["ADR_MARKDOWN"] != "# Add dark mode\n\n..." {
+		t.Fatalf("expected ADR_MARKDOWN to be set from the response, got %q", env["ADR_MARKDOWN"])
+	}
+	if env["FEATURE_BRANCH"] != "yggdrasil/add-dark-mode-feat-456" {
+		t.Fatalf("expected FEATURE_BRANCH to be set from the response, got %q", env["FEATURE_BRANCH"])
+	}
+}
+
+// Proves a spec_grill or feature_build job dispatched without a feature_id
+// fails loudly instead of silently fetching nothing — this is a dispatch
+// bug (ADR 002 always sets one), not a runtime condition worth falling
+// back from.
+func TestAgentRepoEnv_ErrorsWhenFeatureIDMissing(t *testing.T) {
 	job := &queue.Job{ID: "job-1", ProjectID: "proj-123", Kind: queue.KindSpecGrill, FeatureID: nil}
 	cfg := Config{APIClient: apiclient.New("http://unused.invalid", "test-token")}
 
-	_, _, err := specGrillEnv(context.Background(), cfg, job)
+	_, _, err := agentRepoEnv(context.Background(), cfg, job)
 	if err == nil {
 		t.Fatal("expected an error when job.FeatureID is nil")
 	}
@@ -309,7 +387,7 @@ func TestSpecGrillEnv_ErrorsWhenFeatureIDMissing(t *testing.T) {
 
 // Proves a failed spec fetch surfaces as an error rather than silently
 // running the job with an empty/missing GitHub token and repo list.
-func TestSpecGrillEnv_SurfacesFetchError(t *testing.T) {
+func TestAgentRepoEnv_SurfacesFetchError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -319,14 +397,14 @@ func TestSpecGrillEnv_SurfacesFetchError(t *testing.T) {
 	job := &queue.Job{ID: "job-1", ProjectID: "proj-123", Kind: queue.KindSpecGrill, FeatureID: &featureID}
 	cfg := Config{APIClient: apiclient.New(server.URL, "test-token")}
 
-	_, _, err := specGrillEnv(context.Background(), cfg, job)
+	_, _, err := agentRepoEnv(context.Background(), cfg, job)
 	if err == nil {
 		t.Fatal("expected an error when the API returns a non-200 response")
 	}
 }
 
-// Proves runAgentJob actually merges specGrillEnv's output into the
-// created pod's env for a spec_grill job — not just that specGrillEnv
+// Proves runAgentJob actually merges agentRepoEnv's output into the
+// created pod's env for a spec_grill job — not just that agentRepoEnv
 // computes the right map in isolation.
 func TestRunAgentJob_SpecGrillIncludesFetchedRepoAndTokenEnv(t *testing.T) {
 	clientset := testClient(t)

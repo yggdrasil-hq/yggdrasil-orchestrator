@@ -108,6 +108,48 @@ func TestTranslate_CleanAgentEndIsNotCurated(t *testing.T) {
 	}
 }
 
+func TestTranslate_SubmitBuildResultSuccessIsTerminal(t *testing.T) {
+	ev := rawEvent(t, `{"type":"tool_execution_end","toolName":"submit_build_result","result":{"details":{"kind":"submit_build_result","status":"success","prUrl":"https://github.com/acme/web/pull/42","summary":"Added dark mode toggle."},"terminate":true}}`)
+
+	curated, ok := rpc.Translate(ev)
+	if !ok {
+		t.Fatal("expected submit_build_result to be curated")
+	}
+	if curated.Type != rpc.EventSubmitBuildResult {
+		t.Fatalf("expected type %q, got %q", rpc.EventSubmitBuildResult, curated.Type)
+	}
+	if curated.Status != "success" {
+		t.Fatalf("expected status %q, got %q", "success", curated.Status)
+	}
+	if curated.PRUrl != "https://github.com/acme/web/pull/42" {
+		t.Fatalf("expected prUrl to be carried through, got %q", curated.PRUrl)
+	}
+	if curated.Summary != "Added dark mode toggle." {
+		t.Fatalf("expected summary to be carried through, got %q", curated.Summary)
+	}
+	if !curated.Terminal() {
+		t.Fatal("expected submit_build_result to be terminal")
+	}
+}
+
+func TestTranslate_SubmitBuildResultFailureIsAlsoTerminal(t *testing.T) {
+	ev := rawEvent(t, `{"type":"tool_execution_end","toolName":"submit_build_result","result":{"details":{"kind":"submit_build_result","status":"failure","summary":"ADR referenced a package that doesn't exist."},"terminate":true}}`)
+
+	curated, ok := rpc.Translate(ev)
+	if !ok {
+		t.Fatal("expected submit_build_result to be curated")
+	}
+	if curated.Status != "failure" {
+		t.Fatalf("expected status %q, got %q", "failure", curated.Status)
+	}
+	if curated.PRUrl != "" {
+		t.Fatalf("expected no prUrl on a failure result, got %q", curated.PRUrl)
+	}
+	if !curated.Terminal() {
+		t.Fatal("expected a failed submit_build_result to still be terminal — it ends the run either way, only the caller decides success vs. failure")
+	}
+}
+
 func TestRunFailedIsTerminal(t *testing.T) {
 	ev := rpc.CuratedEvent{Type: rpc.EventRunFailed, Message: "attach stream ended"}
 	if !ev.Terminal() {

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/rpc"
 )
@@ -135,31 +136,48 @@ type FeatureSpecRepo struct {
 	IsPrimary bool   `json:"isPrimary"`
 }
 
-// FeatureSpec is a spec_grill job's payload: the feature title (the first
-// prompt sent to Pi), its FeatureType, the project's linked repos, and a
-// job-scoped GitHub installation token freshly minted by the API for this
-// fetch — short-lived or (ADR 005 §14), unlike the model config secrets,
-// which is why it isn't delivered through FetchProjectSecrets/project_secrets.
+// FeatureSpec is a job's feature payload: the feature title (the first
+// prompt sent to Pi for spec_grill), its FeatureType, the project's linked
+// repos, and a job-scoped GitHub installation token freshly minted by the
+// API for this fetch — short-lived (ADR 005 §14), unlike the model config
+// secrets, which is why it isn't delivered through
+// FetchProjectSecrets/project_secrets.
+//
+// AdrMarkdown and Branch are only populated when kind is "feature_build"
+// (ADR 010 item 1) — the approved ADR to implement and the feature branch
+// already expected checked out, per feature_build/skills/implement/
+// SKILL.md's own documented assumptions. Both are empty for spec_grill,
+// which has no ADR yet and clones each repo's default branch.
 //
 // FeatureType ("normal" | "project_init") lets buildInitialPrompt
-// (specgrill.go) pick which skill governs the run explicitly, instead of
-// the model inferring it from Title alone (ADR 008 item 1-2) — Title for a
-// project_init feature is a fixed, non-descriptive string ("Project
-// initialization"), so it carries no information the container could use to
-// tell the two cases apart on its own.
+// (specgrill.go) pick which skill governs a spec_grill run explicitly,
+// instead of the model inferring it from Title alone (ADR 008 item 1-2) —
+// Title for a project_init feature is a fixed, non-descriptive string
+// ("Project initialization"), so it carries no information the container
+// could use to tell the two cases apart on its own.
 type FeatureSpec struct {
 	Title       string            `json:"title"`
 	FeatureType string            `json:"featureType"`
 	Repos       []FeatureSpecRepo `json:"repos"`
 	GithubToken string            `json:"githubToken"`
+	AdrMarkdown string            `json:"adrMarkdown"`
+	Branch      string            `json:"branch"`
 }
 
-// FetchFeatureSpec fetches a spec_grill job's payload (ADR 006 item 5). A
-// feature is scoped to its project, so both IDs are required — mirrors the
-// API's own FeatureRepository.findById(projectId, featureId).
-func (c *Client) FetchFeatureSpec(ctx context.Context, projectID, featureID string) (FeatureSpec, error) {
-	url := fmt.Sprintf("%s/internal/projects/%s/features/%s/spec", c.baseURL, projectID, featureID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// FetchFeatureSpec fetches a job's feature payload (ADR 006 item 5, widened
+// by ADR 010 item 1). A feature is scoped to its project, so both IDs are
+// required — mirrors the API's own FeatureRepository.findById(projectId,
+// featureId). kind (e.g. "spec_grill"/"feature_build") is passed through as
+// a query param so the API can decide both the response shape (AdrMarkdown/
+// Branch) and the minted token's scope (read-only for spec_grill,
+// contents:write+pull-requests:write for feature_build) — this is the
+// existing internal, bearer-token-only surface, not user-facing, so a
+// caller-supplied kind carries no privilege-escalation risk beyond what an
+// internal service is already trusted with.
+func (c *Client) FetchFeatureSpec(ctx context.Context, projectID, featureID, kind string) (FeatureSpec, error) {
+	reqURL := fmt.Sprintf("%s/internal/projects/%s/features/%s/spec?%s",
+		c.baseURL, projectID, featureID, url.Values{"kind": {kind}}.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return FeatureSpec{}, fmt.Errorf("failed to build request: %w", err)
 	}
@@ -187,6 +205,9 @@ type jobEventRequest struct {
 	Question string `json:"question,omitempty"`
 	Markdown string `json:"markdown,omitempty"`
 	Message  string `json:"message,omitempty"`
+	Status   string `json:"status,omitempty"`
+	PRUrl    string `json:"prUrl,omitempty"`
+	Summary  string `json:"summary,omitempty"`
 }
 
 // PostJobEvent relays one curated event (ADR 006 items 7-8) from a running
@@ -200,6 +221,9 @@ func (c *Client) PostJobEvent(ctx context.Context, jobID string, event rpc.Curat
 		Question: event.Question,
 		Markdown: event.Markdown,
 		Message:  event.Message,
+		Status:   event.Status,
+		PRUrl:    event.PRUrl,
+		Summary:  event.Summary,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to encode job event: %w", err)

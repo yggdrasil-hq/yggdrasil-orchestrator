@@ -29,6 +29,13 @@ const (
 	// stream), like EventRunFailed, but for the expected case: a human
 	// asked to stop the run (queue.Queue.WatchCancellation), not an error.
 	EventRunCancelled CuratedEventType = "run_cancelled"
+	// EventSubmitBuildResult: the yggdrasil-contract extension's
+	// submit_build_result tool fired (feature_build only, ADR 010 item 7) —
+	// the implement skill's single terminating call, analogous to
+	// submit_adr for spec_grill. Always ends the run (Terminal() is true
+	// regardless of Status): the two outcomes (Status "success"/"failure")
+	// are distinguished by the caller, not by whether the run ended.
+	EventSubmitBuildResult CuratedEventType = "submit_build_result"
 )
 
 // CuratedEvent is one product-meaningful event translated from Pi's raw
@@ -38,13 +45,16 @@ type CuratedEvent struct {
 	Question string // set for EventAskUser
 	Markdown string // set for EventSubmitADR
 	Message  string // set for EventRunFailed/EventRunCancelled
+	Status   string // set for EventSubmitBuildResult: "success" | "failure"
+	PRUrl    string // set for EventSubmitBuildResult on success
+	Summary  string // set for EventSubmitBuildResult
 }
 
 // Terminal reports whether this event ends the whole job run (ADR 006 item
 // 11): the Orchestrator should stop driving the session and tear the pod
 // down, rather than waiting for more events.
 func (e CuratedEvent) Terminal() bool {
-	return e.Type == EventSubmitADR || e.Type == EventRunFailed || e.Type == EventRunCancelled
+	return e.Type == EventSubmitADR || e.Type == EventRunFailed || e.Type == EventRunCancelled || e.Type == EventSubmitBuildResult
 }
 
 // contractToolResult mirrors the shape yggdrasil-contract's tool
@@ -56,6 +66,9 @@ type contractToolResult struct {
 		Kind     string `json:"kind"`
 		Question string `json:"question"`
 		Markdown string `json:"markdown"`
+		Status   string `json:"status"`
+		PRUrl    string `json:"prUrl"`
+		Summary  string `json:"summary"`
 	} `json:"details"`
 }
 
@@ -79,7 +92,8 @@ type agentEndEvent struct {
 
 // Translate maps a raw Pi RPC event to a curated Event (ADR 006 item 7),
 // scoped for now to the yggdrasil-contract extension's tool-call-based
-// signals (ask_user/submit_adr) — the ones needed to detect completion
+// signals (ask_user/submit_adr for spec_grill, submit_build_result for
+// feature_build, ADR 010 item 7) — the ones needed to detect completion
 // (item 11) — plus one raw Pi event, agent_end, but only far enough to catch
 // a request-level failure (translateAgentEnd); a clean agent_end is left
 // untranslated since a contract tool call, not agent_end, is what ends a
@@ -113,6 +127,13 @@ func translateToolExecutionEnd(ev Event) (CuratedEvent, bool) {
 		return CuratedEvent{Type: EventAskUser, Question: parsed.Result.Details.Question}, true
 	case "submit_adr":
 		return CuratedEvent{Type: EventSubmitADR, Markdown: parsed.Result.Details.Markdown}, true
+	case "submit_build_result":
+		return CuratedEvent{
+			Type:    EventSubmitBuildResult,
+			Status:  parsed.Result.Details.Status,
+			PRUrl:   parsed.Result.Details.PRUrl,
+			Summary: parsed.Result.Details.Summary,
+		}, true
 	default:
 		return CuratedEvent{}, false
 	}

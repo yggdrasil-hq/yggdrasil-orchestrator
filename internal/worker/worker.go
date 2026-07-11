@@ -227,10 +227,11 @@ func runClaimedJob(ctx context.Context, q *queue.Queue, clientset kubernetes.Int
 
 // runInCluster executes a claimed job in the project's namespace (ADR 003):
 // `deploy` jobs apply the project's Helm chart to update its always-on
-// primary deployment (ADR 003 §9-13). A spec_grill job with a real image
-// configured (cfg.Images) drives Pi's RPC session directly (ADR 006 items
-// 2-4, 7, 11) via runSpecGrillJob; every other case (spec_grill with no
-// real image configured yet, feature_build, test_run) still runs the
+// primary deployment (ADR 003 §9-13). A spec_grill or feature_build job
+// with a real image configured for its kind (cfg.Images) drives Pi's RPC
+// session directly (ADR 006 items 2-4, 7, 11; widened to feature_build by
+// ADR 010 item 4) via runAgentRPCJob; every other case (either kind with no
+// real image configured yet, or test_run) still runs the
 // placeholder-compatible blocking k8s.RunJob path via runAgentJob — those
 // job kinds don't yet have their own completion-detection/event-handling
 // wiring, so attaching to them would risk hanging exactly the way
@@ -245,9 +246,9 @@ func runInCluster(ctx context.Context, q *queue.Queue, clientset kubernetes.Inte
 		return runDeploy(ctx, clientset, job.ProjectID, namespace, cfg)
 	}
 
-	if job.Kind == queue.KindSpecGrill {
-		if img, ok := cfg.Images[queue.KindSpecGrill]; ok && img != "" {
-			return runSpecGrillJob(ctx, q, clientset, job, namespace, cfg)
+	if job.Kind == queue.KindSpecGrill || job.Kind == queue.KindFeatureBuild {
+		if img, ok := cfg.Images[job.Kind]; ok && img != "" {
+			return runAgentRPCJob(ctx, q, clientset, job, namespace, cfg)
 		}
 	}
 
@@ -287,10 +288,11 @@ func runAgentJob(ctx context.Context, clientset kubernetes.Interface, job *queue
 // MODEL_BASE_URL/MODEL_API_KEY/MODEL_ID, decrypted from project_secrets) as
 // plain job-pod env vars, the same delivery path already used for the
 // scoped GitHub token, not a Kubernetes Secret object — plus, for
-// spec_grill, TARGET_REPOS/GITHUB_TOKEN via specGrillEnv (ADR 006 item 5).
-// Also returns the fetched FeatureSpec (zero value for non-spec_grill
-// jobs) so runSpecGrillJob can reuse spec.Title for the initial RPC prompt
-// without fetching it a second time.
+// spec_grill and feature_build (ADR 010 item 2), TARGET_REPOS/GITHUB_TOKEN
+// (and, feature_build only, ADR_MARKDOWN/FEATURE_BRANCH) via agentRepoEnv.
+// Also returns the fetched FeatureSpec (zero value for job kinds that don't
+// fetch one) so runAgentRPCJob can reuse spec.Title/spec.FeatureType for
+// the initial RPC prompt without fetching it a second time.
 func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]string, apiclient.FeatureSpec, error) {
 	env := map[string]string{
 		"JOB_ID":     job.ID,
@@ -307,8 +309,8 @@ func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]
 	}
 
 	var spec apiclient.FeatureSpec
-	if job.Kind == queue.KindSpecGrill {
-		specEnv, fetchedSpec, err := specGrillEnv(ctx, cfg, job)
+	if job.Kind == queue.KindSpecGrill || job.Kind == queue.KindFeatureBuild {
+		specEnv, fetchedSpec, err := agentRepoEnv(ctx, cfg, job)
 		if err != nil {
 			return nil, apiclient.FeatureSpec{}, err
 		}
@@ -321,21 +323,29 @@ func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]
 	return env, spec, nil
 }
 
-// specGrillEnv fetches a spec_grill job's payload (ADR 006 item 5) and
-// returns both the extra job-pod env vars it needs — TARGET_REPOS
-// (JSON-encoded FeatureSpecRepo list, consumed by base/entrypoint.sh's
-// clone step, ADR 006 item 6) and GITHUB_TOKEN (a fresh, job-scoped,
-// contents:read-only installation token minted by that same API call — not
-// a project_secrets value, since installation tokens are short-lived and
-// per-job, ADR 005 §14/§16) — and the fetched spec itself. Every spec_grill
-// job is dispatched with a feature_id (ADR 002); one missing is a dispatch
-// bug, not a condition to fall back from.
-func specGrillEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]string, apiclient.FeatureSpec, error) {
+// agentRepoEnv fetches a spec_grill or feature_build job's feature payload
+// (ADR 006 item 5, widened by ADR 010 item 2) and returns both the extra
+// job-pod env vars it needs and the fetched spec itself:
+//   - TARGET_REPOS (JSON-encoded FeatureSpecRepo list, consumed by
+//     base/entrypoint.sh's clone step, ADR 006 item 6) and GITHUB_TOKEN (a
+//     fresh, job-scoped installation token minted by that same API call —
+//     not a project_secrets value, since installation tokens are
+//     short-lived and per-job, ADR 005 §14/§16; scoped read-only for
+//     spec_grill, contents:write+pull-requests:write for feature_build) —
+//     both always set.
+//   - ADR_MARKDOWN/FEATURE_BRANCH (ADR 010 item 3, consumed by
+//     entrypoint.sh's branch-checkout/ADR-file-write step) — only set when
+//     the API response carries them, i.e. feature_build only.
+//
+// Every spec_grill/feature_build job is dispatched with a feature_id (ADR
+// 002, api/src/projects/routes.ts); one missing is a dispatch bug, not a
+// condition to fall back from.
+func agentRepoEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]string, apiclient.FeatureSpec, error) {
 	if job.FeatureID == nil {
-		return nil, apiclient.FeatureSpec{}, fmt.Errorf("spec_grill job %s has no feature_id", job.ID)
+		return nil, apiclient.FeatureSpec{}, fmt.Errorf("job %s (kind=%s) has no feature_id", job.ID, job.Kind)
 	}
 
-	spec, err := cfg.APIClient.FetchFeatureSpec(ctx, job.ProjectID, *job.FeatureID)
+	spec, err := cfg.APIClient.FetchFeatureSpec(ctx, job.ProjectID, *job.FeatureID, string(job.Kind))
 	if err != nil {
 		return nil, apiclient.FeatureSpec{}, fmt.Errorf("failed to fetch feature spec: %w", err)
 	}
@@ -348,6 +358,12 @@ func specGrillEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]s
 	env := map[string]string{
 		"TARGET_REPOS": string(targetRepos),
 		"GITHUB_TOKEN": spec.GithubToken,
+	}
+	if spec.AdrMarkdown != "" {
+		env["ADR_MARKDOWN"] = spec.AdrMarkdown
+	}
+	if spec.Branch != "" {
+		env["FEATURE_BRANCH"] = spec.Branch
 	}
 	return env, spec, nil
 }

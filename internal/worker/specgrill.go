@@ -23,8 +23,8 @@ import (
 // is a safety net against a hang, not an expected wait.
 const endTurnGrace = 10 * time.Second
 
-// errJobCancelled is returned by driveSpecGrillSession (and propagates
-// unwrapped through runSpecGrillJob/runInCluster) when a human asked to
+// errJobCancelled is returned by driveAgentSession (and propagates
+// unwrapped through runAgentRPCJob/runInCluster) when a human asked to
 // stop the run, so runClaimedJob's log line can say "cancelled" instead of
 // "failed", and so callers can tell the two apart via errors.Is. The DB
 // outcome doesn't depend on this: queue.Queue.Fail's own guard (only
@@ -33,7 +33,7 @@ const endTurnGrace = 10 * time.Second
 var errJobCancelled = errors.New("job cancelled")
 
 // replyWaiter is the subset of *messages.Store (ADR 006 items 9-10)
-// driveSpecGrillSession needs — an interface so tests can substitute a
+// driveAgentSession needs — an interface so tests can substitute a
 // fake reply source without a real Postgres connection, decoupling
 // "does the session correctly pause/resume around ask_user" (testable
 // against a real attached pod with a fake replyWaiter) from "does
@@ -43,7 +43,7 @@ type replyWaiter interface {
 	WaitForReply(ctx context.Context, jobID string) (string, error)
 }
 
-// cancelWatcher is the subset of *queue.Queue driveSpecGrillSession needs
+// cancelWatcher is the subset of *queue.Queue driveAgentSession needs
 // to learn a human asked to stop this job (the cancel/abort follow-up
 // tracked in ADR 006's "Follow-ups" section) — an interface for the same
 // reason as replyWaiter: tests can substitute a fake without a real
@@ -52,19 +52,20 @@ type cancelWatcher interface {
 	WatchCancellation(ctx context.Context, jobID string) error
 }
 
-// runSpecGrillJob runs a spec_grill job by attaching to its pod and driving
-// Pi's RPC session directly (ADR 006 items 2-4, 7, 11), instead of the
-// placeholder-compatible blocking k8s.RunJob every other job kind still
-// uses (runAgentJob, worker.go). Only reached once a real image is
-// configured for spec_grill (cfg.Images — see runInCluster's routing).
+// runAgentRPCJob runs a spec_grill or feature_build job by attaching to its
+// pod and driving Pi's RPC session directly (ADR 006 items 2-4, 7, 11;
+// widened to feature_build by ADR 010), instead of the placeholder-
+// compatible blocking k8s.RunJob every other job kind still uses
+// (runAgentJob, worker.go). Only reached once a real image is configured
+// for the job's kind (cfg.Images — see runInCluster's routing).
 //
 // Kubernetes Job status is not the completion signal here: Pi's RPC
-// process never exits on its own, so driveSpecGrillSession itself decides
+// process never exits on its own, so driveAgentSession itself decides
 // when the run is over — from the event stream, not from Job.Status — and
 // this function explicitly deletes the Job once it does (or once the
 // session ends any other way), rather than waiting for Kubernetes to
 // report success.
-func runSpecGrillJob(ctx context.Context, q *queue.Queue, clientset kubernetes.Interface, job *queue.Job, namespace string, cfg Config) error {
+func runAgentRPCJob(ctx context.Context, q *queue.Queue, clientset kubernetes.Interface, job *queue.Job, namespace string, cfg Config) error {
 	env, spec, err := buildAgentEnv(ctx, cfg, job)
 	if err != nil {
 		return err
@@ -90,7 +91,7 @@ func runSpecGrillJob(ctx context.Context, q *queue.Queue, clientset kubernetes.I
 		// an already-cancelled ctx here would make DeleteJob a no-op and
 		// leak the pod.
 		if err := k8s.DeleteJob(context.Background(), clientset, namespace, name); err != nil {
-			log.Printf("worker: failed to delete spec_grill job %s: %v", job.ID, err)
+			log.Printf("worker: failed to delete job %s (kind=%s): %v", job.ID, job.Kind, err)
 		}
 	}()
 
@@ -99,20 +100,45 @@ func runSpecGrillJob(ctx context.Context, q *queue.Queue, clientset kubernetes.I
 		return fmt.Errorf("pod never became attachable: %w", err)
 	}
 
-	initialPrompt := buildInitialPrompt(spec)
+	initialPrompt := buildInitialPrompt(job.Kind, spec)
 
-	return driveSpecGrillSession(ctx, clientset, cfg.RESTConfig, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, func(ev rpc.CuratedEvent) {
+	return driveAgentSession(ctx, clientset, cfg.RESTConfig, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, func(ev rpc.CuratedEvent) {
 		if err := cfg.APIClient.PostJobEvent(ctx, job.ID, ev); err != nil {
 			// A failed relay is a visibility gap, not a job failure: the
-			// job's actual outcome (an ADR submitted, or not) is decided by
-			// the event itself, independent of whether this side-channel
-			// post to the API succeeded.
+			// job's actual outcome (an ADR submitted, a PR opened, or not)
+			// is decided by the event itself, independent of whether this
+			// side-channel post to the API succeeded.
 			log.Printf("worker: failed to relay event %s for job %s: %v", ev.Type, job.ID, err)
 		}
 	})
 }
 
-// buildInitialPrompt states the job's constraints explicitly instead of
+// buildInitialPrompt picks the prompt shape for the job's kind (ADR 010
+// item 6): a feature_build run gets buildFeatureBuildPrompt's short form,
+// everything else (spec_grill) gets buildSpecGrillPrompt's fuller one.
+func buildInitialPrompt(kind queue.JobKind, spec apiclient.FeatureSpec) string {
+	if kind == queue.KindFeatureBuild {
+		return buildFeatureBuildPrompt(spec)
+	}
+	return buildSpecGrillPrompt(spec)
+}
+
+// buildFeatureBuildPrompt is deliberately short: unlike spec_grill (which
+// has to spell out each repo's local path itself, since the agent has no
+// other way to learn the clone layout), feature_build/skills/implement/
+// SKILL.md already documents its own assumptions in full — repos cloned,
+// feature branch checked out, approved ADR written to
+// /workspace/.yggdrasil/adr.md (ADR 010 item 3) — so the Orchestrator
+// doesn't need to restate any of it here, just point at the skill.
+func buildFeatureBuildPrompt(spec apiclient.FeatureSpec) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Implement this feature: %s\n\n", spec.Title)
+	b.WriteString("Read /root/.pi/agent/skills/implement/SKILL.md first — it governs this ")
+	b.WriteString("entire run and already states what's been set up for you before you started.")
+	return b.String()
+}
+
+// buildSpecGrillPrompt states the job's constraints explicitly instead of
 // leaving the agent to (re)discover them — verified against a real stuck
 // run: a bare "New feature: <title>" prompt relied entirely on the model's
 // own initiative to think to read a skill file before doing anything else,
@@ -127,7 +153,7 @@ func runSpecGrillJob(ctx context.Context, q *queue.Queue, clientset kubernetes.I
 // infer from Title which of the two spec_grill skills applies — Title for
 // a project_init feature is the fixed, non-descriptive string "Project
 // initialization" and carries no signal the container could use on its own.
-func buildInitialPrompt(spec apiclient.FeatureSpec) string {
+func buildSpecGrillPrompt(spec apiclient.FeatureSpec) string {
 	var b strings.Builder
 	if spec.FeatureType == "project_init" {
 		b.WriteString("This is a project_init job — the very first spec_grill run for this ")
@@ -173,12 +199,17 @@ func repoLocalDir(repo apiclient.FeatureSpecRepo) string {
 	return "/workspace/" + name
 }
 
-// driveSpecGrillSession drives a spec_grill job's Pi RPC session turn by
-// turn: send initialPrompt, read the response, and — for as long as the
-// yggdrasil-contract extension's ask_user tool keeps firing (a non-terminal
-// signal; see CuratedEvent.Terminal) — wait for the human's reply (ADR 006
-// items 9-10, via msgs) and send it as the next turn's prompt, until
-// submit_adr (or a hard failure) ends the run (ADR 006 item 11).
+// driveAgentSession drives a spec_grill or feature_build job's Pi RPC
+// session turn by turn: send initialPrompt, read the response, and — for as
+// long as the yggdrasil-contract extension's ask_user tool keeps firing (a
+// non-terminal signal; see CuratedEvent.Terminal) — wait for the human's
+// reply (ADR 006 items 9-10, via msgs) and send it as the next turn's
+// prompt, until submit_adr/submit_build_result (or a hard failure) ends the
+// run (ADR 006 item 11; ADR 010 item 8). feature_build's implement skill
+// has no ask_user tool registered, so for that kind this loop's reply-wait
+// branch is simply never reached — the first turn's curated event is
+// always terminal (submit_build_result), with no special-casing needed here
+// to skip it.
 //
 // Each turn is its own k8s.Attach call (runTurn), not one continuous attach
 // for the whole session — see k8s.Attach's doc comment for why: client-go's
@@ -195,7 +226,7 @@ func repoLocalDir(repo apiclient.FeatureSpecRepo) string {
 // deliberate stop from any other ctx-cancellation-shaped error (Orchestrator
 // shutdown, a real attach failure), so the right curated event/return value
 // goes out.
-func driveSpecGrillSession(
+func driveAgentSession(
 	ctx context.Context,
 	clientset kubernetes.Interface,
 	restConfig *rest.Config,
@@ -235,6 +266,14 @@ func driveSpecGrillSession(
 				// q.Complete.
 				return fmt.Errorf("agent run ended with an error: %s", curated.Message)
 			}
+			if curated.Type == rpc.EventSubmitBuildResult && curated.Status == "failure" {
+				// Mirrors the EventRunFailed branch above: submit_build_result
+				// is always terminal (ADR 010 item 7), but only a "failure"
+				// status should make runClaimedJob call q.Fail instead of
+				// q.Complete — a "success" status falls through to the
+				// unconditional `return nil` below, same as submit_adr.
+				return fmt.Errorf("feature_build run reported failure: %s", curated.Summary)
+			}
 			return nil
 		}
 
@@ -261,8 +300,9 @@ func reportSessionError(handle func(rpc.CuratedEvent), cancelled bool, err error
 
 // runTurn attaches once (one k8s.Attach call = one turn), sends prompt as
 // Pi's next RPC prompt, and reads events until the yggdrasil-contract
-// extension's tool-call-based signal (ask_user or submit_adr) says the
-// turn is over — neither Pi's own agent_end event nor a tool result's own
+// extension's tool-call-based signal (ask_user/submit_adr for spec_grill,
+// submit_build_result for feature_build) says the turn is over — neither
+// Pi's own agent_end event nor a tool result's own
 // terminate:true flag mean that (ask_user sets terminate:true too; only
 // the tool's identity, via rpc.Translate, distinguishes "end the turn" from
 // "end the run") — then ends the turn (letting the attach call return
@@ -331,7 +371,7 @@ func runTurn(
 		case <-ctx.Done():
 			// Best-effort: give Pi a chance to end its current operation
 			// cleanly (the cancel/abort follow-up from ADR 006) before the
-			// pod is deleted — k8s.DeleteJob (runSpecGrillJob) is what
+			// pod is deleted — k8s.DeleteJob (runAgentRPCJob) is what
 			// actually guarantees termination, so a failed send here isn't
 			// fatal, just a missed courtesy. Safe to call Send here (unlike
 			// the nested ctx.Done() above): EndTurn hasn't run on this path,

@@ -188,7 +188,7 @@ func TestFetchFeatureSpec_SendsBearerTokenAndParsesResponse(t *testing.T) {
 	defer server.Close()
 
 	client := apiclient.New(server.URL, "test-token")
-	spec, err := client.FetchFeatureSpec(context.Background(), "proj-123", "feat-456")
+	spec, err := client.FetchFeatureSpec(context.Background(), "proj-123", "feat-456", "spec_grill")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -210,6 +210,43 @@ func TestFetchFeatureSpec_SendsBearerTokenAndParsesResponse(t *testing.T) {
 	}
 }
 
+// Proves the kind param actually reaches the API as a query string, and that
+// the feature_build-only fields (ADR 010 item 1) get decoded when present.
+func TestFetchFeatureSpec_PassesKindAndDecodesBuildFields(t *testing.T) {
+	var gotQuery string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"title": "Add dark mode",
+			"repos": []map[string]any{
+				{"cloneUrl": "https://github.com/acme/web.git", "isPrimary": true},
+			},
+			"githubToken": "ghs_write-scoped-token",
+			"adrMarkdown": "# Add dark mode\n\n...",
+			"branch":      "yggdrasil/add-dark-mode-feat-456",
+		})
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	spec, err := client.FetchFeatureSpec(context.Background(), "proj-123", "feat-456", "feature_build")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if gotQuery != "kind=feature_build" {
+		t.Fatalf("expected query %q, got %q", "kind=feature_build", gotQuery)
+	}
+	if spec.AdrMarkdown != "# Add dark mode\n\n..." {
+		t.Fatalf("expected adrMarkdown to be decoded, got %q", spec.AdrMarkdown)
+	}
+	if spec.Branch != "yggdrasil/add-dark-mode-feat-456" {
+		t.Fatalf("expected branch to be decoded, got %q", spec.Branch)
+	}
+}
+
 func TestFetchFeatureSpec_ReturnsErrorOnNon200(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -217,7 +254,7 @@ func TestFetchFeatureSpec_ReturnsErrorOnNon200(t *testing.T) {
 	defer server.Close()
 
 	client := apiclient.New(server.URL, "test-token")
-	_, err := client.FetchFeatureSpec(context.Background(), "proj-123", "feat-456")
+	_, err := client.FetchFeatureSpec(context.Background(), "proj-123", "feat-456", "spec_grill")
 	if err == nil {
 		t.Fatal("expected an error for a 404 response, got nil")
 	}
