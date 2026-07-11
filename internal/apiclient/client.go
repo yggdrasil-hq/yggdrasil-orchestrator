@@ -136,12 +136,20 @@ type FeatureSpecRepo struct {
 }
 
 // FeatureSpec is a spec_grill job's payload: the feature title (the first
-// prompt sent to Pi), the project's linked repos, and a job-scoped GitHub
-// installation token freshly minted by the API for this fetch — short-lived
-// or (ADR 005 §14), unlike the model config secrets, which is why it isn't
-// delivered through FetchProjectSecrets/project_secrets.
+// prompt sent to Pi), its FeatureType, the project's linked repos, and a
+// job-scoped GitHub installation token freshly minted by the API for this
+// fetch — short-lived or (ADR 005 §14), unlike the model config secrets,
+// which is why it isn't delivered through FetchProjectSecrets/project_secrets.
+//
+// FeatureType ("normal" | "project_init") lets buildInitialPrompt
+// (specgrill.go) pick which skill governs the run explicitly, instead of
+// the model inferring it from Title alone (ADR 008 item 1-2) — Title for a
+// project_init feature is a fixed, non-descriptive string ("Project
+// initialization"), so it carries no information the container could use to
+// tell the two cases apart on its own.
 type FeatureSpec struct {
 	Title       string            `json:"title"`
+	FeatureType string            `json:"featureType"`
 	Repos       []FeatureSpecRepo `json:"repos"`
 	GithubToken string            `json:"githubToken"`
 }

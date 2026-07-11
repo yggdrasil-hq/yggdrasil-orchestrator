@@ -115,20 +115,38 @@ func runSpecGrillJob(ctx context.Context, q *queue.Queue, clientset kubernetes.I
 // buildInitialPrompt states the job's constraints explicitly instead of
 // leaving the agent to (re)discover them — verified against a real stuck
 // run: a bare "New feature: <title>" prompt relied entirely on the model's
-// own initiative to think to read grill-with-docs/SKILL.md before doing
-// anything else, which isn't guaranteed, and gave no indication of where
-// (or whether) repos were already on disk. This lists each repo's actual
-// local path so the agent doesn't need to guess or re-derive it, mirroring
-// entrypoint.sh's own clone layout (primary at /workspace, sub-repos at
+// own initiative to think to read a skill file before doing anything else,
+// which isn't guaranteed, and gave no indication of where (or whether)
+// repos were already on disk. This lists each repo's actual local path so
+// the agent doesn't need to guess or re-derive it, mirroring entrypoint.sh's
+// own clone layout (primary at /workspace, sub-repos at
 // /workspace/<repo-name>) exactly.
+//
+// It also branches on spec.FeatureType (ADR 008 items 1-2) to name the
+// exact skill file governing this run, rather than leaving the model to
+// infer from Title which of the two spec_grill skills applies — Title for
+// a project_init feature is the fixed, non-descriptive string "Project
+// initialization" and carries no signal the container could use on its own.
 func buildInitialPrompt(spec apiclient.FeatureSpec) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "New feature: %s\n\n", spec.Title)
-	b.WriteString("This is a spec_grill job. You have read-only access to the repo(s) below — ")
-	b.WriteString("already cloned to the paths listed, nothing left to fetch. Your only job is ")
-	b.WriteString("to explore, interview the user, and call submit_adr; you cannot and must not ")
-	b.WriteString("modify these repos in any way. Read /root/.pi/agent/skills/grill-with-docs/SKILL.md ")
-	b.WriteString("first — it governs this entire run.\n\nRepos:\n")
+	if spec.FeatureType == "project_init" {
+		b.WriteString("This is a project_init job — the very first spec_grill run for this ")
+		b.WriteString("project. Your goal is to bootstrap/adapt the repo(s) below for Yggdrasil: ")
+		b.WriteString("interview the user about what the project does, its tech stack, and how its ")
+		b.WriteString("repos relate; check the target repo(s) against the structure standard; and ")
+		b.WriteString("submit an ADR describing what to scaffold or restructure. Read ")
+		b.WriteString("/root/.pi/agent/skills/project-init/SKILL.md first — it governs this entire ")
+		b.WriteString("run, and is the only skill that applies here (not feature-grill).\n\n")
+	} else {
+		fmt.Fprintf(&b, "New feature: %s\n\n", spec.Title)
+		b.WriteString("This is a normal feature's spec_grill job. Read ")
+		b.WriteString("/root/.pi/agent/skills/feature-grill/SKILL.md first — it governs this entire ")
+		b.WriteString("run, and is the only skill that applies here (not project-init).\n\n")
+	}
+	b.WriteString("You have read-only access to the repo(s) below — already cloned to the paths ")
+	b.WriteString("listed, nothing left to fetch. Your only job is to explore, interview the user, ")
+	b.WriteString("and call submit_adr; you cannot and must not modify these repos in any way.")
+	b.WriteString("\n\nRepos:\n")
 	for _, repo := range spec.Repos {
 		dir := repoLocalDir(repo)
 		role := "sub-repo"

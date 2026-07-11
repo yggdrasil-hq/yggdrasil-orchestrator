@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/apiclient"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/k8s"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/rpc"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -324,5 +325,39 @@ func TestDriveSpecGrillSession_CancellationWhileAwaitingReplyEndsSessionAsCancel
 	}
 	if received[1].Type != rpc.EventRunCancelled {
 		t.Fatalf("expected the second event to be run_cancelled, got %q", received[1].Type)
+	}
+}
+
+// TestBuildInitialPrompt_NamesTheSkillMatchingFeatureType verifies ADR 008
+// items 1-2: the prompt must name project-init's SKILL.md for a
+// project_init feature and feature-grill's for everything else, since
+// Title alone ("Project initialization") carries no signal the container
+// could use to tell the two cases apart on its own.
+func TestBuildInitialPrompt_NamesTheSkillMatchingFeatureType(t *testing.T) {
+	projectInit := buildInitialPrompt(apiclient.FeatureSpec{
+		Title:       "Project initialization",
+		FeatureType: "project_init",
+		Repos:       []apiclient.FeatureSpecRepo{{CloneURL: "https://github.com/acme/web.git", IsPrimary: true}},
+	})
+	if !strings.Contains(projectInit, "project-init/SKILL.md") {
+		t.Fatalf("expected project_init prompt to name project-init/SKILL.md, got: %s", projectInit)
+	}
+	if strings.Contains(projectInit, "feature-grill/SKILL.md") {
+		t.Fatalf("project_init prompt must not also name feature-grill/SKILL.md, got: %s", projectInit)
+	}
+
+	normal := buildInitialPrompt(apiclient.FeatureSpec{
+		Title:       "Add dark mode",
+		FeatureType: "normal",
+		Repos:       []apiclient.FeatureSpecRepo{{CloneURL: "https://github.com/acme/web.git", IsPrimary: true}},
+	})
+	if !strings.Contains(normal, "feature-grill/SKILL.md") {
+		t.Fatalf("expected normal-feature prompt to name feature-grill/SKILL.md, got: %s", normal)
+	}
+	if strings.Contains(normal, "project-init/SKILL.md") {
+		t.Fatalf("normal-feature prompt must not also name project-init/SKILL.md, got: %s", normal)
+	}
+	if !strings.Contains(normal, "Add dark mode") {
+		t.Fatalf("expected normal-feature prompt to include the feature title, got: %s", normal)
 	}
 }
