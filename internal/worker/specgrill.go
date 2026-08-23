@@ -82,6 +82,7 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, clientset kubernetes.In
 		Env:              env,
 		RuntimeClassName: cfg.RuntimeClassName,
 		Stdin:            true,
+		Resources:        k8s.AgentResources(),
 	}); err != nil {
 		return fmt.Errorf("failed to create job: %w", err)
 	}
@@ -350,35 +351,55 @@ func runTurn(
 		return rpc.CuratedEvent{}, fmt.Errorf("failed to send prompt: %w", err)
 	}
 
+	// Remembers the most recent low-level agent run's stop reason (one of
+	// Pi's own values: "stop", "length", "toolUse", "error", "aborted") so
+	// the agent_settled branch below can say why, if it ends up firing.
+	var lastStopReason string
+
 	for {
 		select {
 		case ev, ok := <-rpcClient.Events():
 			if !ok {
 				return rpc.CuratedEvent{}, fmt.Errorf("RPC event stream for pod %s/%s ended before a turn-ending event was seen", namespace, podName)
 			}
+			if reason, ok := rpc.LastMessageStopReason(ev); ok {
+				lastStopReason = reason
+			}
+
+			// Pi's session-level "fully settled" signal (no automatic
+			// retry, compaction retry, or queued follow-up remains — Pi
+			// RPC docs) is not itself a contract-tool-driven signal, so
+			// rpc.Translate never matches it. Left unhandled, a turn that
+			// settles without ever calling a contract tool (ask_user/
+			// submit_adr/submit_build_result) — most commonly the model
+			// hitting its own output length limit mid-response
+			// (lastStopReason "length") before it could call one —
+			// produces no further events ever, and this loop would block
+			// on Events() forever: verified against a real stuck
+			// feature_build job (pod healthy and idle, job stuck
+			// 'running' indefinitely, no PR ever opened). Treated as a
+			// definitive failure, same as a request-level error, rather
+			// than left to hang.
+			if ev.Type == "agent_settled" {
+				curated := rpc.CuratedEvent{
+					Type:    rpc.EventRunFailed,
+					Message: agentSettledFailureMessage(lastStopReason),
+				}
+				return closeOutTurn(ctx, rpcClient, attachErr, namespace, podName, curated)
+			}
+
 			curated, matched := rpc.Translate(ev)
 			if !matched {
 				continue
 			}
-
-			if err := rpcClient.EndTurn(); err != nil {
-				return rpc.CuratedEvent{}, fmt.Errorf("failed to end turn: %w", err)
-			}
-			select {
-			case endErr := <-attachErr:
-				if endErr != nil {
-					return rpc.CuratedEvent{}, fmt.Errorf("attach ended with an error while closing out the turn: %w", endErr)
-				}
-			case <-time.After(endTurnGrace):
-				return rpc.CuratedEvent{}, fmt.Errorf("attach call for pod %s/%s did not end within %s of EndTurn", namespace, podName, endTurnGrace)
-			case <-ctx.Done():
-				return rpc.CuratedEvent{}, ctx.Err()
-			}
-			return curated, nil
+			return closeOutTurn(ctx, rpcClient, attachErr, namespace, podName, curated)
 
 		case err := <-attachErr:
 			if err == nil {
 				err = fmt.Errorf("attach stream to pod %s/%s ended unexpectedly", namespace, podName)
+				if reason := k8s.PodContainerTerminationReason(ctx, clientset, namespace, podName); reason != "" {
+					err = fmt.Errorf("%w (%s)", err, reason)
+				}
 			}
 			return rpc.CuratedEvent{}, err
 
@@ -393,5 +414,49 @@ func runTurn(
 			_ = rpcClient.Send(rpc.Command{Type: "abort"})
 			return rpc.CuratedEvent{}, ctx.Err()
 		}
+	}
+}
+
+// closeOutTurn ends the current turn's stdin pipe and waits for the Attach
+// call to return, the shared tail end of runTurn's loop for every event
+// that ends a turn (a matched curated event, or the synthesized
+// agent_settled failure) — factored out so the wait's three-way race
+// (attach error / grace timeout / ctx cancellation) is defined once.
+func closeOutTurn(
+	ctx context.Context,
+	rpcClient *rpc.Client,
+	attachErr <-chan error,
+	namespace, podName string,
+	curated rpc.CuratedEvent,
+) (rpc.CuratedEvent, error) {
+	if err := rpcClient.EndTurn(); err != nil {
+		return rpc.CuratedEvent{}, fmt.Errorf("failed to end turn: %w", err)
+	}
+	select {
+	case endErr := <-attachErr:
+		if endErr != nil {
+			return rpc.CuratedEvent{}, fmt.Errorf("attach ended with an error while closing out the turn: %w", endErr)
+		}
+	case <-time.After(endTurnGrace):
+		return rpc.CuratedEvent{}, fmt.Errorf("attach call for pod %s/%s did not end within %s of EndTurn", namespace, podName, endTurnGrace)
+	case <-ctx.Done():
+		return rpc.CuratedEvent{}, ctx.Err()
+	}
+	return curated, nil
+}
+
+// agentSettledFailureMessage builds the run_failed message for a turn that
+// settled (Pi's session-level "nothing more is coming" signal) without ever
+// calling a contract tool — lastStopReason is the most recent low-level
+// agent run's stop reason seen beforehand (see rpc.LastMessageStopReason),
+// "" if none was ever observed this turn.
+func agentSettledFailureMessage(lastStopReason string) string {
+	switch lastStopReason {
+	case "":
+		return "the agent's session ended without submitting a result"
+	case "length":
+		return "the agent's response was cut off by the model's own output length limit before it submitted a result (stopReason: length)"
+	default:
+		return fmt.Sprintf("the agent's session ended without submitting a result (stopReason: %s)", lastStopReason)
 	}
 }

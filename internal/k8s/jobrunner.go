@@ -25,7 +25,38 @@ const (
 	defaultRequestMemory = "128Mi"
 	defaultLimitCPU      = "500m"
 	defaultLimitMemory   = "256Mi"
+
+	// Agent RPC jobs (spec_grill/feature_build, ADR 006/010) run a real Pi
+	// coding-agent session — cloning repos, installing dependencies,
+	// running builds/tests — not the tiny placeholder script the package
+	// defaults above were sized for. A run that hits defaultLimitMemory
+	// (256Mi) gets silently OOM-killed with no Kubernetes Event recorded
+	// (verified against a real run: the pod's own container status still
+	// carries the OOMKilled reason/exit code, which is why
+	// PodContainerTerminationReason reads it directly instead of relying on
+	// the event stream), surfacing to the Orchestrator only as an attach
+	// stream that "ended unexpectedly" with no further detail.
+	agentRequestCPU    = "300m"
+	agentRequestMemory = "512Mi"
+	agentLimitCPU      = "2"
+	agentLimitMemory   = "2Gi"
 )
+
+// AgentResources returns the resource requests/limits agent RPC jobs
+// (spec_grill/feature_build) should run with — see the agent* constants'
+// doc comment for why these are much higher than buildJob's own default.
+func AgentResources() *corev1.ResourceRequirements {
+	return &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(agentRequestCPU),
+			corev1.ResourceMemory: resource.MustParse(agentRequestMemory),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(agentLimitCPU),
+			corev1.ResourceMemory: resource.MustParse(agentLimitMemory),
+		},
+	}
+}
 
 // JobSpec describes a single ephemeral run to execute as a Kubernetes Job.
 type JobSpec struct {
@@ -181,6 +212,39 @@ func DeleteJob(ctx context.Context, clientset kubernetes.Interface, namespace, n
 		return fmt.Errorf("failed to delete job %s/%s: %w", namespace, name, err)
 	}
 	return nil
+}
+
+// PodContainerTerminationReason best-effort describes why the pod's "run"
+// container (buildJob's fixed container name) most recently exited — e.g.
+// "container exited with code 137 (OOMKilled)" — or "" if the pod is
+// already gone or nothing terminated has been recorded yet. Meant to be
+// called right after an attach stream ends with no error and no
+// turn-ending event: remotecommand reports that the same way whether the
+// container exited cleanly, crashed, or was OOM-killed, so the attach
+// error itself carries no detail — but the pod object (not yet torn down
+// by the caller's own deferred DeleteJob) still does, until Kubernetes GCs
+// it.
+func PodContainerTerminationReason(ctx context.Context, clientset kubernetes.Interface, namespace, podName string) string {
+	pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		return ""
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name != "run" || cs.State.Terminated == nil {
+			continue
+		}
+		t := cs.State.Terminated
+		reason := t.Reason
+		if reason == "" {
+			reason = "unknown reason"
+		}
+		desc := fmt.Sprintf("container exited with code %d (%s)", t.ExitCode, reason)
+		if t.Message != "" {
+			desc += ": " + t.Message
+		}
+		return desc
+	}
+	return ""
 }
 
 func waitForCompletion(ctx context.Context, clientset kubernetes.Interface, namespace, name string) error {

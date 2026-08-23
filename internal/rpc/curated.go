@@ -173,3 +173,22 @@ func translateAgentEnd(ev Event) (CuratedEvent, bool) {
 	}
 	return CuratedEvent{}, false
 }
+
+// LastMessageStopReason decodes a raw agent_end event and returns the stop
+// reason of its last message — one of Pi's own values ("stop", "length",
+// "toolUse", "error", "aborted") — or ok=false if ev isn't an agent_end
+// event or carries no messages. Used by runTurn (worker/specgrill.go) to
+// remember why the most recent low-level agent run ended, for the message
+// it builds if agent_settled arrives next with nothing else translated in
+// between — agent_settled itself carries no detail of its own (verified
+// against Pi's RPC docs: `{"type": "agent_settled"}`, no other fields).
+func LastMessageStopReason(ev Event) (stopReason string, ok bool) {
+	if ev.Type != "agent_end" {
+		return "", false
+	}
+	var parsed agentEndEvent
+	if err := json.Unmarshal(ev.Raw, &parsed); err != nil || len(parsed.Messages) == 0 {
+		return "", false
+	}
+	return parsed.Messages[len(parsed.Messages)-1].StopReason, true
+}
