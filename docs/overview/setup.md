@@ -68,6 +68,34 @@ see `.env.example`. A self-hosted/managed install pointing at a real domain
 swaps these for `ingress-nginx` and a real ACME `ClusterIssuer`; that's a
 config change, not an Orchestrator code change.
 
+## Reaching a project's deployment locally
+
+A project's always-on primary deployment lives at `<project-slug>.apps.<domain>`
+(ADR 003 §15) — shown as a link on project home once a deploy completes (ADR
+013 addendum). Two things have to be true for that link to actually load on
+your machine, neither of which is automatic:
+
+1. **The host has to resolve `<domain>`.** `APPS_BASE_DOMAIN`'s local-dev
+   default is `127.0.0.1.nip.io` (`.env.example`, both this repo and
+   `api/.env.example` — **must match exactly**): nip.io is a public DNS
+   service that resolves any `<anything>.127.0.0.1.nip.io` to `127.0.0.1`,
+   so no `/etc/hosts` editing is needed. (Only the DNS lookup leaves your
+   machine — the actual HTTP(S) traffic stays local.)
+2. **Something on the host has to be listening.** `deploy/docker-compose.dev.yml`
+   publishes the bundled k3s cluster's Traefik ingress (which every
+   project's Ingress resource is created on, per the ingress + TLS section
+   above) on `DEV_APPS_HTTP_PORT`/`DEV_APPS_HTTPS_PORT` (default
+   `8090`/`8443` — non-standard host ports, same reasoning as
+   `DEV_HTTP_PORT` for the main edge: avoid clobbering anything already on
+   80/443). Set `api/.env`'s `APPS_HTTPS_PORT` to match
+   `DEV_APPS_HTTPS_PORT` so the link the API hands back includes it.
+
+With both set, "Open deployment" resolves to
+`https://<slug>.apps.127.0.0.1.nip.io:8443` — expect a browser warning on
+first load (the `selfSigned` `ClusterIssuer` from the previous section
+issues a self-signed cert, not one a browser trusts by default); click
+through it.
+
 ## Full stack (recommended)
 
 From the meta repo root:
