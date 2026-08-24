@@ -66,8 +66,28 @@ type cancelWatcher interface {
 // session ends any other way), rather than waiting for Kubernetes to
 // report success.
 func runAgentRPCJob(ctx context.Context, q *queue.Queue, clientset kubernetes.Interface, job *queue.Job, namespace string, cfg Config) error {
+	handle := func(ev rpc.CuratedEvent) {
+		if err := cfg.APIClient.PostJobEvent(ctx, job.ID, ev); err != nil {
+			// A failed relay is a visibility gap, not a job failure: the
+			// job's actual outcome (an ADR submitted, a PR opened, or not)
+			// is decided by the event itself, independent of whether this
+			// side-channel post to the API succeeded.
+			log.Printf("worker: failed to relay event %s for job %s: %v", ev.Type, job.ID, err)
+		}
+	}
+
 	env, spec, err := buildAgentEnv(ctx, cfg, job)
 	if err != nil {
+		// Same gap ADR 011 item 3 closed for WaitForJobPod, one call site
+		// earlier: without this, a buildAgentEnv failure (fetching the
+		// feature spec, minting the installation token, ...) leaves the
+		// feature stuck in 'queued' forever — runClaimedJob's q.Fail only
+		// touches the jobs row, and no event would otherwise ever be
+		// posted for this job.
+		handle(rpc.CuratedEvent{
+			Type:    rpc.EventRunFailed,
+			Message: fmt.Sprintf("failed to prepare job environment: %v", err),
+		})
 		return err
 	}
 
@@ -95,16 +115,6 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, clientset kubernetes.In
 			log.Printf("worker: failed to delete job %s (kind=%s): %v", job.ID, job.Kind, err)
 		}
 	}()
-
-	handle := func(ev rpc.CuratedEvent) {
-		if err := cfg.APIClient.PostJobEvent(ctx, job.ID, ev); err != nil {
-			// A failed relay is a visibility gap, not a job failure: the
-			// job's actual outcome (an ADR submitted, a PR opened, or not)
-			// is decided by the event itself, independent of whether this
-			// side-channel post to the API succeeded.
-			log.Printf("worker: failed to relay event %s for job %s: %v", ev.Type, job.ID, err)
-		}
-	}
 
 	podName, err := k8s.WaitForJobPod(ctx, clientset, namespace, name)
 	if err != nil {
@@ -266,7 +276,7 @@ func driveAgentSession(
 
 	prompt := initialPrompt
 	for {
-		curated, err := runTurn(runCtx, clientset, restConfig, rpcClient, namespace, podName, prompt)
+		curated, err := runTurn(runCtx, clientset, restConfig, rpcClient, namespace, podName, prompt, handle)
 		if err != nil {
 			return reportSessionError(handle, cancelled.Load(), err)
 		}
@@ -322,14 +332,26 @@ func reportSessionError(handle func(rpc.CuratedEvent), cancelled bool, err error
 // the tool's identity, via rpc.Translate, distinguishes "end the turn" from
 // "end the run") — then ends the turn (letting the attach call return
 // without restarting the container process) and returns that curated
-// event for the caller to act on.
+// event for the caller to act on. handle is invoked directly, inline, for
+// any EventAgentText seen along the way (rpc.Translate's one non-terminal
+// match) — the only curated event type this loop forwards without also
+// ending the turn on it; see EventAgentText's doc comment for why.
 func runTurn(
 	ctx context.Context,
 	clientset kubernetes.Interface,
 	restConfig *rest.Config,
 	rpcClient *rpc.Client,
 	namespace, podName, prompt string,
+	handle func(rpc.CuratedEvent),
 ) (rpc.CuratedEvent, error) {
+	// Discards whatever the *previous* turn's own trailing agent_end/
+	// agent_settled bookkeeping left sitting in rpcClient's shared Events
+	// buffer (see DrainStaleEvents' doc comment) before this turn reads
+	// anything or sends its own prompt — otherwise this turn's read loop
+	// below could pick up that stale data first and misreport itself as
+	// having ended before Pi ever saw prompt.
+	rpcClient.DrainStaleEvents()
+
 	stdin, err := rpcClient.BeginTurn()
 	if err != nil {
 		return rpc.CuratedEvent{}, fmt.Errorf("failed to begin turn: %w", err)
@@ -390,6 +412,15 @@ func runTurn(
 
 			curated, matched := rpc.Translate(ev)
 			if !matched {
+				continue
+			}
+			if curated.Type == rpc.EventAgentText {
+				// Forwarded live, not turn-ending: the model's own prose
+				// alongside (or instead of) a contract tool call in this
+				// same turn. Keep reading — the real terminating event (a
+				// tool call, agent_settled's failure branch above, or the
+				// attach stream ending) is what actually ends the turn.
+				handle(curated)
 				continue
 			}
 			return closeOutTurn(ctx, rpcClient, attachErr, namespace, podName, curated)

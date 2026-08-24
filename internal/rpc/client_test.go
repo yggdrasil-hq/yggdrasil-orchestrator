@@ -226,6 +226,48 @@ func TestClient_CloseClosesEventsChannel(t *testing.T) {
 	}
 }
 
+// Proves DrainStaleEvents discards whatever's already buffered without
+// blocking — the core guarantee runTurn relies on to keep a finished turn's
+// trailing bookkeeping (agent_end/agent_settled emitted after the contract
+// tool call that already ended the turn) from leaking into the next turn's
+// read loop.
+func TestClient_DrainStaleEventsDiscardsBufferedEvents(t *testing.T) {
+	c := rpc.NewClient()
+	t.Cleanup(c.Close)
+
+	payload := []byte(`{"type":"agent_end","messages":[{"stopReason":"stop"}]}` + "\n" + `{"type":"agent_settled"}` + "\n")
+	if _, err := c.Write(payload); err != nil {
+		t.Fatalf("Write returned an error: %v", err)
+	}
+
+	c.DrainStaleEvents()
+
+	select {
+	case ev := <-c.Events():
+		t.Fatalf("expected no buffered events to remain after draining, got %v", ev)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// A genuinely new event, written after the drain, must still come
+	// through — draining must not tear down or leave the channel unusable.
+	if _, err := c.Write([]byte(`{"type":"agent_start"}` + "\n")); err != nil {
+		t.Fatalf("Write returned an error: %v", err)
+	}
+	ev := mustRecvEvent(t, c)
+	if ev.Type != "agent_start" {
+		t.Fatalf("expected the post-drain event to still arrive, got %q", ev.Type)
+	}
+}
+
+// Proves DrainStaleEvents is a safe no-op when nothing is buffered — the
+// common case, called at the top of every turn including the first.
+func TestClient_DrainStaleEventsNoopWhenEmpty(t *testing.T) {
+	c := rpc.NewClient()
+	t.Cleanup(c.Close)
+
+	c.DrainStaleEvents()
+}
+
 func mustRecvEvent(t *testing.T, c *rpc.Client) rpc.Event {
 	t.Helper()
 	select {

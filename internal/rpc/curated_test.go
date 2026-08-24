@@ -150,6 +150,42 @@ func TestTranslate_SubmitBuildResultFailureIsAlsoTerminal(t *testing.T) {
 	}
 }
 
+func TestTranslate_AssistantMessageEndIsAgentTextAndNotTerminal(t *testing.T) {
+	ev := rawEvent(t, `{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Here's my thinking on the port question."}],"timestamp":1787514442356}}`)
+
+	curated, ok := rpc.Translate(ev)
+	if !ok {
+		t.Fatal("expected an assistant message_end with text to be curated")
+	}
+	if curated.Type != rpc.EventAgentText {
+		t.Fatalf("expected type %q, got %q", rpc.EventAgentText, curated.Type)
+	}
+	if curated.Message != "Here's my thinking on the port question." {
+		t.Fatalf("expected the text to be carried through, got %q", curated.Message)
+	}
+	if curated.Terminal() {
+		t.Fatal("expected agent_text not to be terminal — it must never end a turn on its own")
+	}
+}
+
+func TestTranslate_UserMessageEndIsNotCurated(t *testing.T) {
+	ev := rawEvent(t, `{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"bind next server to port 80"}],"timestamp":1787514442356}}`)
+
+	_, ok := rpc.Translate(ev)
+	if ok {
+		t.Fatal("expected Pi's own echo of the injected prompt (role: user) not to be curated as agent_text")
+	}
+}
+
+func TestTranslate_AssistantMessageEndWithOnlyToolUseIsNotCurated(t *testing.T) {
+	ev := rawEvent(t, `{"type":"message_end","message":{"role":"assistant","content":[{"type":"tool_use","id":"1","name":"ask_user"}],"timestamp":1787514442356}}`)
+
+	_, ok := rpc.Translate(ev)
+	if ok {
+		t.Fatal("expected an assistant message with no text content (only a tool_use block) not to be curated — would just be an empty bubble alongside the tool call's own event")
+	}
+}
+
 func TestRunFailedIsTerminal(t *testing.T) {
 	ev := rpc.CuratedEvent{Type: rpc.EventRunFailed, Message: "attach stream ended"}
 	if !ev.Terminal() {

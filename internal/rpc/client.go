@@ -188,6 +188,42 @@ func (c *Client) Events() <-chan Event {
 	return c.events
 }
 
+// DrainStaleEvents discards, without blocking, any events already sitting
+// in the buffer. Call this once per turn, right before BeginTurn/Send — not
+// after EndTurn — so a turn that just ended can't leak into the one that's
+// about to start.
+//
+// Why this is needed: Events persists across the whole session (many
+// turns), by design (see Write's doc comment), so an event can't be lost
+// *mid-turn*. But a contract tool call (ask_user/submit_adr/
+// submit_build_result) ends a Yggdrasil "turn" the instant runTurn's read
+// loop matches it — before Pi's own trailing per-turn bookkeeping
+// (typically agent_end then agent_settled, emitted moments later as part
+// of the same completed turn) has necessarily arrived. Nothing ever reads
+// those trailing events off Events, because runTurn already returned; they
+// just sit in the buffer. Left there, the *next* runTurn call — the one
+// meant to process a fresh human reply — reads them first and misreads a
+// previous turn's own "I'm done" signal as its own, failing the run before
+// the new prompt was ever sent. Verified against a real k3s pod: two
+// production failures of exactly this shape (run_failed within
+// milliseconds of a reply being sent — too fast for any model round trip)
+// traced back to this.
+//
+// Safe to call with no turn open: BeginTurn/Send for the new turn haven't
+// happened yet at the call site, so nothing genuinely new could be in the
+// channel — only leftovers from a turn whose attach call has already fully
+// returned (closeOutTurn only returns after that), so its Write goroutine
+// is guaranteed to have stopped producing more.
+func (c *Client) DrainStaleEvents() {
+	for {
+		select {
+		case <-c.events:
+		default:
+			return
+		}
+	}
+}
+
 // Errs returns non-fatal parse/backpressure errors observed while decoding
 // the event stream — these don't end the session, just note a dropped or
 // unparseable line.

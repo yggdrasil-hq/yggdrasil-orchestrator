@@ -1,6 +1,9 @@
 package rpc
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // CuratedEventType is the small, product-meaningful event vocabulary the
 // Orchestrator forwards on (ADR 006 item 7) — deliberately narrower than
@@ -45,6 +48,15 @@ const (
 	// no-op for spec_grill (whose feature sits in 'draft', not 'queued').
 	// Never terminal.
 	EventRunStarted CuratedEventType = "run_started"
+	// EventAgentText carries Pi's own plain assistant text — the model's
+	// prose, as opposed to a contract tool call — decoded from a
+	// message_end event (translateMessageEnd). Never terminal: unlike every
+	// other curated event, runTurn (worker/specgrill.go) forwards this one
+	// live via handle and keeps reading, rather than ending the turn on it.
+	// Exists so a turn that settles without ever calling a contract tool
+	// (the agent_settled failure path) leaves a record of what the model
+	// actually said, instead of just "ended without submitting a result".
+	EventAgentText CuratedEventType = "agent_text"
 )
 
 // CuratedEvent is one product-meaningful event translated from Pi's raw
@@ -53,7 +65,7 @@ type CuratedEvent struct {
 	Type     CuratedEventType
 	Question string // set for EventAskUser
 	Markdown string // set for EventSubmitADR
-	Message  string // set for EventRunFailed/EventRunCancelled
+	Message  string // set for EventRunFailed/EventRunCancelled/EventAgentText
 	Status   string // set for EventSubmitBuildResult: "success" | "failure"
 	PRUrl    string // set for EventSubmitBuildResult on success
 	Summary  string // set for EventSubmitBuildResult
@@ -99,27 +111,79 @@ type agentEndEvent struct {
 	} `json:"messages"`
 }
 
+// messageEndEvent mirrors just enough of Pi's own message_end event (raw
+// RPC taxonomy, decoded best-effort like agentEndEvent) to extract an
+// assistant message's plain text. Verified against a real k3s pod's raw
+// log: Pi emits this same shape (role/content/timestamp) for its own echo
+// of an injected prompt (role "user") and, by the same shape, for the
+// model's own reply (role "assistant") — the case this suite actually
+// wants.
+type messageEndEvent struct {
+	Message struct {
+		Role    string `json:"role"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	} `json:"message"`
+}
+
+// translateMessageEnd extracts an assistant message's plain text as
+// EventAgentText (curated.go's doc comment on that constant explains why
+// this exists). ok is false for anything that isn't a genuinely-texty
+// assistant message: a non-assistant role (most commonly Pi echoing back
+// the prompt the Orchestrator just sent, role "user" — not something to
+// show as the agent's own words), or an assistant message whose only
+// content is a tool_use block (a normal ask_user/submit_adr-only turn with
+// no separate prose) — translating that would produce an empty bubble
+// alongside the tool call's own curated event.
+func translateMessageEnd(ev Event) (CuratedEvent, bool) {
+	var parsed messageEndEvent
+	if err := json.Unmarshal(ev.Raw, &parsed); err != nil {
+		return CuratedEvent{}, false
+	}
+	if parsed.Message.Role != "assistant" {
+		return CuratedEvent{}, false
+	}
+
+	var text strings.Builder
+	for _, part := range parsed.Message.Content {
+		if part.Type != "text" || part.Text == "" {
+			continue
+		}
+		if text.Len() > 0 {
+			text.WriteString("\n\n")
+		}
+		text.WriteString(part.Text)
+	}
+	if text.Len() == 0 {
+		return CuratedEvent{}, false
+	}
+	return CuratedEvent{Type: EventAgentText, Message: text.String()}, true
+}
+
 // Translate maps a raw Pi RPC event to a curated Event (ADR 006 item 7),
-// scoped for now to the yggdrasil-contract extension's tool-call-based
-// signals (ask_user/submit_adr for spec_grill, submit_build_result for
+// scoped to the yggdrasil-contract extension's tool-call-based signals
+// (ask_user/submit_adr for spec_grill, submit_build_result for
 // feature_build, ADR 010 item 7) — the ones needed to detect completion
-// (item 11) — plus one raw Pi event, agent_end, but only far enough to catch
-// a request-level failure (translateAgentEnd); a clean agent_end is left
-// untranslated since a contract tool call, not agent_end, is what ends a
-// turn normally. Plain assistant text (agent_text) is intentionally not
-// translated yet: Pi's own message event shapes aren't confirmed against a
-// real integration beyond what's needed here.
+// (item 11) — plus two raw Pi events: agent_end, but only far enough to
+// catch a request-level failure (translateAgentEnd; a clean agent_end is
+// left untranslated since a contract tool call, not agent_end, is what ends
+// a turn normally), and message_end, translated into EventAgentText
+// whenever it carries the model's own plain text (translateMessageEnd).
 //
 // ok is false for any event this suite doesn't curate (including
 // tool_execution_end for tools other than ask_user/submit_adr, e.g. a
-// non-contract bash call, and a clean agent_end) — the caller should just
-// keep reading.
+// non-contract bash call, a clean agent_end, and a message_end that isn't a
+// texty assistant message) — the caller should just keep reading.
 func Translate(ev Event) (curated CuratedEvent, ok bool) {
 	switch ev.Type {
 	case "tool_execution_end":
 		return translateToolExecutionEnd(ev)
 	case "agent_end":
 		return translateAgentEnd(ev)
+	case "message_end":
+		return translateMessageEnd(ev)
 	default:
 		return CuratedEvent{}, false
 	}

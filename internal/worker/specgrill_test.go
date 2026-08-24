@@ -2,7 +2,10 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -287,6 +290,93 @@ func TestDriveSpecGrillSession_ReplyResumesSessionAndReachesSubmitADR(t *testing
 	}
 }
 
+// Proves a turn's own trailing bookkeeping (Pi keeps emitting agent_end
+// then agent_settled for a few moments after the contract tool call that
+// already ended the turn from Yggdrasil's point of view — a normal part of
+// Pi's protocol, not something the stand-in script invents) doesn't leak
+// into the *next* turn and get misread as that turn's own outcome. Traced
+// from two real production failures of this exact shape: run_failed fired
+// within milliseconds of a human's reply being sent — too fast for any
+// model round trip — immediately after a session that had already
+// completed one or more ask_user/reply cycles successfully. Before the
+// DrainStaleEvents fix, this script reliably reproduced it: the second
+// runTurn call would read the leftover agent_settled first and fail before
+// line2 (the reply) was ever sent to the pod.
+func TestDriveSpecGrillSession_TrailingEventsFromPriorTurnDontFailTheNextOne(t *testing.T) {
+	clientset := testClient(t)
+	restConfig, err := k8s.RESTConfig()
+	if err != nil {
+		t.Skipf("no Kubernetes REST config available; skipping: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// After the ask_user tool call, immediately (no sleep) also emits the
+	// agent_end + agent_settled pair Pi's own protocol produces once a turn
+	// is fully idle — before ever reading line2. If these leak into the
+	// next runTurn call, it'll see agent_settled first and fail instead of
+	// reaching submit_adr.
+	script := `read line1; echo '{"type":"tool_execution_end","toolName":"ask_user","result":{"details":{"kind":"ask_user","question":"Which auth model?"},"terminate":true}}'; echo '{"type":"agent_end","messages":[{"stopReason":"stop"}]}'; echo '{"type":"agent_settled"}'; read line2; echo '{"type":"tool_execution_end","toolName":"submit_adr","result":{"details":{"kind":"submit_adr","markdown":"reached submit_adr"}}}'; cat`
+	namespace, podName, _ := startAttachablePod(t, ctx, script)
+
+	var received []rpc.CuratedEvent
+	err = driveAgentSession(ctx, clientset, restConfig, fixedReplyWaiter{reply: "use-oauth"}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+		received = append(received, ev)
+	})
+	if err != nil {
+		t.Fatalf("expected the session to reach submit_adr despite the prior turn's trailing events, got: %v", err)
+	}
+
+	if len(received) != 2 {
+		t.Fatalf("expected ask_user then submit_adr, got %d events: %+v", len(received), received)
+	}
+	if received[0].Type != rpc.EventAskUser {
+		t.Fatalf("expected the first event to be ask_user, got %q", received[0].Type)
+	}
+	if received[1].Type != rpc.EventSubmitADR {
+		t.Fatalf("expected the second event to be submit_adr, not a run_failed synthesized from the prior turn's leftovers, got %q (message: %q)", received[1].Type, received[1].Message)
+	}
+}
+
+// Proves an assistant message_end (Pi's own plain text, e.g. the model
+// thinking out loud alongside a tool call in the same turn) is relayed live
+// via handle as a non-terminal EventAgentText, without ending the turn on
+// it — the session must still proceed to submit_adr afterward. The one
+// exception to "runTurn returns the instant Translate matches something."
+func TestDriveSpecGrillSession_AgentTextIsForwardedLiveNotTurnEnding(t *testing.T) {
+	clientset := testClient(t)
+	restConfig, err := k8s.RESTConfig()
+	if err != nil {
+		t.Skipf("no Kubernetes REST config available; skipping: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	script := `read line; echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Thinking about the ADR structure before I submit it."}],"timestamp":1}}'; echo '{"type":"tool_execution_end","toolName":"submit_adr","result":{"details":{"kind":"submit_adr","markdown":"# Test ADR"},"terminate":true}}'; cat`
+	namespace, podName, _ := startAttachablePod(t, ctx, script)
+
+	var received []rpc.CuratedEvent
+	err = driveAgentSession(ctx, clientset, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+		received = append(received, ev)
+	})
+	if err != nil {
+		t.Fatalf("expected the session to still reach submit_adr despite the intervening agent_text, got: %v", err)
+	}
+
+	if len(received) != 2 {
+		t.Fatalf("expected agent_text then submit_adr, got %d events: %+v", len(received), received)
+	}
+	if received[0].Type != rpc.EventAgentText {
+		t.Fatalf("expected the first event to be agent_text, got %q", received[0].Type)
+	}
+	if received[0].Message != "Thinking about the ADR structure before I submit it." {
+		t.Fatalf("expected the agent_text message to be carried through, got %q", received[0].Message)
+	}
+	if received[1].Type != rpc.EventSubmitADR {
+		t.Fatalf("expected the second event to be submit_adr, got %q", received[1].Type)
+	}
+}
+
 // Proves an unexpected end to the attach stream (the container exiting
 // without ever producing a terminating contract event) surfaces as a
 // synthesized run_failed curated event and a non-nil error — not a silent
@@ -318,6 +408,63 @@ func TestDriveSpecGrillSession_AttachFailureSurfacesAsRunFailed(t *testing.T) {
 		t.Fatalf("expected exactly one synthesized run_failed event, got %+v", received)
 	}
 	if received[0].Message == "" {
+		t.Fatal("expected the run_failed event to carry a non-empty message")
+	}
+}
+
+// Proves the gap this fix closes: a buildAgentEnv failure (fetching the
+// feature spec, minting the installation token, ...) — which happens before
+// any Kubernetes Job is even created, one call site earlier than the
+// WaitForJobPod failure ADR 011 item 3 already covers above — still posts a
+// synthesized run_failed event. Without it, runClaimedJob's q.Fail only
+// touches the jobs row and the feature is stuck in 'queued' forever with no
+// event ever posted (this exact failure mode reached production: the API's
+// /spec endpoint 502ed and the affected feature never left 'queued').
+func TestRunAgentRPCJob_BuildAgentEnvFailureSurfacesAsRunFailed(t *testing.T) {
+	var mu sync.Mutex
+	var received []map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/secrets"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": map[string]string{}})
+		case strings.Contains(r.URL.Path, "/events"):
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			received = append(received, body)
+			mu.Unlock()
+			w.WriteHeader(http.StatusCreated)
+		default:
+			// Stands in for the real production failure: the /spec fetch
+			// itself erroring out (a 502, here a 500 — either way
+			// FetchFeatureSpec returns a non-nil error).
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	featureID := "feat-broken"
+	job := &queue.Job{ID: "job-buildenv-fail", ProjectID: "proj-1", Kind: queue.KindFeatureBuild, FeatureID: &featureID}
+	cfg := Config{APIClient: apiclient.New(server.URL, "test-token")}
+
+	// clientset and q are never touched on this early-return path — nil is
+	// safe here and keeps the test from depending on a reachable cluster.
+	err := runAgentRPCJob(context.Background(), nil, nil, job, "test-namespace", cfg)
+	if err == nil {
+		t.Fatal("expected an error when buildAgentEnv fails")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 1 {
+		t.Fatalf("expected exactly one posted job event, got %d: %+v", len(received), received)
+	}
+	if received[0]["type"] != "run_failed" {
+		t.Fatalf("expected a run_failed event, got %+v", received[0])
+	}
+	if msg, _ := received[0]["message"].(string); msg == "" {
 		t.Fatal("expected the run_failed event to carry a non-empty message")
 	}
 }
