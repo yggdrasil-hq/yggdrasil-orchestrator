@@ -1,0 +1,52 @@
+name: Build and push image
+
+# Pushes the prod image to GitHub Container Registry so deploys can pull a
+# pinned tag instead of building on the host. See ../../docs/conventions/deploy.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Skipped on pull_request: fork PRs get a read-only GITHUB_TOKEN, and
+      # the build never pushes on pull_request, so there's nothing to
+      # authenticate for.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: vars
+        run: echo "sha_tag=sha-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        run: |
+          docker build -f deploy/Dockerfile.prod \
+            -t "$IMAGE:${{ steps.vars.outputs.sha_tag }}" \
+            -t "$IMAGE:latest" \
+            .
+
+      # PRs stop here (build validation only) — nothing below runs.
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push "$IMAGE:${{ steps.vars.outputs.sha_tag }}"
+          docker push "$IMAGE:latest"
