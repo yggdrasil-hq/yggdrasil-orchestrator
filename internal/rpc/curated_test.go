@@ -54,6 +54,14 @@ func TestTranslate_SubmitADRIsTerminal(t *testing.T) {
 	}
 }
 
+func TestTranslate_SubmitADRCarriesDesignSurfaceAnswer(t *testing.T) {
+	ev := rawEvent(t, `{"type":"tool_execution_end","toolName":"submit_adr","result":{"details":{"kind":"submit_adr","markdown":"# Project ADR","hasDesignSurface":true},"terminate":true}}`)
+	curated, ok := rpc.Translate(ev)
+	if !ok || curated.HasDesignSurface == nil || !*curated.HasDesignSurface {
+		t.Fatalf("expected submit_adr to carry hasDesignSurface=true, got %+v (ok=%v)", curated, ok)
+	}
+}
+
 func TestTranslate_IgnoresNonContractToolCalls(t *testing.T) {
 	ev := rawEvent(t, `{"type":"tool_execution_end","toolName":"bash","result":{"content":[{"type":"text","text":"ok"}]},"isError":false}`)
 
@@ -181,6 +189,34 @@ func TestTranslate_SubmitReviewIsTerminalAndCarriesVerdict(t *testing.T) {
 	}
 	if !curated.Terminal() {
 		t.Fatal("expected submit_review to be terminal — it ends the review run")
+	}
+}
+
+func TestTranslate_DesignPreviewIsNonTerminalAndCarriesSnapshot(t *testing.T) {
+	ev := rawEvent(t, `{"type":"tool_execution_end","toolName":"update_design_preview","result":{"details":{"kind":"update_design_preview","snapshot":{"page.html":"<h1>Hello</h1>","styles.css":"body{}"}},"terminate":true}}`)
+	curated, ok := rpc.Translate(ev)
+	if !ok || curated.Type != rpc.EventUpdateDesignPreview {
+		t.Fatalf("expected update_design_preview, got %+v (ok=%v)", curated, ok)
+	}
+	if curated.Snapshot["page.html"] != "<h1>Hello</h1>" || curated.Snapshot["styles.css"] != "body{}" {
+		t.Fatalf("unexpected design snapshot: %+v", curated.Snapshot)
+	}
+	if curated.Terminal() {
+		t.Fatal("expected update_design_preview to end only the current turn")
+	}
+}
+
+func TestTranslate_SubmitDesignIsTerminalAndCarriesSnapshot(t *testing.T) {
+	ev := rawEvent(t, `{"type":"tool_execution_end","toolName":"submit_design","result":{"details":{"kind":"submit_design","snapshot":{"page.html":"<main/>"},"prUrl":"https://github.com/acme/web/pull/9","summary":"Checkout mockup"},"terminate":true}}`)
+	curated, ok := rpc.Translate(ev)
+	if !ok || curated.Type != rpc.EventSubmitDesign {
+		t.Fatalf("expected submit_design, got %+v (ok=%v)", curated, ok)
+	}
+	if curated.PRUrl != "https://github.com/acme/web/pull/9" || curated.Summary != "Checkout mockup" {
+		t.Fatalf("unexpected design result: %+v", curated)
+	}
+	if !curated.Terminal() {
+		t.Fatal("expected submit_design to end the session")
 	}
 }
 

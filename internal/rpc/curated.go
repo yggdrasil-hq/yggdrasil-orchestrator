@@ -73,18 +73,25 @@ const (
 	EventSubmitReview     CuratedEventType = "submit_review"
 	EventReportTestStep   CuratedEventType = "report_test_step"
 	EventSubmitTestReport CuratedEventType = "submit_test_report"
+	// EventUpdateDesignPreview carries the complete current design folder
+	// snapshot and ends only the current turn, not the session.
+	EventUpdateDesignPreview CuratedEventType = "update_design_preview"
+	// EventSubmitDesign carries the finalized design snapshot and ends the
+	// design_grill session.
+	EventSubmitDesign CuratedEventType = "submit_design"
 )
 
 // CuratedEvent is one product-meaningful event translated from Pi's raw
 // RPC stream (or synthesized locally for EventRunFailed/EventRunCancelled).
 type CuratedEvent struct {
-	Type     CuratedEventType
-	Question string // set for EventAskUser
-	Markdown string // set for EventSubmitADR
-	Message  string // set for EventRunFailed/EventRunCancelled/EventAgentText
-	Status   string // set for EventSubmitBuildResult: "success" | "failure"
-	PRUrl    string // set for EventSubmitBuildResult on success
-	Summary  string // set for EventSubmitBuildResult
+	Type             CuratedEventType
+	Question         string // set for EventAskUser
+	Markdown         string // set for EventSubmitADR
+	HasDesignSurface *bool  // set when project_init answers the UI question
+	Message          string // set for EventRunFailed/EventRunCancelled/EventAgentText
+	Status           string // set for EventSubmitBuildResult: "success" | "failure"
+	PRUrl            string // set for EventSubmitBuildResult on success
+	Summary          string // set for EventSubmitBuildResult
 	// Verdict is set for EventSubmitReview: "approved" | "changes_requested".
 	Verdict string
 	// ActionItems is set for EventRequestActionItem: the needed items the
@@ -101,6 +108,7 @@ type CuratedEvent struct {
 	CoveragePercent *float64
 	FailingTests    []string
 	RecordingPath   string
+	Snapshot        map[string]string
 }
 
 // RequestedActionItem is one item feature_build reported it needs via
@@ -117,7 +125,8 @@ type RequestedActionItem struct {
 func (e CuratedEvent) Terminal() bool {
 	return e.Type == EventSubmitADR || e.Type == EventRunFailed || e.Type == EventRunCancelled ||
 		e.Type == EventSubmitBuildResult || e.Type == EventRequestActionItem ||
-		e.Type == EventSubmitReview || e.Type == EventSubmitTestReport
+		e.Type == EventSubmitReview || e.Type == EventSubmitTestReport ||
+		e.Type == EventSubmitDesign
 }
 
 // contractToolResult mirrors the shape yggdrasil-contract's tool
@@ -126,12 +135,13 @@ func (e CuratedEvent) Terminal() bool {
 // Pi's own internal event shapes.
 type contractToolResult struct {
 	Details struct {
-		Kind     string `json:"kind"`
-		Question string `json:"question"`
-		Markdown string `json:"markdown"`
-		Status   string `json:"status"`
-		PRUrl    string `json:"prUrl"`
-		Summary  string `json:"summary"`
+		Kind             string `json:"kind"`
+		Question         string `json:"question"`
+		Markdown         string `json:"markdown"`
+		HasDesignSurface *bool  `json:"hasDesignSurface,omitempty"`
+		Status           string `json:"status"`
+		PRUrl            string `json:"prUrl"`
+		Summary          string `json:"summary"`
 		// Verdict carries submit_review's "approved" | "changes_requested".
 		Verdict string `json:"verdict,omitempty"`
 		// ActionItems carries the needed items for request_action_item.
@@ -146,6 +156,7 @@ type contractToolResult struct {
 		CoveragePercent *float64              `json:"coveragePercent,omitempty"`
 		FailingTests    []string              `json:"failingTests,omitempty"`
 		RecordingPath   string                `json:"recordingPath,omitempty"`
+		Snapshot        map[string]string     `json:"snapshot,omitempty"`
 	} `json:"details"`
 }
 
@@ -255,7 +266,11 @@ func translateToolExecutionEnd(ev Event) (CuratedEvent, bool) {
 	case "ask_user":
 		return CuratedEvent{Type: EventAskUser, Question: parsed.Result.Details.Question}, true
 	case "submit_adr":
-		return CuratedEvent{Type: EventSubmitADR, Markdown: parsed.Result.Details.Markdown}, true
+		return CuratedEvent{
+			Type:             EventSubmitADR,
+			Markdown:         parsed.Result.Details.Markdown,
+			HasDesignSurface: parsed.Result.Details.HasDesignSurface,
+		}, true
 	case "submit_build_result":
 		return CuratedEvent{
 			Type:    EventSubmitBuildResult,
@@ -294,6 +309,18 @@ func translateToolExecutionEnd(ev Event) (CuratedEvent, bool) {
 			FailingTests:    parsed.Result.Details.FailingTests,
 			Summary:         parsed.Result.Details.Summary,
 			RecordingPath:   parsed.Result.Details.RecordingPath,
+		}, true
+	case "update_design_preview":
+		return CuratedEvent{
+			Type:     EventUpdateDesignPreview,
+			Snapshot: parsed.Result.Details.Snapshot,
+		}, true
+	case "submit_design":
+		return CuratedEvent{
+			Type:     EventSubmitDesign,
+			PRUrl:    parsed.Result.Details.PRUrl,
+			Summary:  parsed.Result.Details.Summary,
+			Snapshot: parsed.Result.Details.Snapshot,
 		}, true
 	default:
 		return CuratedEvent{}, false

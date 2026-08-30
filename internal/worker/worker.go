@@ -267,7 +267,8 @@ func runInCluster(ctx context.Context, q *queue.Queue, client *k8s.Client, job *
 	if job.Kind == queue.KindSpecGrill ||
 		job.Kind == queue.KindFeatureBuild ||
 		job.Kind == queue.KindTestRun ||
-		job.Kind == queue.KindAgenticReview {
+		job.Kind == queue.KindAgenticReview ||
+		job.Kind == queue.KindDesignGrill {
 		if img, ok := cfg.Images[job.Kind]; ok && img != "" {
 			return runAgentRPCJob(ctx, q, client, job, namespace, cfg)
 		}
@@ -309,7 +310,8 @@ func runAgentJob(ctx context.Context, client *k8s.Client, job *queue.Job, namesp
 // MODEL_BASE_URL/MODEL_API_KEY/MODEL_ID, decrypted from project_secrets) as
 // plain job-pod env vars, the same delivery path already used for the
 // scoped GitHub token, not a Kubernetes Secret object — plus, for
-// spec_grill and feature_build (ADR 010 item 2), TARGET_REPOS/GITHUB_TOKEN
+// spec_grill, feature_build, and design_grill (ADR 010/014),
+// TARGET_REPOS/GITHUB_TOKEN
 // (and, feature_build only, ADR_MARKDOWN/FEATURE_BRANCH) via agentRepoEnv.
 // Also returns the fetched FeatureSpec (zero value for job kinds that don't
 // fetch one) so runAgentRPCJob can reuse spec.Title/spec.FeatureType for
@@ -333,7 +335,8 @@ func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]
 	if job.Kind == queue.KindSpecGrill ||
 		job.Kind == queue.KindFeatureBuild ||
 		job.Kind == queue.KindTestRun ||
-		job.Kind == queue.KindAgenticReview {
+		job.Kind == queue.KindAgenticReview ||
+		job.Kind == queue.KindDesignGrill {
 		specEnv, fetchedSpec, err := agentRepoEnv(ctx, cfg, job)
 		if err != nil {
 			return nil, apiclient.FeatureSpec{}, err
@@ -388,14 +391,17 @@ func agentRepoEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]s
 	var spec apiclient.FeatureSpec
 	var err error
 	if job.FeatureID == nil {
-		if job.Kind != queue.KindTestRun || job.TestID == nil {
+		if job.Kind == queue.KindDesignGrill {
+			spec, err = cfg.APIClient.FetchDesignSpec(ctx, job.ProjectID, job.ID)
+		} else if job.Kind != queue.KindTestRun || job.TestID == nil {
 			return nil, apiclient.FeatureSpec{}, fmt.Errorf("job %s (kind=%s) has no feature_id", job.ID, job.Kind)
+		} else {
+			ref := "main"
+			if job.Ref != nil && *job.Ref != "" {
+				ref = *job.Ref
+			}
+			spec, err = cfg.APIClient.FetchTestSpec(ctx, job.ProjectID, *job.TestID, ref)
 		}
-		ref := "main"
-		if job.Ref != nil && *job.Ref != "" {
-			ref = *job.Ref
-		}
-		spec, err = cfg.APIClient.FetchTestSpec(ctx, job.ProjectID, *job.TestID, ref)
 	} else {
 		testID := ""
 		if job.TestID != nil {

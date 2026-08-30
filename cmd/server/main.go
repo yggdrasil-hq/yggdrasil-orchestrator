@@ -175,6 +175,9 @@ func resolveAgentImages() map[queue.JobKind]string {
 	if v := os.Getenv("AGENTIC_REVIEW_IMAGE"); v != "" {
 		images[queue.KindAgenticReview] = v
 	}
+	if v := os.Getenv("DESIGN_GRILL_IMAGE"); v != "" {
+		images[queue.KindDesignGrill] = v
+	}
 	return images
 }
 

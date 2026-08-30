@@ -53,7 +53,7 @@ type cancelWatcher interface {
 	WatchCancellation(ctx context.Context, jobID string) error
 }
 
-// runAgentRPCJob runs a spec_grill, feature_build, or test_run job by attaching to its
+// runAgentRPCJob runs a spec_grill, feature_build, test_run, or design_grill job by attaching to its
 // pod and driving Pi's RPC session directly (ADR 006 items 2-4, 7, 11;
 // widened to feature_build by ADR 010), instead of the placeholder-
 // compatible blocking k8s.RunJob every other job kind still uses
@@ -214,7 +214,20 @@ func buildInitialPrompt(kind queue.JobKind, spec apiclient.FeatureSpec) string {
 	if kind == queue.KindTestRun {
 		return buildTestRunPrompt(spec)
 	}
+	if kind == queue.KindDesignGrill {
+		return buildDesignGrillPrompt(spec)
+	}
 	return buildSpecGrillPrompt(spec)
+}
+
+func buildDesignGrillPrompt(spec apiclient.FeatureSpec) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Design session: %s\n\n", spec.DesignName)
+	b.WriteString("Read /root/.pi/agent/skills/design-grill/SKILL.md first. ")
+	b.WriteString("Create and refine a live, self-contained HTML mockup from the design brief below. ")
+	b.WriteString("The design folder is already checked out on the branch prepared for this session.\n\n")
+	fmt.Fprintf(&b, "Design brief:\n%s", spec.DesignDescription)
+	return b.String()
 }
 
 func buildTestRunPrompt(spec apiclient.FeatureSpec) string {
@@ -493,7 +506,9 @@ func runTurn(
 			if !matched {
 				continue
 			}
-			if curated.Type == rpc.EventAgentText || curated.Type == rpc.EventReportTestStep {
+			if curated.Type == rpc.EventAgentText ||
+				curated.Type == rpc.EventReportTestStep ||
+				curated.Type == rpc.EventUpdateDesignPreview {
 				// Forwarded live, not turn-ending: the model's own prose
 				// alongside (or instead of) a contract tool call in this
 				// same turn. Test steps have the same property: they are

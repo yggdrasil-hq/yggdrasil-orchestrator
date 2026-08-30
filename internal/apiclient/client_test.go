@@ -306,6 +306,36 @@ func TestFetchFeatureSpec_ReturnsErrorOnNon200(t *testing.T) {
 	}
 }
 
+func TestFetchDesignSpecDecodesDesignPayload(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name":        "Checkout flow",
+			"slug":        "checkout",
+			"description": "A responsive checkout mockup.",
+			"branch":      "yggdrasil/design-checkout-session-1",
+			"repos":       []map[string]any{{"cloneUrl": "https://github.com/acme/web.git", "isPrimary": true}},
+			"githubToken": "ghs_design-token",
+		})
+	}))
+	defer server.Close()
+
+	spec, err := apiclient.New(server.URL, "test-token").
+		FetchDesignSpec(context.Background(), "proj-123", "session-1")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if gotPath != "/internal/projects/proj-123/designs/session-1/spec" {
+		t.Fatalf("unexpected design payload path: %q", gotPath)
+	}
+	if spec.DesignName != "Checkout flow" || spec.DesignSlug != "checkout" ||
+		spec.DesignDescription != "A responsive checkout mockup." {
+		t.Fatalf("unexpected design payload: %+v", spec)
+	}
+}
+
 func TestFetchTestSpecSendsRefAndParsesMarkdown(t *testing.T) {
 	var gotAuthHeader, gotPath, gotRef string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

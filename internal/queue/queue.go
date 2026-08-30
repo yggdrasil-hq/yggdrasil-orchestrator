@@ -23,6 +23,7 @@ const (
 	KindDeploy        JobKind = "deploy"
 	KindScriptTestRun JobKind = "script_test_run"
 	KindAgenticReview JobKind = "agentic_review"
+	KindDesignGrill   JobKind = "design_grill"
 )
 
 type JobStatus string

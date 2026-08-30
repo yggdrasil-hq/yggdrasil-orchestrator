@@ -593,3 +593,16 @@ func TestBuildInitialPrompt_FeatureBuildPointsAtImplementSkill(t *testing.T) {
 		t.Fatalf("feature_build prompt must not name a spec_grill skill, got: %s", prompt)
 	}
 }
+
+func TestBuildInitialPrompt_DesignGrillPointsAtDesignSkill(t *testing.T) {
+	prompt := buildInitialPrompt(queue.KindDesignGrill, apiclient.FeatureSpec{
+		DesignName:        "Checkout flow",
+		DesignDescription: "A responsive checkout mockup.",
+	})
+	if !strings.Contains(prompt, "design-grill/SKILL.md") {
+		t.Fatalf("expected design_grill prompt to name design-grill/SKILL.md, got: %s", prompt)
+	}
+	if !strings.Contains(prompt, "Checkout flow") || !strings.Contains(prompt, "responsive checkout") {
+		t.Fatalf("expected design metadata in prompt, got: %s", prompt)
+	}
+}

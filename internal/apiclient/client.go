@@ -191,15 +191,42 @@ type FeatureSpecRepo struct {
 // ("Project initialization"), so it carries no information the container
 // could use to tell the two cases apart on its own.
 type FeatureSpec struct {
-	Title        string            `json:"title"`
-	FeatureType  string            `json:"featureType"`
-	Repos        []FeatureSpecRepo `json:"repos"`
-	GithubToken  string            `json:"githubToken"`
-	AdrMarkdown  string            `json:"adrMarkdown"`
-	Branch       string            `json:"branch"`
-	TestID       string            `json:"testId"`
-	TestMarkdown string            `json:"testMarkdown"`
-	Ref          string            `json:"ref"`
+	Title             string            `json:"title"`
+	FeatureType       string            `json:"featureType"`
+	Repos             []FeatureSpecRepo `json:"repos"`
+	GithubToken       string            `json:"githubToken"`
+	AdrMarkdown       string            `json:"adrMarkdown"`
+	Branch            string            `json:"branch"`
+	TestID            string            `json:"testId"`
+	TestMarkdown      string            `json:"testMarkdown"`
+	Ref               string            `json:"ref"`
+	DesignName        string            `json:"name"`
+	DesignSlug        string            `json:"slug"`
+	DesignDescription string            `json:"description"`
+}
+
+// FetchDesignSpec fetches the project-scoped payload for a design_grill job.
+func (c *Client) FetchDesignSpec(ctx context.Context, projectID, sessionID string) (FeatureSpec, error) {
+	reqURL := fmt.Sprintf("%s/internal/projects/%s/designs/%s/spec", c.baseURL, projectID, sessionID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return FeatureSpec{}, fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return FeatureSpec{}, fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return FeatureSpec{}, fmt.Errorf("API returned status %d fetching design session %s", resp.StatusCode, sessionID)
+	}
+	var spec FeatureSpec
+	if err := json.NewDecoder(resp.Body).Decode(&spec); err != nil {
+		return FeatureSpec{}, fmt.Errorf("failed to decode design session response: %w", err)
+	}
+	return spec, nil
 }
 
 // FetchFeatureSpec fetches a job's feature payload (ADR 006 item 5, widened
@@ -279,18 +306,20 @@ type jobEventRequest struct {
 	Verdict string `json:"verdict,omitempty"`
 	// ActionItems is set for request_action_item (ADR 015 item 8 / Track B3):
 	// the needed items the blocked implement skill reported.
-	ActionItems     []rpc.RequestedActionItem `json:"actionItems,omitempty"`
-	TestName        string                    `json:"testName,omitempty"`
-	TestStatus      string                    `json:"testStatus,omitempty"`
-	TestDetails     string                    `json:"testDetails,omitempty"`
-	ScreenshotPath  string                    `json:"screenshotPath,omitempty"`
-	Passed          *int                      `json:"passed,omitempty"`
-	Failed          *int                      `json:"failed,omitempty"`
-	Skipped         *int                      `json:"skipped,omitempty"`
-	Total           *int                      `json:"total,omitempty"`
-	CoveragePercent *float64                  `json:"coveragePercent,omitempty"`
-	FailingTests    []string                  `json:"failingTests,omitempty"`
-	RecordingPath   string                    `json:"recordingPath,omitempty"`
+	ActionItems      []rpc.RequestedActionItem `json:"actionItems,omitempty"`
+	TestName         string                    `json:"testName,omitempty"`
+	TestStatus       string                    `json:"testStatus,omitempty"`
+	TestDetails      string                    `json:"testDetails,omitempty"`
+	ScreenshotPath   string                    `json:"screenshotPath,omitempty"`
+	Passed           *int                      `json:"passed,omitempty"`
+	Failed           *int                      `json:"failed,omitempty"`
+	Skipped          *int                      `json:"skipped,omitempty"`
+	Total            *int                      `json:"total,omitempty"`
+	CoveragePercent  *float64                  `json:"coveragePercent,omitempty"`
+	FailingTests     []string                  `json:"failingTests,omitempty"`
+	RecordingPath    string                    `json:"recordingPath,omitempty"`
+	Snapshot         map[string]string         `json:"snapshot,omitempty"`
+	HasDesignSurface *bool                     `json:"hasDesignSurface,omitempty"`
 }
 
 // PostJobEvent relays one curated event (ADR 006 items 7-8) from a running
@@ -300,26 +329,28 @@ type jobEventRequest struct {
 // independent of whether this side-channel post succeeded.
 func (c *Client) PostJobEvent(ctx context.Context, jobID string, event rpc.CuratedEvent) error {
 	body, err := json.Marshal(jobEventRequest{
-		Type:            string(event.Type),
-		Question:        event.Question,
-		Markdown:        event.Markdown,
-		Message:         event.Message,
-		Status:          event.Status,
-		PRUrl:           event.PRUrl,
-		Summary:         event.Summary,
-		Verdict:         event.Verdict,
-		ActionItems:     event.ActionItems,
-		TestName:        event.TestName,
-		TestStatus:      event.TestStatus,
-		TestDetails:     event.TestDetails,
-		ScreenshotPath:  event.ScreenshotPath,
-		Passed:          event.Passed,
-		Failed:          event.Failed,
-		Skipped:         event.Skipped,
-		Total:           event.Total,
-		CoveragePercent: event.CoveragePercent,
-		FailingTests:    event.FailingTests,
-		RecordingPath:   event.RecordingPath,
+		Type:             string(event.Type),
+		Question:         event.Question,
+		Markdown:         event.Markdown,
+		Message:          event.Message,
+		Status:           event.Status,
+		PRUrl:            event.PRUrl,
+		Summary:          event.Summary,
+		Verdict:          event.Verdict,
+		ActionItems:      event.ActionItems,
+		TestName:         event.TestName,
+		TestStatus:       event.TestStatus,
+		TestDetails:      event.TestDetails,
+		ScreenshotPath:   event.ScreenshotPath,
+		Passed:           event.Passed,
+		Failed:           event.Failed,
+		Skipped:          event.Skipped,
+		Total:            event.Total,
+		CoveragePercent:  event.CoveragePercent,
+		FailingTests:     event.FailingTests,
+		RecordingPath:    event.RecordingPath,
+		Snapshot:         event.Snapshot,
+		HasDesignSurface: event.HasDesignSurface,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to encode job event: %w", err)
