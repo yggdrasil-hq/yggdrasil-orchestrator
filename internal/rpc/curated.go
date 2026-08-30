@@ -94,8 +94,8 @@ type CuratedEvent struct {
 	Summary          string // set for EventSubmitBuildResult
 	// Verdict is set for EventSubmitReview: "approved" | "changes_requested".
 	Verdict string
-	// ActionItems is set for EventRequestActionItem: the needed items the
-	// blocked implement skill reported (ADR 015 item 8).
+	// ActionItems is set for submit_adr and request_action_item: the Action
+	// Item batch or the needed items the blocked implement skill reported.
 	ActionItems     []RequestedActionItem
 	TestName        string
 	TestStatus      string
@@ -115,8 +115,10 @@ type CuratedEvent struct {
 // request_action_item (ADR 015 item 8): a type ("secret_request",
 // "subtask_feature", "design_grill", "test_request") and a description.
 type RequestedActionItem struct {
-	Type        string `json:"type"`
-	Description string `json:"description"`
+	Type              string `json:"type"`
+	Description       string `json:"description"`
+	SecretKey         string `json:"secretKey,omitempty"`
+	DraftTestMarkdown string `json:"draftTestMarkdown,omitempty"`
 }
 
 // Terminal reports whether this event ends the whole job run (ADR 006 item
@@ -142,6 +144,7 @@ type contractToolResult struct {
 		Status           string `json:"status"`
 		PRUrl            string `json:"prUrl"`
 		Summary          string `json:"summary"`
+		Comment          string `json:"comment,omitempty"`
 		// Verdict carries submit_review's "approved" | "changes_requested".
 		Verdict string `json:"verdict,omitempty"`
 		// ActionItems carries the needed items for request_action_item.
@@ -270,6 +273,7 @@ func translateToolExecutionEnd(ev Event) (CuratedEvent, bool) {
 			Type:             EventSubmitADR,
 			Markdown:         parsed.Result.Details.Markdown,
 			HasDesignSurface: parsed.Result.Details.HasDesignSurface,
+			ActionItems:      parsed.Result.Details.ActionItems,
 		}, true
 	case "submit_build_result":
 		return CuratedEvent{
@@ -285,10 +289,14 @@ func translateToolExecutionEnd(ev Event) (CuratedEvent, bool) {
 			ActionItems: parsed.Result.Details.ActionItems,
 		}, true
 	case "submit_review":
+		summary := parsed.Result.Details.Comment
+		if summary == "" {
+			summary = parsed.Result.Details.Summary
+		}
 		return CuratedEvent{
 			Type:    EventSubmitReview,
 			Verdict: parsed.Result.Details.Verdict,
-			Summary: parsed.Result.Details.Summary,
+			Summary: summary,
 		}, true
 	case "report_test_step":
 		return CuratedEvent{

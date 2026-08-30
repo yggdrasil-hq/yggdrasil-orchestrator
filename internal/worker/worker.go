@@ -423,13 +423,16 @@ func agentRepoEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]s
 		if job.TestGroup != nil {
 			scriptName = *job.TestGroup
 		}
+		args := []string{testID, scriptName}
+		if job.Kind == queue.KindSpecGrill {
+			args = append(args, job.ID)
+		}
 		spec, err = cfg.APIClient.FetchFeatureSpec(
 			ctx,
 			job.ProjectID,
 			*job.FeatureID,
 			string(job.Kind),
-			testID,
-			scriptName,
+			args...,
 		)
 	}
 	if err != nil {

@@ -214,10 +214,24 @@ func buildInitialPrompt(kind queue.JobKind, spec apiclient.FeatureSpec) string {
 	if kind == queue.KindTestRun {
 		return buildTestRunPrompt(spec)
 	}
+	if kind == queue.KindAgenticReview {
+		return buildAgenticReviewPrompt(spec)
+	}
 	if kind == queue.KindDesignGrill {
 		return buildDesignGrillPrompt(spec)
 	}
 	return buildSpecGrillPrompt(spec)
+}
+
+func buildAgenticReviewPrompt(spec apiclient.FeatureSpec) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Review the implementation of feature %s against its approved ADR.\n\n", spec.Title)
+	b.WriteString("Read /root/.pi/agent/skills/review/SKILL.md first. ")
+	b.WriteString("The approved ADR is at /workspace/.yggdrasil/adr.md. ")
+	b.WriteString("Review the feature branch diff against main and inspect any ")
+	b.WriteString("Testing reports under /workspace/.yggdrasil/. ")
+	b.WriteString("Submit exactly one internal verdict with submit_review.")
+	return b.String()
 }
 
 func buildDesignGrillPrompt(spec apiclient.FeatureSpec) string {
@@ -298,7 +312,42 @@ func buildSpecGrillPrompt(spec apiclient.FeatureSpec) string {
 		}
 		fmt.Fprintf(&b, "- %s (%s): %s\n", dir, role, repo.CloneURL)
 	}
+	appendSpecContext(&b, spec.SpecContext)
 	return b.String()
+}
+
+func appendSpecContext(b *strings.Builder, context *apiclient.SpecGrillContext) {
+	if context == nil {
+		return
+	}
+	b.WriteString("\n\nThis is a continuation of an earlier specification run. Preserve useful decisions from the context below, revisit anything the kickback makes invalid, and do not make the user repeat settled answers.\n")
+	if context.PreviousAdrMarkdown != "" {
+		b.WriteString("\nPreviously approved ADR:\n---\n")
+		b.WriteString(context.PreviousAdrMarkdown)
+		b.WriteString("\n---\n")
+	}
+	if context.GrillTranscriptSummary != "" {
+		b.WriteString("\nPrevious grill transcript summary:\n---\n")
+		b.WriteString(context.GrillTranscriptSummary)
+		b.WriteString("\n---\n")
+	}
+	if context.KickbackReason != "" {
+		b.WriteString("\nImplementation kickback reason:\n---\n")
+		b.WriteString(context.KickbackReason)
+		b.WriteString("\n---\n")
+	}
+	if len(context.RequestedActionItems) > 0 {
+		b.WriteString("\nRequested Action Items:\n")
+		for _, item := range context.RequestedActionItems {
+			fmt.Fprintf(b, "- %s: %s\n", item.Type, item.Description)
+		}
+	}
+	for _, design := range context.DesignSnapshots {
+		fmt.Fprintf(b, "\nFinalized design snapshot from session %s:\n", design.SessionID)
+		for path, content := range design.Snapshot {
+			fmt.Fprintf(b, "\nFile: %s\n```html\n%s\n```\n", path, content)
+		}
+	}
 }
 
 // repoLocalDir mirrors entrypoint.sh's clone layout: the primary repo lands

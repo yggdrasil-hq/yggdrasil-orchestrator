@@ -606,3 +606,34 @@ func TestBuildInitialPrompt_DesignGrillPointsAtDesignSkill(t *testing.T) {
 		t.Fatalf("expected design metadata in prompt, got: %s", prompt)
 	}
 }
+
+func TestBuildInitialPrompt_SpecGrillIncludesKickbackContext(t *testing.T) {
+	prompt := buildInitialPrompt(queue.KindSpecGrill, apiclient.FeatureSpec{
+		Title:       "Add dark mode",
+		FeatureType: "normal",
+		SpecContext: &apiclient.SpecGrillContext{
+			PreviousAdrMarkdown:    "# Previous ADR",
+			GrillTranscriptSummary: "User chose CSS variables.",
+			KickbackReason:         "secret_request: Need DARK_MODE_KEY",
+			RequestedActionItems: []rpc.RequestedActionItem{
+				{Type: "secret_request", Description: "Need DARK_MODE_KEY"},
+			},
+			DesignSnapshots: []apiclient.DesignSnapshotContext{{
+				SessionID: "design-1",
+				Snapshot:  map[string]string{"designs/dark-mode/page.html": "<h1>Dark mode</h1>"},
+			}},
+		},
+	})
+
+	for _, want := range []string{
+		"# Previous ADR",
+		"User chose CSS variables.",
+		"Need DARK_MODE_KEY",
+		"designs/dark-mode/page.html",
+		"<h1>Dark mode</h1>",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("expected prompt to include %q, got: %s", want, prompt)
+		}
+	}
+}

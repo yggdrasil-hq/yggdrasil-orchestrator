@@ -213,6 +213,20 @@ type FeatureSpec struct {
 	DesignSlug        string            `json:"slug"`
 	DesignDescription string            `json:"description"`
 	ScriptName        string            `json:"scriptName"`
+	SpecContext       *SpecGrillContext `json:"specContext,omitempty"`
+}
+
+type DesignSnapshotContext struct {
+	SessionID string            `json:"sessionId"`
+	Snapshot  map[string]string `json:"snapshot"`
+}
+
+type SpecGrillContext struct {
+	PreviousAdrMarkdown    string                    `json:"previousAdrMarkdown"`
+	GrillTranscriptSummary string                    `json:"grillTranscriptSummary"`
+	KickbackReason         string                    `json:"kickbackReason"`
+	RequestedActionItems   []rpc.RequestedActionItem `json:"requestedActionItems"`
+	DesignSnapshots        []DesignSnapshotContext   `json:"designSnapshots"`
 }
 
 // FetchDesignSpec fetches the project-scoped payload for a design_grill job.
@@ -256,6 +270,9 @@ func (c *Client) FetchFeatureSpec(ctx context.Context, projectID, featureID, kin
 	}
 	if len(testIDs) > 1 && testIDs[1] != "" {
 		query.Set("scriptName", testIDs[1])
+	}
+	if len(testIDs) > 2 && testIDs[2] != "" {
+		query.Set("jobId", testIDs[2])
 	}
 	reqURL := fmt.Sprintf("%s/internal/projects/%s/features/%s/spec?%s",
 		c.baseURL, projectID, featureID, query.Encode())
@@ -318,7 +335,8 @@ type jobEventRequest struct {
 	// internal Agentic Review verdict "approved" | "changes_requested".
 	Verdict string `json:"verdict,omitempty"`
 	// ActionItems is set for request_action_item (ADR 015 item 8 / Track B3):
-	// the needed items the blocked implement skill reported.
+	// the needed items the blocked implement skill reported, or the batch
+	// returned by submit_adr.
 	ActionItems      []rpc.RequestedActionItem `json:"actionItems,omitempty"`
 	TestName         string                    `json:"testName,omitempty"`
 	TestStatus       string                    `json:"testStatus,omitempty"`

@@ -309,8 +309,8 @@ func TestAgentRepoEnv_FetchesAndBuildsTargetReposAndToken(t *testing.T) {
 	if gotPath != "/internal/projects/proj-123/features/feat-456/spec" {
 		t.Fatalf("expected path %q, got %q", "/internal/projects/proj-123/features/feat-456/spec", gotPath)
 	}
-	if gotQuery != "kind=spec_grill" {
-		t.Fatalf("expected query %q, got %q", "kind=spec_grill", gotQuery)
+	if gotQuery != "jobId=job-1&kind=spec_grill" {
+		t.Fatalf("expected query %q, got %q", "jobId=job-1&kind=spec_grill", gotQuery)
 	}
 	if env["GITHUB_TOKEN"] != "ghs_test-token" {
 		t.Fatalf("expected GITHUB_TOKEN %q, got %q", "ghs_test-token", env["GITHUB_TOKEN"])

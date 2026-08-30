@@ -54,6 +54,18 @@ func TestTranslate_SubmitADRIsTerminal(t *testing.T) {
 	}
 }
 
+func TestTranslate_SubmitADRCarriesActionItems(t *testing.T) {
+	ev := rawEvent(t, `{"type":"tool_execution_end","toolName":"submit_adr","result":{"details":{"kind":"submit_adr","markdown":"# ADR 1","actionItems":[{"type":"secret_request","description":"Need a key","secretKey":"API_KEY"},{"type":"test_request","description":"Add smoke coverage","draftTestMarkdown":"## Smoke"}]},"terminate":true}}`)
+
+	curated, ok := rpc.Translate(ev)
+	if !ok || len(curated.ActionItems) != 2 {
+		t.Fatalf("expected two submit_adr Action Items, got %+v (ok=%v)", curated.ActionItems, ok)
+	}
+	if curated.ActionItems[0].SecretKey != "API_KEY" || curated.ActionItems[1].DraftTestMarkdown != "## Smoke" {
+		t.Fatalf("expected Action Item fields to survive translation, got %+v", curated.ActionItems)
+	}
+}
+
 func TestTranslate_SubmitADRCarriesDesignSurfaceAnswer(t *testing.T) {
 	ev := rawEvent(t, `{"type":"tool_execution_end","toolName":"submit_adr","result":{"details":{"kind":"submit_adr","markdown":"# Project ADR","hasDesignSurface":true},"terminate":true}}`)
 	curated, ok := rpc.Translate(ev)
@@ -176,7 +188,7 @@ func TestTranslate_RequestActionItemIsTerminalAndCarriesItems(t *testing.T) {
 }
 
 func TestTranslate_SubmitReviewIsTerminalAndCarriesVerdict(t *testing.T) {
-	ev := rawEvent(t, `{"type":"tool_execution_end","toolName":"submit_review","result":{"details":{"kind":"submit_review","verdict":"changes_requested","summary":"The diff doesn't match the approved ADR."},"terminate":true}}`)
+	ev := rawEvent(t, `{"type":"tool_execution_end","toolName":"submit_review","result":{"details":{"kind":"submit_review","verdict":"changes_requested","comment":"The diff doesn't match the approved ADR."},"terminate":true}}`)
 	curated, ok := rpc.Translate(ev)
 	if !ok {
 		t.Fatal("expected submit_review to be curated")
@@ -186,6 +198,9 @@ func TestTranslate_SubmitReviewIsTerminalAndCarriesVerdict(t *testing.T) {
 	}
 	if curated.Verdict != "changes_requested" {
 		t.Fatalf("expected verdict to be decoded, got %q", curated.Verdict)
+	}
+	if curated.Summary != "The diff doesn't match the approved ADR." {
+		t.Fatalf("expected comment to be decoded, got %q", curated.Summary)
 	}
 	if !curated.Terminal() {
 		t.Fatal("expected submit_review to be terminal — it ends the review run")
