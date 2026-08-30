@@ -73,7 +73,7 @@ func TestLoadChartFromFiles_ProducesDeployableChart(t *testing.T) {
 		_ = clientset.CoreV1().Namespaces().Delete(context.Background(), namespace, metav1.DeleteOptions{})
 	})
 
-	cfg, err := helm.NewConfiguration(namespace)
+	cfg, err := helm.NewConfiguration(mustRESTConfig(t), namespace)
 	if err != nil {
 		t.Fatalf("failed to build helm configuration: %v", err)
 	}

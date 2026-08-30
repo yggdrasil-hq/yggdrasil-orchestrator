@@ -1,6 +1,8 @@
-// Package k8s wires the Orchestrator to its single target Kubernetes cluster
-// (ADR 003 — one cluster per Orchestrator instance) and provisions
-// per-project resources within it.
+// Package k8s wires the Orchestrator to the Kubernetes cluster(s) it runs
+// jobs on. ADR 003 originally pinned a single cluster per instance; ADR 016
+// item 13 supersedes that with dynamic per-Organization cluster resolution —
+// the Orchestrator now builds clients from each org's stored kubeconfig
+// rather than one static client built once at startup.
 package k8s
 
 import (
@@ -13,11 +15,34 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-// NewClient builds a Kubernetes clientset for the Orchestrator's single
-// target cluster. It tries in-cluster config first (how a self-hosted or
-// managed Orchestrator running inside its target cluster will authenticate),
-// falling back to KUBECONFIG / the default kubeconfig path for local
-// development.
+// Client bundles the typed clientset and the raw REST config for one target
+// cluster, so callers that need either (jobs need the clientset, the
+// attach/helm paths need the REST config) get both from one resolution.
+type Client struct {
+	Interface kubernetes.Interface
+	Config    *rest.Config
+}
+
+// NewClientFromKubeconfig builds a Client (clientset + REST config) from raw
+// kubeconfig YAML bytes — the path every job's target cluster now flows
+// through, since org kubeconfigs are stored in the DB (ADR 016 item 13).
+func NewClientFromKubeconfig(kubeconfig []byte) (*Client, error) {
+	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse kubeconfig: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build Kubernetes clientset from kubeconfig: %w", err)
+	}
+	return &Client{Interface: clientset, Config: config}, nil
+}
+
+// NewClient builds a Kubernetes clientset for the Orchestrator's target
+// cluster using the ambient in-cluster config / KUBECONFIG / default kubeconfig
+// — kept solely as a local-dev/test convenience. This is NOT the production
+// cluster-resolution path (ADR 016 item 13 supersedes it for real jobs); it
+// just lets tests and local tooling connect to a developer cluster.
 func NewClient() (*kubernetes.Clientset, error) {
 	config, err := RESTConfig()
 	if err != nil {
@@ -26,9 +51,8 @@ func NewClient() (*kubernetes.Clientset, error) {
 	return kubernetes.NewForConfig(config)
 }
 
-// RESTConfig resolves the REST config for the Orchestrator's single target
-// cluster, for callers (e.g. internal/helm) that need it directly rather
-// than through a typed Kubernetes clientset.
+// RESTConfig resolves the REST config for the Orchestrator's target cluster
+// from in-cluster config, KUBECONFIG, or the default kubeconfig path.
 func RESTConfig() (*rest.Config, error) {
 	if config, err := rest.InClusterConfig(); err == nil {
 		return config, nil

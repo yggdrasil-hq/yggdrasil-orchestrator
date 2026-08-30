@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/apiclient"
+	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/helm"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/k8s"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/queue"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/rpc"
@@ -52,7 +53,7 @@ type cancelWatcher interface {
 	WatchCancellation(ctx context.Context, jobID string) error
 }
 
-// runAgentRPCJob runs a spec_grill or feature_build job by attaching to its
+// runAgentRPCJob runs a spec_grill, feature_build, or test_run job by attaching to its
 // pod and driving Pi's RPC session directly (ADR 006 items 2-4, 7, 11;
 // widened to feature_build by ADR 010), instead of the placeholder-
 // compatible blocking k8s.RunJob every other job kind still uses
@@ -65,7 +66,7 @@ type cancelWatcher interface {
 // this function explicitly deletes the Job once it does (or once the
 // session ends any other way), rather than waiting for Kubernetes to
 // report success.
-func runAgentRPCJob(ctx context.Context, q *queue.Queue, clientset kubernetes.Interface, job *queue.Job, namespace string, cfg Config) error {
+func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job *queue.Job, namespace string, cfg Config) error {
 	handle := func(ev rpc.CuratedEvent) {
 		if err := cfg.APIClient.PostJobEvent(ctx, job.ID, ev); err != nil {
 			// A failed relay is a visibility gap, not a job failure: the
@@ -91,10 +92,23 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, clientset kubernetes.In
 		return err
 	}
 
+	var cleanupPreview func()
+	if job.Kind == queue.KindTestRun {
+		cleanupPreview, err = createTestPreview(ctx, client, job, cfg)
+		if err != nil {
+			handle(rpc.CuratedEvent{
+				Type:    rpc.EventRunFailed,
+				Message: fmt.Sprintf("failed to create test preview: %v", err),
+			})
+			return err
+		}
+		defer cleanupPreview()
+	}
+
 	image, command := resolveAgentImage(cfg, job.Kind)
 	name := "job-" + job.ID
 
-	if err := k8s.CreateJob(ctx, clientset, k8s.JobSpec{
+	if err := k8s.CreateJob(ctx, client.Interface, k8s.JobSpec{
 		Namespace:        namespace,
 		Name:             name,
 		Image:            image,
@@ -111,12 +125,12 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, clientset kubernetes.In
 		// itself is what ended the session (worker shutdown, deadline) —
 		// an already-cancelled ctx here would make DeleteJob a no-op and
 		// leak the pod.
-		if err := k8s.DeleteJob(context.Background(), clientset, namespace, name); err != nil {
+		if err := k8s.DeleteJob(context.Background(), client.Interface, namespace, name); err != nil {
 			log.Printf("worker: failed to delete job %s (kind=%s): %v", job.ID, job.Kind, err)
 		}
 	}()
 
-	podName, err := k8s.WaitForJobPod(ctx, clientset, namespace, name)
+	podName, err := k8s.WaitForJobPod(ctx, client.Interface, namespace, name)
 	if err != nil {
 		// ADR 011 item 3: without this, a pod that never becomes attachable
 		// leaves the feature stuck in 'queued' forever — runClaimedJob's
@@ -135,17 +149,82 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, clientset kubernetes.In
 
 	initialPrompt := buildInitialPrompt(job.Kind, spec)
 
-	return driveAgentSession(ctx, clientset, cfg.RESTConfig, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, handle)
+	return driveAgentSession(ctx, client.Interface, client.Config, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, handle)
+}
+
+func createTestPreview(
+	ctx context.Context,
+	client *k8s.Client,
+	job *queue.Job,
+	cfg Config,
+) (func(), error) {
+	chrt, err := resolveChart(ctx, cfg, job.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	releaseName := "preview-" + job.ID
+	namespace := k8s.ProjectNamespace(job.ProjectID)
+	helmCfg, err := helm.NewConfiguration(client.Config, namespace)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize preview helm: %w", err)
+	}
+	if err := helm.Deploy(ctx, helmCfg, namespace, releaseName, chrt, nil); err != nil {
+		return nil, fmt.Errorf("failed to deploy test preview: %w", err)
+	}
+	slug, err := cfg.APIClient.FetchProjectMetadata(ctx, job.ProjectID)
+	if err != nil {
+		_ = helm.Uninstall(context.Background(), helmCfg, releaseName)
+		return nil, fmt.Errorf("failed to fetch project slug for test preview: %w", err)
+	}
+	host := fmt.Sprintf("%s-test-run-%s.preview.%s", slug, job.ID, cfg.AppsDomain)
+	ingressName := "preview-" + job.ID
+	if err := k8s.EnsureNamedIngress(
+		ctx,
+		client.Interface,
+		namespace,
+		ingressName,
+		host,
+		releaseName,
+		80,
+		cfg.IngressClassName,
+		ingressName+"-tls",
+		cfg.CertIssuerName,
+	); err != nil {
+		_ = helm.Uninstall(context.Background(), helmCfg, releaseName)
+		return nil, fmt.Errorf("failed to expose test preview: %w", err)
+	}
+	return func() {
+		cleanupCtx := context.Background()
+		if err := k8s.DeleteIngress(cleanupCtx, client.Interface, namespace, ingressName); err != nil {
+			log.Printf("worker: failed to delete test preview ingress %s: %v", ingressName, err)
+		}
+		if err := helm.Uninstall(cleanupCtx, helmCfg, releaseName); err != nil {
+			log.Printf("worker: failed to uninstall test preview %s: %v", releaseName, err)
+		}
+	}, nil
 }
 
 // buildInitialPrompt picks the prompt shape for the job's kind (ADR 010
-// item 6): a feature_build run gets buildFeatureBuildPrompt's short form,
-// everything else (spec_grill) gets buildSpecGrillPrompt's fuller one.
+// item 6): feature_build and test_run get their dedicated skills, while
+// spec_grill gets the fuller grill prompt.
 func buildInitialPrompt(kind queue.JobKind, spec apiclient.FeatureSpec) string {
 	if kind == queue.KindFeatureBuild {
 		return buildFeatureBuildPrompt(spec)
 	}
+	if kind == queue.KindTestRun {
+		return buildTestRunPrompt(spec)
+	}
 	return buildSpecGrillPrompt(spec)
+}
+
+func buildTestRunPrompt(spec apiclient.FeatureSpec) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Run the test suite for feature %s.\n\n", spec.Title)
+	b.WriteString("Read /root/.pi/agent/skills/run-tests/SKILL.md first. ")
+	b.WriteString("The test specification is available at /workspace/.yggdrasil/test-spec.md. ")
+	b.WriteString("The application preview is available at $PREVIEW_URL. ")
+	b.WriteString("Run every section in order, report each step, and submit exactly one final report.")
+	return b.String()
 }
 
 // buildFeatureBuildPrompt is deliberately short: unlike spec_grill (which
@@ -414,12 +493,14 @@ func runTurn(
 			if !matched {
 				continue
 			}
-			if curated.Type == rpc.EventAgentText {
+			if curated.Type == rpc.EventAgentText || curated.Type == rpc.EventReportTestStep {
 				// Forwarded live, not turn-ending: the model's own prose
 				// alongside (or instead of) a contract tool call in this
-				// same turn. Keep reading — the real terminating event (a
-				// tool call, agent_settled's failure branch above, or the
-				// attach stream ending) is what actually ends the turn.
+				// same turn. Test steps have the same property: they are
+				// progress records, not a request for another prompt.
+				// Keep reading — the real terminating event (a tool call,
+				// agent_settled's failure branch above, or the attach stream
+				// ending) is what actually ends the turn.
 				handle(curated)
 				continue
 			}

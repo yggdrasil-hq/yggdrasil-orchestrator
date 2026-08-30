@@ -150,6 +150,40 @@ func TestTranslate_SubmitBuildResultFailureIsAlsoTerminal(t *testing.T) {
 	}
 }
 
+func TestTranslate_RequestActionItemIsTerminalAndCarriesItems(t *testing.T) {
+	ev := rawEvent(t, `{"type":"tool_execution_end","toolName":"request_action_item","result":{"details":{"kind":"request_action_item","actionItems":[{"type":"secret_request","description":"Need a deploy token"}]},"terminate":true}}`)
+	curated, ok := rpc.Translate(ev)
+	if !ok {
+		t.Fatal("expected request_action_item to be curated")
+	}
+	if curated.Type != rpc.EventRequestActionItem {
+		t.Fatalf("expected EventRequestActionItem, got %q", curated.Type)
+	}
+	if len(curated.ActionItems) != 1 || curated.ActionItems[0].Type != "secret_request" || curated.ActionItems[0].Description != "Need a deploy token" {
+		t.Fatalf("unexpected action items: %+v", curated.ActionItems)
+	}
+	if !curated.Terminal() {
+		t.Fatal("expected request_action_item to be terminal — it ends feature_build's run")
+	}
+}
+
+func TestTranslate_SubmitReviewIsTerminalAndCarriesVerdict(t *testing.T) {
+	ev := rawEvent(t, `{"type":"tool_execution_end","toolName":"submit_review","result":{"details":{"kind":"submit_review","verdict":"changes_requested","summary":"The diff doesn't match the approved ADR."},"terminate":true}}`)
+	curated, ok := rpc.Translate(ev)
+	if !ok {
+		t.Fatal("expected submit_review to be curated")
+	}
+	if curated.Type != rpc.EventSubmitReview {
+		t.Fatalf("expected EventSubmitReview, got %q", curated.Type)
+	}
+	if curated.Verdict != "changes_requested" {
+		t.Fatalf("expected verdict to be decoded, got %q", curated.Verdict)
+	}
+	if !curated.Terminal() {
+		t.Fatal("expected submit_review to be terminal — it ends the review run")
+	}
+}
+
 func TestTranslate_AssistantMessageEndIsAgentTextAndNotTerminal(t *testing.T) {
 	ev := rawEvent(t, `{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Here's my thinking on the port question."}],"timestamp":1787514442356}}`)
 

@@ -169,6 +169,52 @@ func TestFetchProjectMetadata_ReturnsErrorOnNon200(t *testing.T) {
 	}
 }
 
+func TestFetchOrganizationCluster_ParsesOrgAndKubeconfig(t *testing.T) {
+	var gotAuthHeader, gotPath string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthHeader = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"organizationId": "org-1",
+			"kubeconfig":     "apiVersion: v1\nclusters: []\n",
+		})
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	orgID, kubeconfig, err := client.FetchOrganizationCluster(context.Background(), "proj-123")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if gotAuthHeader != "Bearer test-token" {
+		t.Fatalf("expected Authorization header %q, got %q", "Bearer test-token", gotAuthHeader)
+	}
+	if gotPath != "/internal/projects/proj-123/organization-cluster" {
+		t.Fatalf("expected path %q, got %q", "/internal/projects/proj-123/organization-cluster", gotPath)
+	}
+	if orgID != "org-1" {
+		t.Fatalf("expected org id %q, got %q", "org-1", orgID)
+	}
+	if kubeconfig != "apiVersion: v1\nclusters: []\n" {
+		t.Fatalf("expected kubeconfig to be parsed, got %q", kubeconfig)
+	}
+}
+
+func TestFetchOrganizationCluster_ReturnsErrorWhenNoClusterConfigured(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	_, _, err := client.FetchOrganizationCluster(context.Background(), "proj-123")
+	if err == nil {
+		t.Fatal("expected an error for a 409 (org has no cluster), got nil")
+	}
+}
+
 func TestFetchFeatureSpec_SendsBearerTokenAndParsesResponse(t *testing.T) {
 	var gotAuthHeader, gotPath string
 
@@ -257,6 +303,38 @@ func TestFetchFeatureSpec_ReturnsErrorOnNon200(t *testing.T) {
 	_, err := client.FetchFeatureSpec(context.Background(), "proj-123", "feat-456", "spec_grill")
 	if err == nil {
 		t.Fatal("expected an error for a 404 response, got nil")
+	}
+}
+
+func TestFetchTestSpecSendsRefAndParsesMarkdown(t *testing.T) {
+	var gotAuthHeader, gotPath, gotRef string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthHeader = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		gotRef = r.URL.Query().Get("ref")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"title":        "Checkout flow",
+			"testId":       "test-1",
+			"testMarkdown": "## Checkout",
+			"ref":          "main",
+		})
+	}))
+	defer server.Close()
+
+	spec, err := apiclient.New(server.URL, "test-token").
+		FetchTestSpec(context.Background(), "proj-123", "test-1", "main")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if gotAuthHeader != "Bearer test-token" {
+		t.Fatalf("expected bearer auth, got %q", gotAuthHeader)
+	}
+	if gotPath != "/internal/projects/proj-123/tests/test-1/spec" || gotRef != "main" {
+		t.Fatalf("unexpected test spec request: path=%q ref=%q", gotPath, gotRef)
+	}
+	if spec.TestMarkdown != "## Checkout" || spec.Ref != "main" {
+		t.Fatalf("unexpected test spec: %+v", spec)
 	}
 }
 

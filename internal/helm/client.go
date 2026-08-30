@@ -4,6 +4,7 @@
 package helm
 
 import (
+	"context"
 	"fmt"
 	"log"
 
@@ -15,8 +16,6 @@ import (
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
-
-	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/k8s"
 )
 
 // helmStorageDriver controls where Helm stores release metadata. "secret"
@@ -25,14 +24,11 @@ import (
 const helmStorageDriver = "secret"
 
 // NewConfiguration builds a Helm action.Configuration scoped to namespace,
-// reusing the Orchestrator's single target cluster's REST config (the same
-// in-cluster/kubeconfig resolution as internal/k8s.NewClient).
-func NewConfiguration(namespace string) (*action.Configuration, error) {
-	restConfig, err := k8s.RESTConfig()
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve REST config: %w", err)
-	}
-
+// using the provided *rest.Config — the per-Organization cluster config a
+// deploy job resolved at claim time (ADR 016 item 13). Takes the config
+// explicitly rather than deriving it from an ambient kubeconfig, since a
+// deploy must target whatever cluster the project's org owns.
+func NewConfiguration(restConfig *rest.Config, namespace string) (*action.Configuration, error) {
 	cfg := new(action.Configuration)
 	getter := &restClientGetter{config: restConfig, namespace: namespace}
 	debugLog := func(format string, v ...interface{}) {
@@ -42,6 +38,16 @@ func NewConfiguration(namespace string) (*action.Configuration, error) {
 		return nil, fmt.Errorf("failed to initialize helm configuration: %w", err)
 	}
 	return cfg, nil
+}
+
+func Uninstall(ctx context.Context, cfg *action.Configuration, releaseName string) error {
+	_ = ctx
+	uninstall := action.NewUninstall(cfg)
+	uninstall.Wait = true
+	if _, err := uninstall.Run(releaseName); err != nil {
+		return fmt.Errorf("failed to uninstall release %s: %w", releaseName, err)
+	}
+	return nil
 }
 
 // restClientGetter adapts an already-resolved *rest.Config to Helm's

@@ -26,11 +26,32 @@ func EnsureProjectIngress(
 	servicePort int32,
 	ingressClassName, tlsSecretName, certIssuerName string,
 ) error {
+	return EnsureNamedIngress(
+		ctx,
+		clientset,
+		PrimaryIngressName,
+		namespace,
+		host,
+		serviceName,
+		servicePort,
+		ingressClassName,
+		tlsSecretName,
+		certIssuerName,
+	)
+}
+
+func EnsureNamedIngress(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	ingressName, namespace, host, serviceName string,
+	servicePort int32,
+	ingressClassName, tlsSecretName, certIssuerName string,
+) error {
 	pathType := networkingv1.PathTypePrefix
 
 	ingress := &networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      PrimaryIngressName,
+			Name:      ingressName,
 			Namespace: namespace,
 			Annotations: map[string]string{
 				"cert-manager.io/cluster-issuer": certIssuerName,
@@ -75,21 +96,29 @@ func EnsureProjectIngress(
 		return nil
 	}
 	if !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("failed to create ingress %s in namespace %s: %w", PrimaryIngressName, namespace, err)
+		return fmt.Errorf("failed to create ingress %s in namespace %s: %w", ingressName, namespace, err)
 	}
 
 	// Kubernetes requires the current resourceVersion for an update
 	// (optimistic concurrency) — Get before Update rather than blindly
 	// retrying Create's object.
-	existing, err := clientset.NetworkingV1().Ingresses(namespace).Get(ctx, PrimaryIngressName, metav1.GetOptions{})
+	existing, err := clientset.NetworkingV1().Ingresses(namespace).Get(ctx, ingressName, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to fetch existing ingress %s in namespace %s: %w", PrimaryIngressName, namespace, err)
+		return fmt.Errorf("failed to fetch existing ingress %s in namespace %s: %w", ingressName, namespace, err)
 	}
 	existing.Annotations = ingress.Annotations
 	existing.Spec = ingress.Spec
 
 	if _, err := clientset.NetworkingV1().Ingresses(namespace).Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
-		return fmt.Errorf("failed to update ingress %s in namespace %s: %w", PrimaryIngressName, namespace, err)
+		return fmt.Errorf("failed to update ingress %s in namespace %s: %w", ingressName, namespace, err)
+	}
+	return nil
+}
+
+func DeleteIngress(ctx context.Context, clientset kubernetes.Interface, namespace, name string) error {
+	err := clientset.NetworkingV1().Ingresses(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete ingress %s in namespace %s: %w", name, namespace, err)
 	}
 	return nil
 }

@@ -13,13 +13,13 @@ import (
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/k8s"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/queue"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 )
 
 // testClient connects to whatever cluster KUBECONFIG (or in-cluster config)
 // points at, skipping the test if none is reachable — same pattern used by
-// internal/k8s and internal/helm.
-func testClient(t *testing.T) kubernetes.Interface {
+// internal/k8s and internal/helm. Returns a *k8s.Client so it can be passed
+// straight to the per-org client-consuming funcs under test.
+func testClient(t *testing.T) *k8s.Client {
 	t.Helper()
 	clientset, err := k8s.NewClient()
 	if err != nil {
@@ -28,7 +28,11 @@ func testClient(t *testing.T) kubernetes.Interface {
 	if _, err := clientset.Discovery().ServerVersion(); err != nil {
 		t.Skipf("Kubernetes cluster unreachable; skipping: %v", err)
 	}
-	return clientset
+	restConfig, err := k8s.RESTConfig()
+	if err != nil {
+		t.Skipf("no Kubernetes REST config available; skipping: %v", err)
+	}
+	return &k8s.Client{Interface: clientset, Config: restConfig}
 }
 
 // Proves runDeploy's chart-resolution glue actually prefers a scaffolded
@@ -119,12 +123,12 @@ func TestRunDeploy_SurfacesSlugFetchError(t *testing.T) {
 	defer server.Close()
 
 	projectID := "test-" + time.Now().Format("150405")
-	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset, projectID)
+	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset.Interface, projectID)
 	if err != nil {
 		t.Fatalf("failed to provision namespace: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = clientset.CoreV1().Namespaces().Delete(context.Background(), namespace, metav1.DeleteOptions{})
+		_ = clientset.Interface.CoreV1().Namespaces().Delete(context.Background(), namespace, metav1.DeleteOptions{})
 	})
 
 	cfg := Config{
@@ -431,12 +435,12 @@ func TestRunAgentJob_SpecGrillIncludesFetchedRepoAndTokenEnv(t *testing.T) {
 	defer server.Close()
 
 	projectID := "test-" + time.Now().Format("150405")
-	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset, projectID)
+	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset.Interface, projectID)
 	if err != nil {
 		t.Fatalf("failed to provision namespace: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = clientset.CoreV1().Namespaces().Delete(context.Background(), namespace, metav1.DeleteOptions{})
+		_ = clientset.Interface.CoreV1().Namespaces().Delete(context.Background(), namespace, metav1.DeleteOptions{})
 	})
 
 	featureID := "feat-456"
@@ -453,7 +457,7 @@ func TestRunAgentJob_SpecGrillIncludesFetchedRepoAndTokenEnv(t *testing.T) {
 		t.Fatalf("runAgentJob failed: %v", err)
 	}
 
-	createdJob, err := clientset.BatchV1().Jobs(namespace).Get(ctx, "job-"+jobID, metav1.GetOptions{})
+	createdJob, err := clientset.Interface.BatchV1().Jobs(namespace).Get(ctx, "job-"+jobID, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("failed to fetch created job: %v", err)
 	}

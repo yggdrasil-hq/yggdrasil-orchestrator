@@ -17,10 +17,12 @@ import (
 type JobKind string
 
 const (
-	KindSpecGrill    JobKind = "spec_grill"
-	KindFeatureBuild JobKind = "feature_build"
-	KindTestRun      JobKind = "test_run"
-	KindDeploy       JobKind = "deploy"
+	KindSpecGrill     JobKind = "spec_grill"
+	KindFeatureBuild  JobKind = "feature_build"
+	KindTestRun       JobKind = "test_run"
+	KindDeploy        JobKind = "deploy"
+	KindScriptTestRun JobKind = "script_test_run"
+	KindAgenticReview JobKind = "agentic_review"
 )
 
 type JobStatus string
@@ -40,6 +42,8 @@ type Job struct {
 	Kind      JobKind
 	FeatureID *string
 	TestID    *string
+	Ref       *string
+	Trigger   *string
 	Status    JobStatus
 	CreatedAt time.Time
 	StartedAt *time.Time
@@ -70,12 +74,12 @@ func (q *Queue) Claim(ctx context.Context, workerID string) (*Job, error) {
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
 		)
-		RETURNING id, project_id, kind, feature_id, test_id, status, created_at, started_at
+		RETURNING id, project_id, kind, feature_id, test_id, ref, trigger_source, status, created_at, started_at
 	`, workerID)
 
 	var j Job
 	err := row.Scan(
-		&j.ID, &j.ProjectID, &j.Kind, &j.FeatureID, &j.TestID,
+		&j.ID, &j.ProjectID, &j.Kind, &j.FeatureID, &j.TestID, &j.Ref, &j.Trigger,
 		&j.Status, &j.CreatedAt, &j.StartedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {

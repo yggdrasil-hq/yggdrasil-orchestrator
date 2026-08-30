@@ -57,6 +57,22 @@ const (
 	// (the agent_settled failure path) leaves a record of what the model
 	// actually said, instead of just "ended without submitting a result".
 	EventAgentText CuratedEventType = "agent_text"
+	// EventRequestActionItem: the yggdrasil-contract extension's
+	// request_action_item tool fired (feature_build only, ADR 015 item 7-8 &
+	// Track B3) — the implement skill's terminal "I'm blocked" call,
+	// structurally distinct from a generic crash/`submit_build_result
+	// success:false`. The API lands the feature back in `draft` and dispatches
+	// a context-seeded spec_grill. Always terminal.
+	EventRequestActionItem CuratedEventType = "request_action_item"
+	// EventSubmitReview: the yggdrasil-contract extension's submit_review tool
+	// fired (agentic_review only, ADR 015 item 14-16 & Track B6) — the
+	// reviewing agent's terminal internal verdict, never a real GitHub PR
+	// review (which would collide with ADR 013's human-review webhook). The
+	// API maps `approved` -> in_review, `changes_requested` -> returned with
+	// reason agentic_review. Always terminal.
+	EventSubmitReview     CuratedEventType = "submit_review"
+	EventReportTestStep   CuratedEventType = "report_test_step"
+	EventSubmitTestReport CuratedEventType = "submit_test_report"
 )
 
 // CuratedEvent is one product-meaningful event translated from Pi's raw
@@ -69,13 +85,39 @@ type CuratedEvent struct {
 	Status   string // set for EventSubmitBuildResult: "success" | "failure"
 	PRUrl    string // set for EventSubmitBuildResult on success
 	Summary  string // set for EventSubmitBuildResult
+	// Verdict is set for EventSubmitReview: "approved" | "changes_requested".
+	Verdict string
+	// ActionItems is set for EventRequestActionItem: the needed items the
+	// blocked implement skill reported (ADR 015 item 8).
+	ActionItems     []RequestedActionItem
+	TestName        string
+	TestStatus      string
+	TestDetails     string
+	ScreenshotPath  string
+	Passed          *int
+	Failed          *int
+	Skipped         *int
+	Total           *int
+	CoveragePercent *float64
+	FailingTests    []string
+	RecordingPath   string
+}
+
+// RequestedActionItem is one item feature_build reported it needs via
+// request_action_item (ADR 015 item 8): a type ("secret_request",
+// "subtask_feature", "design_grill", "test_request") and a description.
+type RequestedActionItem struct {
+	Type        string `json:"type"`
+	Description string `json:"description"`
 }
 
 // Terminal reports whether this event ends the whole job run (ADR 006 item
 // 11): the Orchestrator should stop driving the session and tear the pod
 // down, rather than waiting for more events.
 func (e CuratedEvent) Terminal() bool {
-	return e.Type == EventSubmitADR || e.Type == EventRunFailed || e.Type == EventRunCancelled || e.Type == EventSubmitBuildResult
+	return e.Type == EventSubmitADR || e.Type == EventRunFailed || e.Type == EventRunCancelled ||
+		e.Type == EventSubmitBuildResult || e.Type == EventRequestActionItem ||
+		e.Type == EventSubmitReview || e.Type == EventSubmitTestReport
 }
 
 // contractToolResult mirrors the shape yggdrasil-contract's tool
@@ -90,6 +132,20 @@ type contractToolResult struct {
 		Status   string `json:"status"`
 		PRUrl    string `json:"prUrl"`
 		Summary  string `json:"summary"`
+		// Verdict carries submit_review's "approved" | "changes_requested".
+		Verdict string `json:"verdict,omitempty"`
+		// ActionItems carries the needed items for request_action_item.
+		ActionItems     []RequestedActionItem `json:"actionItems,omitempty"`
+		TestName        string                `json:"name,omitempty"`
+		TestDetails     string                `json:"details,omitempty"`
+		ScreenshotPath  string                `json:"screenshotPath,omitempty"`
+		Passed          *int                  `json:"passed,omitempty"`
+		Failed          *int                  `json:"failed,omitempty"`
+		Skipped         *int                  `json:"skipped,omitempty"`
+		Total           *int                  `json:"total,omitempty"`
+		CoveragePercent *float64              `json:"coveragePercent,omitempty"`
+		FailingTests    []string              `json:"failingTests,omitempty"`
+		RecordingPath   string                `json:"recordingPath,omitempty"`
 	} `json:"details"`
 }
 
@@ -206,6 +262,38 @@ func translateToolExecutionEnd(ev Event) (CuratedEvent, bool) {
 			Status:  parsed.Result.Details.Status,
 			PRUrl:   parsed.Result.Details.PRUrl,
 			Summary: parsed.Result.Details.Summary,
+		}, true
+	case "request_action_item":
+		return CuratedEvent{
+			Type:        EventRequestActionItem,
+			Message:     "feature_build requested action items mid-build",
+			ActionItems: parsed.Result.Details.ActionItems,
+		}, true
+	case "submit_review":
+		return CuratedEvent{
+			Type:    EventSubmitReview,
+			Verdict: parsed.Result.Details.Verdict,
+			Summary: parsed.Result.Details.Summary,
+		}, true
+	case "report_test_step":
+		return CuratedEvent{
+			Type:           EventReportTestStep,
+			TestName:       parsed.Result.Details.TestName,
+			TestStatus:     parsed.Result.Details.Status,
+			TestDetails:    parsed.Result.Details.TestDetails,
+			ScreenshotPath: parsed.Result.Details.ScreenshotPath,
+		}, true
+	case "submit_test_report":
+		return CuratedEvent{
+			Type:            EventSubmitTestReport,
+			Passed:          parsed.Result.Details.Passed,
+			Failed:          parsed.Result.Details.Failed,
+			Skipped:         parsed.Result.Details.Skipped,
+			Total:           parsed.Result.Details.Total,
+			CoveragePercent: parsed.Result.Details.CoveragePercent,
+			FailingTests:    parsed.Result.Details.FailingTests,
+			Summary:         parsed.Result.Details.Summary,
+			RecordingPath:   parsed.Result.Details.RecordingPath,
 		}, true
 	default:
 		return CuratedEvent{}, false

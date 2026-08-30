@@ -14,7 +14,6 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/apiclient"
-	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/k8s"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/messages"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/queue"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/worker"
@@ -40,15 +39,6 @@ func main() {
 	}
 	defer pool.Close()
 
-	clientset, err := k8s.NewClient()
-	if err != nil {
-		log.Fatalf("failed to build Kubernetes client: %v", err)
-	}
-	restConfig, err := k8s.RESTConfig()
-	if err != nil {
-		log.Fatalf("failed to build Kubernetes REST config: %v", err)
-	}
-
 	apiInternalURL := os.Getenv("API_INTERNAL_URL")
 	if apiInternalURL == "" {
 		log.Fatal("API_INTERNAL_URL is required")
@@ -62,7 +52,7 @@ func main() {
 	id := resolveWorkerID()
 	q := queue.New(pool)
 	msgs := messages.New(pool)
-	go worker.Run(ctx, q, clientset, worker.Config{
+	go worker.Run(ctx, q, worker.Config{
 		WorkerID:          id,
 		PollInterval:      resolvePollInterval(),
 		MaxConcurrentJobs: resolveMaxConcurrentJobs(),
@@ -71,7 +61,7 @@ func main() {
 		PlaceholderScript: os.Getenv("JOB_PLACEHOLDER_SCRIPT"),
 		RuntimeClassName:  resolveRuntimeClassName(),
 		APIClient:         apiClient,
-		RESTConfig:        restConfig,
+		Clusters:          worker.NewAPIClusterProvider(apiClient),
 		Messages:          msgs,
 		AppsDomain:        resolveWithDefault("APPS_BASE_DOMAIN", "yggdrasil.local"),
 		IngressClassName:  resolveWithDefault("INGRESS_CLASS_NAME", "traefik"),
@@ -174,6 +164,16 @@ func resolveAgentImages() map[queue.JobKind]string {
 	}
 	if v := os.Getenv("TEST_RUN_IMAGE"); v != "" {
 		images[queue.KindTestRun] = v
+	}
+	// ADR 015 items 10 & 13 (Track B5/B6): the two new job kinds. script_test_run
+	// is a non-Pi plain container (no skill/tools), so its image is a
+	// lightweight test runner; agentic_review is a Pi RPC kind like
+	// spec_grill/feature_build, so it needs its own agent image + skill.
+	if v := os.Getenv("SCRIPT_TEST_RUN_IMAGE"); v != "" {
+		images[queue.KindScriptTestRun] = v
+	}
+	if v := os.Getenv("AGENTIC_REVIEW_IMAGE"); v != "" {
+		images[queue.KindAgenticReview] = v
 	}
 	return images
 }

@@ -18,8 +18,6 @@ import (
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/messages"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/queue"
 	"helm.sh/helm/v3/pkg/chart"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 )
 
 // primaryReleaseName is constant within a project's own namespace — no
@@ -85,12 +83,11 @@ type Config struct {
 	// §16). Required for `deploy` jobs.
 	APIClient *apiclient.Client
 
-	// RESTConfig is the raw Kubernetes REST config (as opposed to the typed
-	// clientset) needed to open an attach stream (ADR 006 items 2-4) — a
-	// spec_grill job with a real image configured (cfg.Images) drives Pi's
-	// RPC session this way instead of the placeholder-compatible blocking
-	// k8s.RunJob path every other agent job kind still uses.
-	RESTConfig *rest.Config
+	// Clusters resolves each job's target Kubernetes cluster (clientset +
+	// REST config) from its project -> organization, replacing the old single
+	// static client built once at startup (ADR 016 item 13). Required: there
+	// is no platform-default cluster, so every job resolves its org's own.
+	Clusters ClusterProvider
 
 	// Messages delivers a human's reply to a running spec_grill job's
 	// ask_user question back into its RPC session (ADR 006 items 9-10), via
@@ -105,6 +102,14 @@ type Config struct {
 	AppsDomain       string
 	IngressClassName string
 	CertIssuerName   string
+}
+
+// ClusterProvider resolves the Kubernetes client a job should run against,
+// derived from the job's project -> organization (ADR 016 item 13). Returns
+// the error when the org has no cluster configured — a hard failure, not a
+// fallback, since there is no platform-default cluster anymore.
+type ClusterProvider interface {
+	Resolve(ctx context.Context, job *queue.Job) (*k8s.Client, error)
 }
 
 // limiter bounds how many jobs this replica runs concurrently (ADR 006
@@ -141,7 +146,7 @@ func (l limiter) release() {
 // job finishes — a spec_grill session can sit open for minutes waiting on a
 // human's reply, and shouldn't stall every other job this replica could
 // otherwise claim.
-func Run(ctx context.Context, q *queue.Queue, clientset kubernetes.Interface, cfg Config) {
+func Run(ctx context.Context, q *queue.Queue, cfg Config) {
 	pollInterval := cfg.PollInterval
 	if pollInterval <= 0 {
 		pollInterval = defaultPollInterval
@@ -166,7 +171,7 @@ func Run(ctx context.Context, q *queue.Queue, clientset kubernetes.Interface, cf
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			claimAndDispatch(ctx, q, clientset, cfg, sem)
+			claimAndDispatch(ctx, q, cfg, sem)
 		}
 	}
 }
@@ -177,7 +182,7 @@ func Run(ctx context.Context, q *queue.Queue, clientset kubernetes.Interface, cf
 // this tick: claiming a job this replica has no free slot to start would
 // just leave it stuck in "running" status until a slot frees up, when
 // another replica (or this one, next tick) could have picked it up instead.
-func claimAndDispatch(ctx context.Context, q *queue.Queue, clientset kubernetes.Interface, cfg Config, sem limiter) {
+func claimAndDispatch(ctx context.Context, q *queue.Queue, cfg Config, sem limiter) {
 	if !sem.tryAcquire() {
 		return
 	}
@@ -197,14 +202,26 @@ func claimAndDispatch(ctx context.Context, q *queue.Queue, clientset kubernetes.
 
 	go func() {
 		defer sem.release()
-		runClaimedJob(ctx, q, clientset, cfg, job)
+		runClaimedJob(ctx, q, cfg, job)
 	}()
 }
 
 // runClaimedJob runs a single already-claimed job to completion and records
-// its outcome on the queue.
-func runClaimedJob(ctx context.Context, q *queue.Queue, clientset kubernetes.Interface, cfg Config, job *queue.Job) {
-	if err := runInCluster(ctx, q, clientset, job, cfg); err != nil {
+// its outcome on the queue. It resolves the job's target cluster first (ADR
+// 016 item 13) and fails the job if the org has no cluster configured.
+func runClaimedJob(ctx context.Context, q *queue.Queue, cfg Config, job *queue.Job) {
+	client, err := cfg.Clusters.Resolve(ctx, job)
+	if err != nil {
+		// The org has no (valid) cluster — a hard gate failure, recorded
+		// exactly like a run crash via q.Fail (ADR 012 retry semantics apply).
+		log.Printf("worker %s: job %s cluster resolution failed: %v", cfg.WorkerID, job.ID, err)
+		if failErr := q.Fail(ctx, job.ID, err); failErr != nil {
+			log.Printf("worker %s: failed to record failure for job %s: %v", cfg.WorkerID, job.ID, failErr)
+		}
+		return
+	}
+
+	if err := runInCluster(ctx, q, client, job, cfg); err != nil {
 		if errors.Is(err, errJobCancelled) {
 			log.Printf("worker %s: job %s was cancelled", cfg.WorkerID, job.ID)
 		} else {
@@ -227,32 +244,36 @@ func runClaimedJob(ctx context.Context, q *queue.Queue, clientset kubernetes.Int
 
 // runInCluster executes a claimed job in the project's namespace (ADR 003):
 // `deploy` jobs apply the project's Helm chart to update its always-on
-// primary deployment (ADR 003 §9-13). A spec_grill or feature_build job
-// with a real image configured for its kind (cfg.Images) drives Pi's RPC
-// session directly (ADR 006 items 2-4, 7, 11; widened to feature_build by
-// ADR 010 item 4) via runAgentRPCJob; every other case (either kind with no
-// real image configured yet, or test_run) still runs the
-// placeholder-compatible blocking k8s.RunJob path via runAgentJob — those
-// job kinds don't yet have their own completion-detection/event-handling
-// wiring, so attaching to them would risk hanging exactly the way
-// runAgentJob's own doc comment used to warn about.
-func runInCluster(ctx context.Context, q *queue.Queue, clientset kubernetes.Interface, job *queue.Job, cfg Config) error {
-	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset, job.ProjectID)
+// primary deployment (ADR 003 §9-13). A spec_grill, feature_build, or
+// agentic_review (ADR 015 item 13 / Track B6) job with a real image
+// configured for its kind (cfg.Images) drives Pi's RPC session directly
+// (ADR 006 items 2-4, 7, 11; widened to feature_build by ADR 010 item 4 and
+// to agentic_review by ADR 015) via runAgentRPCJob; every other case (either
+// kind with no real image configured yet, test_run, or the non-Pi
+// script_test_run — ADR 015 item 10) still runs the placeholder-compatible
+// blocking k8s.RunJob path via runAgentJob, since script_test_run is
+// deliberately not Pi/RPC-driven and the others lack their own
+// completion-detection wiring.
+func runInCluster(ctx context.Context, q *queue.Queue, client *k8s.Client, job *queue.Job, cfg Config) error {
+	namespace, err := k8s.EnsureProjectNamespace(ctx, client.Interface, job.ProjectID)
 	if err != nil {
 		return fmt.Errorf("failed to provision namespace: %w", err)
 	}
 
 	if job.Kind == queue.KindDeploy {
-		return runDeploy(ctx, clientset, job.ProjectID, namespace, cfg)
+		return runDeploy(ctx, client, job.ProjectID, namespace, cfg)
 	}
 
-	if job.Kind == queue.KindSpecGrill || job.Kind == queue.KindFeatureBuild {
+	if job.Kind == queue.KindSpecGrill ||
+		job.Kind == queue.KindFeatureBuild ||
+		job.Kind == queue.KindTestRun ||
+		job.Kind == queue.KindAgenticReview {
 		if img, ok := cfg.Images[job.Kind]; ok && img != "" {
-			return runAgentRPCJob(ctx, q, clientset, job, namespace, cfg)
+			return runAgentRPCJob(ctx, q, client, job, namespace, cfg)
 		}
 	}
 
-	return runAgentJob(ctx, clientset, job, namespace, cfg)
+	return runAgentJob(ctx, client, job, namespace, cfg)
 }
 
 // runAgentJob runs a spec_grill/feature_build/test_run job as a Kubernetes
@@ -265,7 +286,7 @@ func runInCluster(ctx context.Context, q *queue.Queue, clientset kubernetes.Inte
 // function — runInCluster routes it to runSpecGrillJob (specgrill.go)
 // instead, since RunJob's "wait for Job status" model doesn't apply to a
 // process that never exits on its own.
-func runAgentJob(ctx context.Context, clientset kubernetes.Interface, job *queue.Job, namespace string, cfg Config) error {
+func runAgentJob(ctx context.Context, client *k8s.Client, job *queue.Job, namespace string, cfg Config) error {
 	env, _, err := buildAgentEnv(ctx, cfg, job)
 	if err != nil {
 		return err
@@ -273,7 +294,7 @@ func runAgentJob(ctx context.Context, clientset kubernetes.Interface, job *queue
 
 	image, command := resolveAgentImage(cfg, job.Kind)
 
-	return k8s.RunJob(ctx, clientset, k8s.JobSpec{
+	return k8s.RunJob(ctx, client.Interface, k8s.JobSpec{
 		Namespace:        namespace,
 		Name:             "job-" + job.ID,
 		Image:            image,
@@ -309,7 +330,10 @@ func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]
 	}
 
 	var spec apiclient.FeatureSpec
-	if job.Kind == queue.KindSpecGrill || job.Kind == queue.KindFeatureBuild {
+	if job.Kind == queue.KindSpecGrill ||
+		job.Kind == queue.KindFeatureBuild ||
+		job.Kind == queue.KindTestRun ||
+		job.Kind == queue.KindAgenticReview {
 		specEnv, fetchedSpec, err := agentRepoEnv(ctx, cfg, job)
 		if err != nil {
 			return nil, apiclient.FeatureSpec{}, err
@@ -318,12 +342,33 @@ func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]
 			env[k] = v
 		}
 		spec = fetchedSpec
+		if spec.TestMarkdown != "" {
+			env["TEST_MARKDOWN"] = spec.TestMarkdown
+		}
+		if spec.Ref != "" {
+			env["FEATURE_REF"] = spec.Ref
+		}
+		if job.Ref != nil && *job.Ref != "" {
+			env["FEATURE_REF"] = *job.Ref
+		}
+		if job.Kind == queue.KindTestRun {
+			slug, err := cfg.APIClient.FetchProjectMetadata(ctx, job.ProjectID)
+			if err != nil {
+				return nil, apiclient.FeatureSpec{}, fmt.Errorf("failed to resolve test preview URL: %w", err)
+			}
+			env["PREVIEW_URL"] = fmt.Sprintf(
+				"https://%s-test-run-%s.preview.%s",
+				slug,
+				job.ID,
+				cfg.AppsDomain,
+			)
+		}
 	}
 
 	return env, spec, nil
 }
 
-// agentRepoEnv fetches a spec_grill or feature_build job's feature payload
+// agentRepoEnv fetches a repo-backed job's payload
 // (ADR 006 item 5, widened by ADR 010 item 2) and returns both the extra
 // job-pod env vars it needs and the fetched spec itself:
 //   - TARGET_REPOS (JSON-encoded FeatureSpecRepo list, consumed by
@@ -333,19 +378,37 @@ func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]
 //     short-lived and per-job, ADR 005 §14/§16; scoped read-only for
 //     spec_grill, contents:write+pull-requests:write for feature_build) —
 //     both always set.
-//   - ADR_MARKDOWN/FEATURE_BRANCH (ADR 010 item 3, consumed by
-//     entrypoint.sh's branch-checkout/ADR-file-write step) — only set when
-//     the API response carries them, i.e. feature_build only.
+//   - ADR_MARKDOWN/FEATURE_BRANCH or FEATURE_REF (consumed by entrypoint.sh's
+//     branch-checkout/ADR-file-write step), plus TEST_MARKDOWN for test_run.
 //
-// Every spec_grill/feature_build job is dispatched with a feature_id (ADR
-// 002, api/src/projects/routes.ts); one missing is a dispatch bug, not a
-// condition to fall back from.
+// Scheduled test_run jobs have no feature_id and fetch their test payload
+// directly, defaulting to main; feature-stage test runs carry a feature_id
+// and target the persisted ref.
 func agentRepoEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]string, apiclient.FeatureSpec, error) {
+	var spec apiclient.FeatureSpec
+	var err error
 	if job.FeatureID == nil {
-		return nil, apiclient.FeatureSpec{}, fmt.Errorf("job %s (kind=%s) has no feature_id", job.ID, job.Kind)
+		if job.Kind != queue.KindTestRun || job.TestID == nil {
+			return nil, apiclient.FeatureSpec{}, fmt.Errorf("job %s (kind=%s) has no feature_id", job.ID, job.Kind)
+		}
+		ref := "main"
+		if job.Ref != nil && *job.Ref != "" {
+			ref = *job.Ref
+		}
+		spec, err = cfg.APIClient.FetchTestSpec(ctx, job.ProjectID, *job.TestID, ref)
+	} else {
+		testID := ""
+		if job.TestID != nil {
+			testID = *job.TestID
+		}
+		spec, err = cfg.APIClient.FetchFeatureSpec(
+			ctx,
+			job.ProjectID,
+			*job.FeatureID,
+			string(job.Kind),
+			testID,
+		)
 	}
-
-	spec, err := cfg.APIClient.FetchFeatureSpec(ctx, job.ProjectID, *job.FeatureID, string(job.Kind))
 	if err != nil {
 		return nil, apiclient.FeatureSpec{}, fmt.Errorf("failed to fetch feature spec: %w", err)
 	}
@@ -363,7 +426,11 @@ func agentRepoEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]s
 		env["ADR_MARKDOWN"] = spec.AdrMarkdown
 	}
 	if spec.Branch != "" {
-		env["FEATURE_BRANCH"] = spec.Branch
+		if job.Kind == queue.KindTestRun || job.Kind == queue.KindAgenticReview {
+			env["FEATURE_REF"] = spec.Branch
+		} else {
+			env["FEATURE_BRANCH"] = spec.Branch
+		}
 	}
 	return env, spec, nil
 }
@@ -405,12 +472,12 @@ func filterModelEnv(secrets map[string]string) map[string]string {
 // Deployment's envFrom reference resolves on first rollout. Once the
 // Deployment/Service exist, an Ingress (ADR 003 §15) makes the primary
 // deployment reachable at <project-slug>.apps.<domain>.
-func runDeploy(ctx context.Context, clientset kubernetes.Interface, projectID, namespace string, cfg Config) error {
+func runDeploy(ctx context.Context, client *k8s.Client, projectID, namespace string, cfg Config) error {
 	secrets, err := cfg.APIClient.FetchProjectSecrets(ctx, projectID)
 	if err != nil {
 		return fmt.Errorf("failed to fetch project secrets: %w", err)
 	}
-	if err := k8s.EnsureProjectSecret(ctx, clientset, namespace, secrets); err != nil {
+	if err := k8s.EnsureProjectSecret(ctx, client.Interface, namespace, secrets); err != nil {
 		return fmt.Errorf("failed to push project secrets: %w", err)
 	}
 
@@ -419,7 +486,7 @@ func runDeploy(ctx context.Context, clientset kubernetes.Interface, projectID, n
 		return err
 	}
 
-	helmCfg, err := helm.NewConfiguration(namespace)
+	helmCfg, err := helm.NewConfiguration(client.Config, namespace)
 	if err != nil {
 		return fmt.Errorf("failed to initialize helm: %w", err)
 	}
@@ -434,7 +501,7 @@ func runDeploy(ctx context.Context, clientset kubernetes.Interface, projectID, n
 	}
 	host := fmt.Sprintf("%s.apps.%s", slug, cfg.AppsDomain)
 	if err := k8s.EnsureProjectIngress(
-		ctx, clientset, namespace, host, primaryReleaseName, 80,
+		ctx, client.Interface, namespace, host, primaryReleaseName, 80,
 		cfg.IngressClassName, "primary-tls", cfg.CertIssuerName,
 	); err != nil {
 		return fmt.Errorf("failed to ensure ingress: %w", err)
