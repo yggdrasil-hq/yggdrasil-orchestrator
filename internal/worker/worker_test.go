@@ -375,6 +375,46 @@ func TestAgentRepoEnv_FeatureBuildIncludesAdrMarkdownAndBranch(t *testing.T) {
 	}
 }
 
+func TestAgentRepoEnv_ScriptTestRunIncludesGroupAndFeatureRef(t *testing.T) {
+	var gotQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"title": "Add dark mode",
+			"repos": []map[string]any{
+				{"cloneUrl": "https://github.com/acme/web.git", "isPrimary": true},
+			},
+			"githubToken": "ghs_read-scoped-token",
+			"branch":      "yggdrasil/add-dark-mode-feat-456",
+			"scriptName":  "unit",
+		})
+	}))
+	defer server.Close()
+
+	featureID := "feat-456"
+	testGroup := "unit"
+	job := &queue.Job{
+		ID: "job-1", ProjectID: "proj-123", Kind: queue.KindScriptTestRun,
+		FeatureID: &featureID, TestGroup: &testGroup,
+	}
+	cfg := Config{APIClient: apiclient.New(server.URL, "test-token")}
+
+	env, spec, err := agentRepoEnv(context.Background(), cfg, job)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if gotQuery != "kind=script_test_run&scriptName=unit" {
+		t.Fatalf("expected script query, got %q", gotQuery)
+	}
+	if env["FEATURE_REF"] != "yggdrasil/add-dark-mode-feat-456" {
+		t.Fatalf("expected FEATURE_REF to be set, got %q", env["FEATURE_REF"])
+	}
+	if spec.ScriptName != "unit" {
+		t.Fatalf("expected script name to be returned, got %q", spec.ScriptName)
+	}
+}
+
 // Proves a spec_grill or feature_build job dispatched without a feature_id
 // fails loudly instead of silently fetching nothing — this is a dispatch
 // bug (ADR 002 always sets one), not a runtime condition worth falling

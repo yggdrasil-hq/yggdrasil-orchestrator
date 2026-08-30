@@ -43,6 +43,7 @@ type Job struct {
 	Kind      JobKind
 	FeatureID *string
 	TestID    *string
+	TestGroup *string
 	Ref       *string
 	Trigger   *string
 	Status    JobStatus
@@ -75,12 +76,12 @@ func (q *Queue) Claim(ctx context.Context, workerID string) (*Job, error) {
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
 		)
-		RETURNING id, project_id, kind, feature_id, test_id, ref, trigger_source, status, created_at, started_at
+		RETURNING id, project_id, kind, feature_id, test_id, test_group, ref, trigger_source, status, created_at, started_at
 	`, workerID)
 
 	var j Job
 	err := row.Scan(
-		&j.ID, &j.ProjectID, &j.Kind, &j.FeatureID, &j.TestID, &j.Ref, &j.Trigger,
+		&j.ID, &j.ProjectID, &j.Kind, &j.FeatureID, &j.TestID, &j.TestGroup, &j.Ref, &j.Trigger,
 		&j.Status, &j.CreatedAt, &j.StartedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {

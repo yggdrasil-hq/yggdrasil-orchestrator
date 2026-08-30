@@ -250,10 +250,9 @@ func runClaimedJob(ctx context.Context, q *queue.Queue, cfg Config, job *queue.J
 // (ADR 006 items 2-4, 7, 11; widened to feature_build by ADR 010 item 4 and
 // to agentic_review by ADR 015) via runAgentRPCJob; every other case (either
 // kind with no real image configured yet, test_run, or the non-Pi
-// script_test_run — ADR 015 item 10) still runs the placeholder-compatible
-// blocking k8s.RunJob path via runAgentJob, since script_test_run is
-// deliberately not Pi/RPC-driven and the others lack their own
-// completion-detection wiring.
+// script_test_run — ADR 015 item 10) runs the standalone non-Pi image through
+// the blocking k8s.RunJob path; its entrypoint posts the canonical report
+// before returning. Jobs without a configured script image fail explicitly.
 func runInCluster(ctx context.Context, q *queue.Queue, client *k8s.Client, job *queue.Job, cfg Config) error {
 	namespace, err := k8s.EnsureProjectNamespace(ctx, client.Interface, job.ProjectID)
 	if err != nil {
@@ -271,6 +270,12 @@ func runInCluster(ctx context.Context, q *queue.Queue, client *k8s.Client, job *
 		job.Kind == queue.KindDesignGrill {
 		if img, ok := cfg.Images[job.Kind]; ok && img != "" {
 			return runAgentRPCJob(ctx, q, client, job, namespace, cfg)
+		}
+	}
+
+	if job.Kind == queue.KindScriptTestRun {
+		if _, ok := cfg.Images[job.Kind]; !ok || cfg.Images[job.Kind] == "" {
+			return fmt.Errorf("no image configured for %s", job.Kind)
 		}
 	}
 
@@ -335,6 +340,7 @@ func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]
 	if job.Kind == queue.KindSpecGrill ||
 		job.Kind == queue.KindFeatureBuild ||
 		job.Kind == queue.KindTestRun ||
+		job.Kind == queue.KindScriptTestRun ||
 		job.Kind == queue.KindAgenticReview ||
 		job.Kind == queue.KindDesignGrill {
 		specEnv, fetchedSpec, err := agentRepoEnv(ctx, cfg, job)
@@ -365,6 +371,12 @@ func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]
 				job.ID,
 				cfg.AppsDomain,
 			)
+		}
+		if job.Kind == queue.KindScriptTestRun {
+			env["SCRIPT_NAME"] = spec.ScriptName
+			baseURL, token := cfg.APIClient.InternalEndpoint()
+			env["YGGDRASIL_API_URL"] = baseURL
+			env["YGGDRASIL_API_TOKEN"] = token
 		}
 	}
 
@@ -407,12 +419,17 @@ func agentRepoEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]s
 		if job.TestID != nil {
 			testID = *job.TestID
 		}
+		scriptName := ""
+		if job.TestGroup != nil {
+			scriptName = *job.TestGroup
+		}
 		spec, err = cfg.APIClient.FetchFeatureSpec(
 			ctx,
 			job.ProjectID,
 			*job.FeatureID,
 			string(job.Kind),
 			testID,
+			scriptName,
 		)
 	}
 	if err != nil {
@@ -432,7 +449,9 @@ func agentRepoEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]s
 		env["ADR_MARKDOWN"] = spec.AdrMarkdown
 	}
 	if spec.Branch != "" {
-		if job.Kind == queue.KindTestRun || job.Kind == queue.KindAgenticReview {
+		if job.Kind == queue.KindTestRun ||
+			job.Kind == queue.KindScriptTestRun ||
+			job.Kind == queue.KindAgenticReview {
 			env["FEATURE_REF"] = spec.Branch
 		} else {
 			env["FEATURE_BRANCH"] = spec.Branch

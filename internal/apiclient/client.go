@@ -30,6 +30,15 @@ func New(baseURL, token string) *Client {
 	}
 }
 
+// InternalEndpoint returns the API URL and bearer token needed by a
+// script_test_run container to submit its canonical report. The same
+// short-lived internal credentials already used for the Orchestrator's
+// payload fetch are scoped by the API to the specific job id in the event
+// endpoint.
+func (c *Client) InternalEndpoint() (baseURL, token string) {
+	return c.baseURL, c.token
+}
+
 type secretsResponse struct {
 	Secrets map[string]string `json:"secrets"`
 }
@@ -203,6 +212,7 @@ type FeatureSpec struct {
 	DesignName        string            `json:"name"`
 	DesignSlug        string            `json:"slug"`
 	DesignDescription string            `json:"description"`
+	ScriptName        string            `json:"scriptName"`
 }
 
 // FetchDesignSpec fetches the project-scoped payload for a design_grill job.
@@ -243,6 +253,9 @@ func (c *Client) FetchFeatureSpec(ctx context.Context, projectID, featureID, kin
 	query := url.Values{"kind": {kind}}
 	if len(testIDs) > 0 && testIDs[0] != "" {
 		query.Set("testId", testIDs[0])
+	}
+	if len(testIDs) > 1 && testIDs[1] != "" {
+		query.Set("scriptName", testIDs[1])
 	}
 	reqURL := fmt.Sprintf("%s/internal/projects/%s/features/%s/spec?%s",
 		c.baseURL, projectID, featureID, query.Encode())
