@@ -284,8 +284,25 @@ func buildFeatureBuildPrompt(spec apiclient.FeatureSpec) string {
 // infer from Title which of the two spec_grill skills applies — Title for
 // a project_init feature is the fixed, non-descriptive string "Project
 // initialization" and carries no signal the container could use on its own.
+//
+// spec.ProjectName/ProjectDescription (the user-entered project fields, not
+// the feature's own Title) are surfaced up front when present so the agent
+// starts from what the user already told it instead of re-deriving purpose
+// from the repo alone and re-asking — this applies to every spec_grill run
+// (project_init and normal features alike), not just project_init.
 func buildSpecGrillPrompt(spec apiclient.FeatureSpec) string {
 	var b strings.Builder
+	if spec.ProjectName != "" || spec.ProjectDescription != "" {
+		b.WriteString("Project context (as entered by the user when creating the project — ")
+		b.WriteString("treat it as a starting point to confirm/refine, not settled fact):\n")
+		if spec.ProjectName != "" {
+			fmt.Fprintf(&b, "- Name: %s\n", spec.ProjectName)
+		}
+		if spec.ProjectDescription != "" {
+			fmt.Fprintf(&b, "- Description: %s\n", spec.ProjectDescription)
+		}
+		b.WriteString("\n")
+	}
 	if spec.FeatureType == "project_init" {
 		b.WriteString("This is a project_init job — the very first spec_grill run for this ")
 		b.WriteString("project. Your goal is to bootstrap/adapt the repo(s) below for Yggdrasil: ")

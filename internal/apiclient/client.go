@@ -202,20 +202,22 @@ type FeatureSpecRepo struct {
 // ("Project initialization"), so it carries no information the container
 // could use to tell the two cases apart on its own.
 type FeatureSpec struct {
-	Title             string            `json:"title"`
-	FeatureType       string            `json:"featureType"`
-	Repos             []FeatureSpecRepo `json:"repos"`
-	GithubToken       string            `json:"githubToken"`
-	AdrMarkdown       string            `json:"adrMarkdown"`
-	Branch            string            `json:"branch"`
-	TestID            string            `json:"testId"`
-	TestMarkdown      string            `json:"testMarkdown"`
-	Ref               string            `json:"ref"`
-	DesignName        string            `json:"name"`
-	DesignSlug        string            `json:"slug"`
-	DesignDescription string            `json:"description"`
-	ScriptName        string            `json:"scriptName"`
-	SpecContext       *SpecGrillContext `json:"specContext,omitempty"`
+	Title              string            `json:"title"`
+	FeatureType        string            `json:"featureType"`
+	ProjectName        string            `json:"projectName"`
+	ProjectDescription string            `json:"projectDescription"`
+	Repos              []FeatureSpecRepo `json:"repos"`
+	GithubToken        string            `json:"githubToken"`
+	AdrMarkdown        string            `json:"adrMarkdown"`
+	Branch             string            `json:"branch"`
+	TestID             string            `json:"testId"`
+	TestMarkdown       string            `json:"testMarkdown"`
+	Ref                string            `json:"ref"`
+	DesignName         string            `json:"name"`
+	DesignSlug         string            `json:"slug"`
+	DesignDescription  string            `json:"description"`
+	ScriptName         string            `json:"scriptName"`
+	SpecContext        *SpecGrillContext `json:"specContext,omitempty"`
 }
 
 type DesignSnapshotContext struct {
