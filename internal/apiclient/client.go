@@ -43,10 +43,12 @@ type secretsResponse struct {
 	Secrets map[string]string `json:"secrets"`
 }
 
-// FetchProjectSecrets fetches a project's decrypted env vars/secrets. The
+// FetchProjectSecrets fetches a project's decrypted env vars/secrets, with
+// model config (MODEL_BASE_URL/MODEL_API_KEY/MODEL_ID) resolved for the given
+// job kind (ADR 018 — provider/model catalog + per-job-kind defaults). The
 // returned map is empty (not an error) if the project has none configured.
-func (c *Client) FetchProjectSecrets(ctx context.Context, projectID string) (map[string]string, error) {
-	url := fmt.Sprintf("%s/internal/projects/%s/secrets", c.baseURL, projectID)
+func (c *Client) FetchProjectSecrets(ctx context.Context, projectID string, jobKind string) (map[string]string, error) {
+	url := fmt.Sprintf("%s/internal/projects/%s/secrets?jobKind=%s", c.baseURL, projectID, jobKind)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build request: %w", err)

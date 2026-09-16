@@ -328,7 +328,7 @@ func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]
 		"PROJECT_ID": job.ProjectID,
 	}
 
-	secrets, err := cfg.APIClient.FetchProjectSecrets(ctx, job.ProjectID)
+	secrets, err := cfg.APIClient.FetchProjectSecrets(ctx, job.ProjectID, string(job.Kind))
 	if err != nil {
 		return nil, apiclient.FeatureSpec{}, fmt.Errorf("failed to fetch project secrets: %w", err)
 	}
@@ -501,7 +501,7 @@ func filterModelEnv(secrets map[string]string) map[string]string {
 // Deployment/Service exist, an Ingress (ADR 003 §15) makes the primary
 // deployment reachable at <project-slug>.apps.<domain>.
 func runDeploy(ctx context.Context, client *k8s.Client, projectID, namespace string, cfg Config) error {
-	secrets, err := cfg.APIClient.FetchProjectSecrets(ctx, projectID)
+	secrets, err := cfg.APIClient.FetchProjectSecrets(ctx, projectID, string(queue.KindDeploy))
 	if err != nil {
 		return fmt.Errorf("failed to fetch project secrets: %w", err)
 	}

@@ -25,7 +25,7 @@ func TestFetchProjectSecrets_SendsBearerTokenAndParsesResponse(t *testing.T) {
 	defer server.Close()
 
 	client := apiclient.New(server.URL, "test-token")
-	secrets, err := client.FetchProjectSecrets(context.Background(), "proj-123")
+	secrets, err := client.FetchProjectSecrets(context.Background(), "proj-123", "feature_build")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestFetchProjectSecrets_ReturnsErrorOnNon200(t *testing.T) {
 	defer server.Close()
 
 	client := apiclient.New(server.URL, "wrong-token")
-	_, err := client.FetchProjectSecrets(context.Background(), "proj-123")
+	_, err := client.FetchProjectSecrets(context.Background(), "proj-123", "feature_build")
 	if err == nil {
 		t.Fatal("expected an error for a non-200 response, got nil")
 	}
@@ -62,7 +62,7 @@ func TestFetchProjectSecrets_EmptySecretsIsNotAnError(t *testing.T) {
 	defer server.Close()
 
 	client := apiclient.New(server.URL, "test-token")
-	secrets, err := client.FetchProjectSecrets(context.Background(), "proj-123")
+	secrets, err := client.FetchProjectSecrets(context.Background(), "proj-123", "feature_build")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
