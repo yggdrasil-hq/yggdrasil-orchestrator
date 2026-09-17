@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/apiclient"
@@ -25,7 +26,7 @@ func TestFetchProjectSecrets_SendsBearerTokenAndParsesResponse(t *testing.T) {
 	defer server.Close()
 
 	client := apiclient.New(server.URL, "test-token")
-	secrets, err := client.FetchProjectSecrets(context.Background(), "proj-123", "feature_build")
+	secrets, err := client.FetchProjectSecrets(context.Background(), "proj-123", "feature_build", "")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -48,7 +49,7 @@ func TestFetchProjectSecrets_ReturnsErrorOnNon200(t *testing.T) {
 	defer server.Close()
 
 	client := apiclient.New(server.URL, "wrong-token")
-	_, err := client.FetchProjectSecrets(context.Background(), "proj-123", "feature_build")
+	_, err := client.FetchProjectSecrets(context.Background(), "proj-123", "feature_build", "")
 	if err == nil {
 		t.Fatal("expected an error for a non-200 response, got nil")
 	}
@@ -62,12 +63,76 @@ func TestFetchProjectSecrets_EmptySecretsIsNotAnError(t *testing.T) {
 	defer server.Close()
 
 	client := apiclient.New(server.URL, "test-token")
-	secrets, err := client.FetchProjectSecrets(context.Background(), "proj-123", "feature_build")
+	secrets, err := client.FetchProjectSecrets(context.Background(), "proj-123", "feature_build", "")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 	if len(secrets) != 0 {
 		t.Fatalf("expected empty secrets map, got: %v", secrets)
+	}
+}
+
+// Proves a feature-owned job's feature id reaches the API as a query param, so
+// the per-feature model tier takes part in resolution (ADR 018 amendment,
+// issue #5). Without it the API resolves at the project/org tier and a
+// feature override silently has no effect on the model the pod runs with.
+func TestFetchProjectSecrets_SendsFeatureIdWhenPresent(t *testing.T) {
+	var gotJobKind, gotFeatureID string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotJobKind = r.URL.Query().Get("jobKind")
+		gotFeatureID = r.URL.Query().Get("featureId")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"secrets": map[string]string{"MODEL_ID": "feature-model"},
+		})
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	secrets, err := client.FetchProjectSecrets(
+		context.Background(), "proj-123", "feature_build", "feat-456",
+	)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if gotFeatureID != "feat-456" {
+		t.Fatalf("expected featureId query param %q, got %q", "feat-456", gotFeatureID)
+	}
+	if gotJobKind != "feature_build" {
+		t.Fatalf("expected jobKind query param %q, got %q", "feature_build", gotJobKind)
+	}
+	if secrets["MODEL_ID"] != "feature-model" {
+		t.Fatalf("expected the feature-tier model to be parsed, got: %v", secrets)
+	}
+}
+
+// The param must be absent, not merely empty, when a job has no feature: an
+// API that predates the feature tier then sees exactly the request it saw
+// before, which is what keeps the two sides deployable in either order.
+func TestFetchProjectSecrets_OmitsFeatureIdWhenJobHasNoFeature(t *testing.T) {
+	var query url.Values
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query = r.URL.Query()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"secrets": map[string]string{}})
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	// A scheduled test_run is the realistic no-feature case.
+	if _, err := client.FetchProjectSecrets(
+		context.Background(), "proj-123", "test_run", "",
+	); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if _, present := query["featureId"]; present {
+		t.Fatalf("expected no featureId query param, got %q", query.Get("featureId"))
+	}
+	if query.Get("jobKind") != "test_run" {
+		t.Fatalf("expected jobKind query param %q, got %q", "test_run", query.Get("jobKind"))
 	}
 }
 

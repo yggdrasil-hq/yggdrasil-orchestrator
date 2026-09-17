@@ -318,9 +318,12 @@ func runAgentJob(ctx context.Context, client *k8s.Client, job *queue.Job, namesp
 // spec_grill, feature_build, and design_grill (ADR 010/014),
 // TARGET_REPOS/GITHUB_TOKEN
 // (and, feature_build only, ADR_MARKDOWN/FEATURE_BRANCH) via agentRepoEnv.
-// Also returns the fetched FeatureSpec (zero value for job kinds that don't
-// fetch one) so runAgentRPCJob can reuse spec.Title/spec.FeatureType for
-// the initial RPC prompt without fetching it a second time.
+// Model config is resolved for the job's own feature when it has one, so a
+// per-feature override reaches the pod rather than stopping at the API's
+// dispatch gate (ADR 018 amendment, issue #5). Also returns the fetched
+// FeatureSpec (zero value for job kinds that don't fetch one) so
+// runAgentRPCJob can reuse spec.Title/spec.FeatureType for the initial RPC
+// prompt without fetching it a second time.
 func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]string, apiclient.FeatureSpec, error) {
 	env := map[string]string{
 		"JOB_ID":     job.ID,
@@ -328,7 +331,14 @@ func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]
 		"PROJECT_ID": job.ProjectID,
 	}
 
-	secrets, err := cfg.APIClient.FetchProjectSecrets(ctx, job.ProjectID, string(job.Kind))
+	// Empty for a job with no feature (a scheduled test_run, a deploy, or a
+	// design session — ADR 014 keeps design jobs project-scoped), which makes
+	// the fetch behave exactly as it did before the feature tier existed.
+	featureID := ""
+	if job.FeatureID != nil {
+		featureID = *job.FeatureID
+	}
+	secrets, err := cfg.APIClient.FetchProjectSecrets(ctx, job.ProjectID, string(job.Kind), featureID)
 	if err != nil {
 		return nil, apiclient.FeatureSpec{}, fmt.Errorf("failed to fetch project secrets: %w", err)
 	}
@@ -501,7 +511,9 @@ func filterModelEnv(secrets map[string]string) map[string]string {
 // Deployment/Service exist, an Ingress (ADR 003 §15) makes the primary
 // deployment reachable at <project-slug>.apps.<domain>.
 func runDeploy(ctx context.Context, client *k8s.Client, projectID, namespace string, cfg Config) error {
-	secrets, err := cfg.APIClient.FetchProjectSecrets(ctx, projectID, string(queue.KindDeploy))
+	// The trailing "" is the feature id: a deploy is project-scoped, so it has
+	// no feature whose model tier could apply.
+	secrets, err := cfg.APIClient.FetchProjectSecrets(ctx, projectID, string(queue.KindDeploy), "")
 	if err != nil {
 		return fmt.Errorf("failed to fetch project secrets: %w", err)
 	}

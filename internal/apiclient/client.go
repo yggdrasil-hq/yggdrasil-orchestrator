@@ -47,9 +47,20 @@ type secretsResponse struct {
 // model config (MODEL_BASE_URL/MODEL_API_KEY/MODEL_ID) resolved for the given
 // job kind (ADR 018 — provider/model catalog + per-job-kind defaults). The
 // returned map is empty (not an error) if the project has none configured.
-func (c *Client) FetchProjectSecrets(ctx context.Context, projectID string, jobKind string) (map[string]string, error) {
-	url := fmt.Sprintf("%s/internal/projects/%s/secrets?jobKind=%s", c.baseURL, projectID, jobKind)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+//
+// featureID is the feature a feature-owned job belongs to, and is optional:
+// pass "" for a job that has no feature (a scheduled test_run, a deploy). It
+// is sent only when present, and the API ignores it unless it belongs to the
+// project, so an empty featureID produces exactly the request this call made
+// before the feature tier existed — the two sides can be deployed in either
+// order (ADR 018 amendment, issue #5).
+func (c *Client) FetchProjectSecrets(ctx context.Context, projectID string, jobKind string, featureID string) (map[string]string, error) {
+	query := url.Values{"jobKind": {jobKind}}
+	if featureID != "" {
+		query.Set("featureId", featureID)
+	}
+	reqURL := fmt.Sprintf("%s/internal/projects/%s/secrets?%s", c.baseURL, projectID, query.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build request: %w", err)
 	}

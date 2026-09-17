@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -511,5 +512,98 @@ func TestRunAgentJob_SpecGrillIncludesFetchedRepoAndTokenEnv(t *testing.T) {
 	}
 	if !strings.Contains(env["TARGET_REPOS"], "acme/web") {
 		t.Fatalf("expected TARGET_REPOS to include the fetched repo, got %q", env["TARGET_REPOS"])
+	}
+}
+
+// Proves buildAgentEnv hands the job's own feature id to the secrets fetch, so
+// the API's per-feature model tier actually reaches the pod (ADR 018
+// amendment, issue #5). Before this, the API resolved at the project/org tier
+// and a feature override was visible in the UI but had no effect on a real run.
+func TestBuildAgentEnv_ForwardsJobFeatureIDToSecretsFetch(t *testing.T) {
+	var gotJobKind, gotFeatureID, gotSecretsPath string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/secrets") {
+			gotSecretsPath = r.URL.Path
+			gotJobKind = r.URL.Query().Get("jobKind")
+			gotFeatureID = r.URL.Query().Get("featureId")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": map[string]string{"MODEL_ID": "feature-tier-model"},
+			})
+			return
+		}
+		// The feature-spec fetch agentRepoEnv makes for a feature-owned job.
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"title":  "Feature title",
+			"branch": "yggdrasil/feature-1",
+		})
+	}))
+	defer server.Close()
+
+	featureID := "11111111-1111-4111-8111-111111111111"
+	job := &queue.Job{
+		ID:        "job-feature-model",
+		ProjectID: "proj-1",
+		Kind:      queue.KindFeatureBuild,
+		FeatureID: &featureID,
+	}
+	cfg := Config{APIClient: apiclient.New(server.URL, "test-token")}
+
+	env, _, err := buildAgentEnv(context.Background(), cfg, job)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if gotFeatureID != featureID {
+		t.Fatalf("expected featureId query param %q, got %q", featureID, gotFeatureID)
+	}
+	if gotJobKind != string(queue.KindFeatureBuild) {
+		t.Fatalf("expected jobKind query param %q, got %q", queue.KindFeatureBuild, gotJobKind)
+	}
+	if gotSecretsPath != "/internal/projects/proj-1/secrets" {
+		t.Fatalf("expected the secrets path, got %q", gotSecretsPath)
+	}
+	if env["MODEL_ID"] != "feature-tier-model" {
+		t.Fatalf("expected the resolved model config in the pod env, got %v", env)
+	}
+}
+
+// A job with no feature must not send the param at all: a scheduled test_run
+// resolves exactly as it did before the feature tier existed, which is what
+// keeps an API and an Orchestrator from different versions interoperable.
+func TestBuildAgentEnv_OmitsFeatureIDForJobWithoutFeature(t *testing.T) {
+	var query url.Values
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/secrets") {
+			query = r.URL.Query()
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": map[string]string{}})
+			return
+		}
+		// FetchTestSpec, for a scheduled test_run with no feature.
+		_ = json.NewEncoder(w).Encode(map[string]any{"title": "Test title", "ref": "main"})
+	}))
+	defer server.Close()
+
+	testID := "22222222-2222-4222-8222-222222222222"
+	job := &queue.Job{
+		ID:        "job-scheduled-test",
+		ProjectID: "proj-1",
+		Kind:      queue.KindTestRun,
+		TestID:    &testID,
+	}
+	cfg := Config{APIClient: apiclient.New(server.URL, "test-token")}
+
+	if _, _, err := buildAgentEnv(context.Background(), cfg, job); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if _, present := query["featureId"]; present {
+		t.Fatalf("expected no featureId query param, got %q", query.Get("featureId"))
+	}
+	if query.Get("jobKind") != string(queue.KindTestRun) {
+		t.Fatalf("expected jobKind query param %q, got %q", queue.KindTestRun, query.Get("jobKind"))
 	}
 }
