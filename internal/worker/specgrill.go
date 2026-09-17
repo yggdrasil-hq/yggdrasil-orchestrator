@@ -33,6 +33,51 @@ const endTurnGrace = 10 * time.Second
 // 'cancelled' status from being clobbered, regardless of this sentinel.
 var errJobCancelled = errors.New("job cancelled")
 
+// enforceTokenCap is ADR 030 §4's enforcement point.
+//
+// It runs before the job does anything, and it *fails* the job rather than
+// parking it. That is the deliberate difference from ADR 003 §17's preview cap,
+// which leaves an over-cap job `pending` for the seconds until a slot frees:
+// a monthly spend cap could leave a job pending for weeks, and a job that
+// silently never starts is worse than one that stops and says why. The failure
+// is legible — it carries the project, the spend, the cap and the remedy — and
+// it lands in `jobs.last_error`, which is the same channel ADR 012's retries
+// already surface.
+//
+// An unreachable API is treated as "cannot enforce" and the job proceeds: the
+// alternative turns an API restart into a project-wide work stoppage. Overshoot
+// in that window is bounded by one job, exactly like the race described in
+// ADR 030 §4 — the cap already tolerates a one-job overshoot because a job's
+// own consumption is unknowable until it ends.
+//
+// Jobs already running are never interrupted. ADR 023 reports a job's usage
+// only when its session ends, so there is no mid-run figure to compare against;
+// killing one would also throw away work already paid for.
+func enforceTokenCap(ctx context.Context, job *queue.Job, cfg Config) error {
+	if !queue.ConsumesTokens(job.Kind) {
+		return nil
+	}
+
+	decision, err := cfg.APIClient.CheckProjectTokenCap(ctx, job.ProjectID, string(job.Kind))
+	if err != nil {
+		log.Printf("worker: could not check the token cap for project %s, allowing job %s: %v", job.ProjectID, job.ID, err)
+		return nil
+	}
+	if decision.Allowed {
+		return nil
+	}
+
+	capValue := int64(0)
+	if decision.Cap != nil {
+		capValue = *decision.Cap
+	}
+	return fmt.Errorf(
+		"project has reached its monthly token cap (%d of %d tokens used for the period beginning %s); "+
+			"raise or clear the cap to run more work",
+		decision.UsedTokens, capValue, decision.PeriodStart,
+	)
+}
+
 // replyWaiter is the subset of *messages.Store (ADR 006 items 9-10)
 // driveAgentSession needs — an interface so tests can substitute a
 // fake reply source without a real Postgres connection, decoupling

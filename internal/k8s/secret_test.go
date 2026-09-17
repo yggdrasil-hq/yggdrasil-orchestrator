@@ -14,7 +14,7 @@ func TestEnsureProjectSecret_CreatesAndUpdates(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset, testProjectID(t))
+	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset, testProjectID(t), k8s.DefaultResourceQuota())
 	if err != nil {
 		t.Fatalf("failed to provision namespace: %v", err)
 	}

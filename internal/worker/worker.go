@@ -297,8 +297,34 @@ func runClaimedJob(ctx context.Context, q *queue.Queue, cfg Config, job *queue.J
 // script_test_run — ADR 015 item 10) runs the standalone non-Pi image through
 // the blocking k8s.RunJob path; its entrypoint posts the canonical report
 // before returning. Jobs without a configured script image fail explicitly.
+//
+// Two ADR 030 steps bracket everything else: a token-cap check that can stop
+// the job before any work happens, and the project's configured namespace
+// quota applied when the namespace is provisioned.
 func runInCluster(ctx context.Context, q *queue.Queue, client *k8s.Client, job *queue.Job, cfg Config) error {
-	namespace, err := k8s.EnsureProjectNamespace(ctx, client.Interface, job.ProjectID)
+	// ADR 030 §4: the token cap is checked before anything expensive happens,
+	// so an over-cap job never provisions a namespace, starts a preview, or
+	// mints a GitHub token. The API owns the decision; this asks it once.
+	if err := enforceTokenCap(ctx, job, cfg); err != nil {
+		return err
+	}
+
+	// ADR 030 §5: the project's configured quota, resolved by the API to
+	// concrete numbers. A fetch failure falls back to the built-in defaults
+	// rather than failing the job — quota sizing is a guardrail, not a
+	// correctness dependency (ADR 030 §6).
+	quota := k8s.DefaultResourceQuota()
+	if fetched, err := cfg.APIClient.FetchProjectResourceQuota(ctx, job.ProjectID); err != nil {
+		log.Printf("worker: using default resource quota for project %s: %v", job.ProjectID, err)
+	} else {
+		quota = k8s.ResourceQuota{
+			CPUmillicores: fetched.CPUmillicores,
+			MemoryMiB:     fetched.MemoryMiB,
+			Pods:          fetched.Pods,
+		}
+	}
+
+	namespace, err := k8s.EnsureProjectNamespace(ctx, client.Interface, job.ProjectID, quota)
 	if err != nil {
 		return fmt.Errorf("failed to provision namespace: %w", err)
 	}

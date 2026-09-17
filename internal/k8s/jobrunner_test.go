@@ -17,7 +17,7 @@ func TestRunJob_Success(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset, testProjectID(t))
+	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset, testProjectID(t), k8s.DefaultResourceQuota())
 	if err != nil {
 		t.Fatalf("failed to provision namespace: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestRunJob_Failure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset, testProjectID(t))
+	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset, testProjectID(t), k8s.DefaultResourceQuota())
 	if err != nil {
 		t.Fatalf("failed to provision namespace: %v", err)
 	}

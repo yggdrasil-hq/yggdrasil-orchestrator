@@ -31,7 +31,7 @@ func startAttachablePod(t *testing.T, ctx context.Context, script string) (names
 	t.Helper()
 	clientset := testClient(t)
 
-	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset.Interface, "test-"+rand.String(8))
+	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset.Interface, "test-"+rand.String(8), k8s.DefaultResourceQuota())
 	if err != nil {
 		t.Fatalf("failed to provision namespace: %v", err)
 	}
