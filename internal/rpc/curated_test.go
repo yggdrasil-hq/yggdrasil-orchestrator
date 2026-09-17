@@ -2,6 +2,7 @@ package rpc_test
 
 import (
 	"encoding/json"
+	"strconv"
 	"testing"
 
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/rpc"
@@ -268,6 +269,106 @@ func TestTranslate_AssistantMessageEndWithOnlyToolUseIsNotCurated(t *testing.T) 
 	_, ok := rpc.Translate(ev)
 	if ok {
 		t.Fatal("expected an assistant message with no text content (only a tool_use block) not to be curated — would just be an empty bubble alongside the tool call's own event")
+	}
+}
+
+// ADR 019 item 13: a streaming text chunk becomes agent_text_delta, and —
+// critically — is NOT terminal, since the message it belongs to is still being
+// written. If this ever became terminal the turn would end mid-sentence and the
+// job would tear down before the model called a contract tool.
+func TestTranslate_MessageUpdateTextDeltaIsAgentTextDeltaAndNotTerminal(t *testing.T) {
+	ev := rawEvent(t, `{"type":"message_update","usage":{"input":100,"output":1,"totalTokens":101},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hello "}}`)
+
+	curated, ok := rpc.Translate(ev)
+	if !ok {
+		t.Fatal("expected a message_update text_delta to be curated")
+	}
+	if curated.Type != rpc.EventAgentTextDelta {
+		t.Fatalf("expected type %q, got %q", rpc.EventAgentTextDelta, curated.Type)
+	}
+	if curated.Message != "Hello " {
+		t.Fatalf("expected the delta text to be carried through verbatim (including its trailing space), got %q", curated.Message)
+	}
+	if curated.Terminal() {
+		t.Fatal("expected agent_text_delta not to be terminal — it must never end a turn on its own")
+	}
+}
+
+// The delta and the finished message must not disagree about the text: Pi's docs
+// are explicit that message_update carries a delta without a cumulative
+// snapshot, so the deltas for one message concatenate to exactly what
+// message_end later delivers whole. This is the property the Web app relies on
+// when it drops its accumulated buffer in favour of agent_text.
+func TestTranslate_DeltasConcatenateToTheMessageEndText(t *testing.T) {
+	parts := []string{"Hello", " world", "!"}
+
+	var built string
+	for _, part := range parts {
+		ev := rawEvent(t, `{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":`+strconv.Quote(part)+`}}`)
+		curated, ok := rpc.Translate(ev)
+		if !ok {
+			t.Fatalf("expected delta %q to be curated", part)
+		}
+		built += curated.Message
+	}
+
+	end := rawEvent(t, `{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Hello world!"}],"timestamp":1}}`)
+	finished, ok := rpc.Translate(end)
+	if !ok {
+		t.Fatal("expected the message_end to be curated as agent_text")
+	}
+	if built != finished.Message {
+		t.Fatalf("expected the concatenated deltas %q to equal the finished message %q", built, finished.Message)
+	}
+}
+
+// Only text_delta is prose. Everything else in Pi's assistantMessageEvent union
+// (block boundaries, thinking, tool-call assembly) must produce nothing, or the
+// transcript would stream reasoning the model never addressed to the user, or
+// raw tool arguments.
+func TestTranslate_MessageUpdateNonTextDeltasAreNotCurated(t *testing.T) {
+	cases := map[string]string{
+		"text_start":      `{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":0}}`,
+		"text_end":        `{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"Hello world"}}`,
+		"thinking_start":  `{"type":"message_update","assistantMessageEvent":{"type":"thinking_start","contentIndex":0}}`,
+		"thinking_delta":  `{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"considering options"}}`,
+		"thinking_end":    `{"type":"message_update","assistantMessageEvent":{"type":"thinking_end","contentIndex":0}}`,
+		"toolcall_start":  `{"type":"message_update","assistantMessageEvent":{"type":"toolcall_start","contentIndex":1,"id":"call_abc123","toolName":"write"}}`,
+		"toolcall_delta":  `{"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":1,"delta":"{\"path\":"}}`,
+		"toolcall_end":    `{"type":"message_update","assistantMessageEvent":{"type":"toolcall_end","contentIndex":1}}`,
+		"missing_event":   `{"type":"message_update"}`,
+		"unknown_subtype": `{"type":"message_update","assistantMessageEvent":{"type":"something_new","delta":"ignored"}}`,
+	}
+
+	for name, line := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, ok := rpc.Translate(rawEvent(t, line)); ok {
+				t.Fatalf("expected %s not to be curated as agent_text_delta", name)
+			}
+		})
+	}
+}
+
+// An empty delta carries no text; relaying it would append nothing while still
+// costing an HTTP request and a frame.
+func TestTranslate_MessageUpdateEmptyDeltaIsNotCurated(t *testing.T) {
+	ev := rawEvent(t, `{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":""}}`)
+
+	if _, ok := rpc.Translate(ev); ok {
+		t.Fatal("expected an empty text_delta not to be curated")
+	}
+}
+
+func TestTranslate_MessageUpdateMalformedIsNotCurated(t *testing.T) {
+	for name, line := range map[string]string{
+		"not_an_object":      `{"type":"message_update","assistantMessageEvent":"text_delta"}`,
+		"delta_not_a_string": `{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":42}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, ok := rpc.Translate(rawEvent(t, line)); ok {
+				t.Fatalf("expected malformed message_update (%s) not to be curated", name)
+			}
+		})
 	}
 }
 

@@ -57,6 +57,20 @@ const (
 	// (the agent_settled failure path) leaves a record of what the model
 	// actually said, instead of just "ended without submitting a result".
 	EventAgentText CuratedEventType = "agent_text"
+	// EventAgentTextDelta is one streaming chunk of an assistant message, decoded
+	// from Pi's message_update event while the model is still talking
+	// (translateMessageUpdate). ADR 019 item 13: this is what makes the grill
+	// transcript grow token by token instead of appearing in one block at
+	// message_end.
+	//
+	// Never terminal, and a *provisional* view of text that EventAgentText will
+	// later supersede: the deltas for one message concatenate to the text that
+	// message_end eventually delivers whole. The API relays it without storing it
+	// (one row per token would multiply the append-only job_events table and
+	// bloat the catch-up read), so it is best-effort by construction — a lost
+	// delta costs a moment of smoothness, never content, because the
+	// authoritative message still arrives over the ordinary agent_text path.
+	EventAgentTextDelta CuratedEventType = "agent_text_delta"
 	// EventRequestActionItem: the yggdrasil-contract extension's
 	// request_action_item tool fired (feature_build only, ADR 015 item 7-8 &
 	// Track B3) — the implement skill's terminal "I'm blocked" call,
@@ -124,6 +138,9 @@ type RequestedActionItem struct {
 // Terminal reports whether this event ends the whole job run (ADR 006 item
 // 11): the Orchestrator should stop driving the session and tear the pod
 // down, rather than waiting for more events.
+//
+// EventAgentTextDelta is deliberately absent: like EventAgentText it is a
+// mid-turn observation, so runTurn forwards it and keeps reading.
 func (e CuratedEvent) Terminal() bool {
 	return e.Type == EventSubmitADR || e.Type == EventRunFailed || e.Type == EventRunCancelled ||
 		e.Type == EventSubmitBuildResult || e.Type == EventRequestActionItem ||
@@ -198,6 +215,53 @@ type messageEndEvent struct {
 	} `json:"message"`
 }
 
+// messageUpdateEvent mirrors just enough of Pi's own message_update event (raw
+// RPC taxonomy, decoded best-effort like agentEndEvent/messageEndEvent) to
+// extract one streaming text chunk. Pi documents this shape explicitly and
+// distinguishes it from message_end in a way that matters here: message_update
+// carries "a delta event without a cumulative message snapshot", so the text has
+// to be accumulated by the receiver rather than read off in full. It also means
+// `assistantMessageEvent` is a union — text_start/text_delta/text_end,
+// thinking_*, toolcall_* — of which only text_delta carries sayable prose, which
+// is why translateMessageUpdate checks the type rather than trusting `delta` to
+// be present.
+//
+// The top-level `usage` field is deliberately not decoded: ADR 023 accounts a
+// job's tokens from get_session_stats at session end, so a per-delta cumulative
+// figure would be a second, moving answer to a question that already has one.
+type messageUpdateEvent struct {
+	AssistantMessageEvent struct {
+		Type  string `json:"type"`
+		Delta string `json:"delta"`
+	} `json:"assistantMessageEvent"`
+}
+
+// translateMessageUpdate extracts one streaming text chunk as
+// EventAgentTextDelta (ADR 019 item 13). ok is false for everything that is not
+// a text_delta, which is most of the union: text_start/text_end carry no prose,
+// thinking_* is reasoning the model did not address to the user, and
+// toolcall_* is a tool call being assembled — translating any of those would
+// stream the wrong thing into the transcript.
+//
+// An empty delta is also dropped rather than forwarded: it carries no text, and
+// the API would relay it as a frame that appends nothing.
+func translateMessageUpdate(ev Event) (CuratedEvent, bool) {
+	var parsed messageUpdateEvent
+	if err := json.Unmarshal(ev.Raw, &parsed); err != nil {
+		return CuratedEvent{}, false
+	}
+	if parsed.AssistantMessageEvent.Type != "text_delta" {
+		return CuratedEvent{}, false
+	}
+	if parsed.AssistantMessageEvent.Delta == "" {
+		return CuratedEvent{}, false
+	}
+	return CuratedEvent{
+		Type:    EventAgentTextDelta,
+		Message: parsed.AssistantMessageEvent.Delta,
+	}, true
+}
+
 // translateMessageEnd extracts an assistant message's plain text as
 // EventAgentText (curated.go's doc comment on that constant explains why
 // this exists). ok is false for anything that isn't a genuinely-texty
@@ -236,16 +300,19 @@ func translateMessageEnd(ev Event) (CuratedEvent, bool) {
 // scoped to the yggdrasil-contract extension's tool-call-based signals
 // (ask_user/submit_adr for spec_grill, submit_build_result for
 // feature_build, ADR 010 item 7) — the ones needed to detect completion
-// (item 11) — plus two raw Pi events: agent_end, but only far enough to
+// (item 11) — plus three raw Pi events: agent_end, but only far enough to
 // catch a request-level failure (translateAgentEnd; a clean agent_end is
 // left untranslated since a contract tool call, not agent_end, is what ends
-// a turn normally), and message_end, translated into EventAgentText
-// whenever it carries the model's own plain text (translateMessageEnd).
+// a turn normally), message_end, translated into EventAgentText
+// whenever it carries the model's own plain text (translateMessageEnd), and
+// message_update, translated into EventAgentTextDelta while the model is still
+// streaming (translateMessageUpdate, ADR 019 item 13).
 //
 // ok is false for any event this suite doesn't curate (including
 // tool_execution_end for tools other than ask_user/submit_adr, e.g. a
-// non-contract bash call, a clean agent_end, and a message_end that isn't a
-// texty assistant message) — the caller should just keep reading.
+// non-contract bash call, a clean agent_end, a message_update that isn't a text
+// delta, and a message_end that isn't a texty assistant message) — the caller
+// should just keep reading.
 func Translate(ev Event) (curated CuratedEvent, ok bool) {
 	switch ev.Type {
 	case "tool_execution_end":
@@ -254,6 +321,8 @@ func Translate(ev Event) (curated CuratedEvent, ok bool) {
 		return translateAgentEnd(ev)
 	case "message_end":
 		return translateMessageEnd(ev)
+	case "message_update":
+		return translateMessageUpdate(ev)
 	default:
 		return CuratedEvent{}, false
 	}

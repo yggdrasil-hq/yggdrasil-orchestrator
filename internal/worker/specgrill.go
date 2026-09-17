@@ -641,9 +641,18 @@ func reportSessionError(handle func(rpc.CuratedEvent), cancelled bool, err error
 // "end the run") — then ends the turn (letting the attach call return
 // without restarting the container process) and returns that curated
 // event for the caller to act on. handle is invoked directly, inline, for
-// any EventAgentText seen along the way (rpc.Translate's one non-terminal
-// match) — the only curated event type this loop forwards without also
-// ending the turn on it; see EventAgentText's doc comment for why.
+// any non-terminal event seen along the way (EventAgentText and its
+// streaming precursor EventAgentTextDelta, plus test-step and design-preview
+// progress records) — the curated event types this loop forwards without also
+// ending the turn on them; see each type's doc comment for why.
+//
+// Note that handle is called *synchronously* and, for an RPC-driven job, does
+// an HTTP POST per event — which is what makes the delta stream (ADR 019 item
+// 13) a genuine throughput question rather than a free one: a turn's total time
+// grows with the number of deltas, and a terminating event behind a long delta
+// stream waits for those POSTs to drain. That is a deliberate cost of keeping
+// the relay's transport unchanged, and coalescing deltas before they reach here
+// is the documented follow-up (ADR 019 item 13).
 func runTurn(
 	ctx context.Context,
 	clientset kubernetes.Interface,
@@ -723,13 +732,18 @@ func runTurn(
 				continue
 			}
 			if curated.Type == rpc.EventAgentText ||
+				curated.Type == rpc.EventAgentTextDelta ||
 				curated.Type == rpc.EventReportTestStep ||
 				curated.Type == rpc.EventUpdateDesignPreview {
 				// Forwarded live, not turn-ending: the model's own prose
 				// alongside (or instead of) a contract tool call in this
 				// same turn. Test steps have the same property: they are
 				// progress records, not a request for another prompt.
-				// Keep reading — the real terminating event (a tool call,
+				//
+				// EventAgentTextDelta (ADR 019 item 13) is the same case at
+				// a finer grain: a streaming chunk of the prose whose final
+				// form arrives as EventAgentText at message_end. Keep
+				// reading — the real terminating event (a tool call,
 				// agent_settled's failure branch above, or the attach stream
 				// ending) is what actually ends the turn.
 				handle(curated)

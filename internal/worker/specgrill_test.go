@@ -361,6 +361,87 @@ func TestDriveSpecGrillSession_TrailingEventsFromPriorTurnDontFailTheNextOne(t *
 // via handle as a non-terminal EventAgentText, without ending the turn on
 // it — the session must still proceed to submit_adr afterward. The one
 // exception to "runTurn returns the instant Translate matches something."
+// ADR 019 item 13: a stream of text_delta chunks is forwarded live, in order,
+// and — the point of the whole design — is genuinely superseded by the
+// authoritative agent_text that message_end delivers, rather than the two
+// disagreeing. Proving this needs a real pod, because the ordering under test is
+// runTurn's own read loop: deltas must not end the turn, and the terminating
+// contract event behind them must still be reached.
+func TestDriveSpecGrillSession_TextDeltasAreForwardedLiveThenSupersededByAgentText(t *testing.T) {
+	clientset := testClient(t)
+	restConfig, err := k8s.RESTConfig()
+	if err != nil {
+		t.Skipf("no Kubernetes REST config available; skipping: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Three deltas that concatenate to exactly the message_end text, then the
+	// terminal contract call — i.e. one assistant message, then the ADR. The
+	// intervening text_start/text_end are not curated, so they double as a check
+	// that the non-prose members of the union are ignored in a real stream.
+	script := `read line
+` +
+		`echo '{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":0}}'
+` +
+		`echo '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Drafting "}}'
+` +
+		`echo '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"the "}}'
+` +
+		`echo '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"ADR."}}'
+` +
+		`echo '{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"Drafting the ADR."}}'
+` +
+		`echo '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Drafting the ADR."}],"timestamp":1}}'
+` +
+		`echo '{"type":"tool_execution_end","toolName":"submit_adr","result":{"details":{"kind":"submit_adr","markdown":"# Test ADR"},"terminate":true}}'
+` +
+		`cat`
+	namespace, podName, _ := startAttachablePod(t, ctx, script)
+
+	var received []rpc.CuratedEvent
+	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+		received = append(received, ev)
+	},
+		noStats, discardUsage)
+	if err != nil {
+		t.Fatalf("expected the session to still reach submit_adr despite the intervening deltas, got: %v", err)
+	}
+
+	if len(received) != 5 {
+		t.Fatalf("expected 3 deltas, agent_text, then submit_adr; got %d events: %+v", len(received), received)
+	}
+	for i, want := range []string{"Drafting ", "the ", "ADR."} {
+		if received[i].Type != rpc.EventAgentTextDelta {
+			t.Fatalf("expected event %d to be agent_text_delta, got %q", i, received[i].Type)
+		}
+		if received[i].Message != want {
+			t.Fatalf("expected delta %d to be %q, got %q", i, want, received[i].Message)
+		}
+		if received[i].Terminal() {
+			t.Fatalf("delta %d must not be terminal — the turn would end mid-message", i)
+		}
+	}
+
+	if received[3].Type != rpc.EventAgentText {
+		t.Fatalf("expected the fourth event to be agent_text, got %q", received[3].Type)
+	}
+	if received[4].Type != rpc.EventSubmitADR {
+		t.Fatalf("expected the fifth event to be submit_adr, got %q", received[4].Type)
+	}
+
+	// The supersede relationship, stated as an assertion: what the deltas built
+	// and what message_end delivered are the same text, so a client that drops
+	// its buffer on agent_text shows the same thing either way.
+	var built strings.Builder
+	for _, ev := range received[:3] {
+		built.WriteString(ev.Message)
+	}
+	if built.String() != received[3].Message {
+		t.Fatalf("expected the concatenated deltas %q to equal the authoritative agent_text %q", built.String(), received[3].Message)
+	}
+}
+
 func TestDriveSpecGrillSession_AgentTextIsForwardedLiveNotTurnEnding(t *testing.T) {
 	clientset := testClient(t)
 	restConfig, err := k8s.RESTConfig()
