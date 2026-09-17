@@ -168,7 +168,7 @@ func createTestPreview(
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize preview helm: %w", err)
 	}
-	if err := helm.Deploy(ctx, helmCfg, namespace, releaseName, chrt, nil); err != nil {
+	if _, err := helm.Deploy(ctx, helmCfg, namespace, releaseName, chrt, nil); err != nil {
 		return nil, fmt.Errorf("failed to deploy test preview: %w", err)
 	}
 	slug, err := cfg.APIClient.FetchProjectMetadata(ctx, job.ProjectID)

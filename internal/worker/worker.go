@@ -260,7 +260,11 @@ func runInCluster(ctx context.Context, q *queue.Queue, client *k8s.Client, job *
 	}
 
 	if job.Kind == queue.KindDeploy {
-		return runDeploy(ctx, client, job.ProjectID, namespace, cfg)
+		return runDeploy(ctx, client, job, namespace, cfg)
+	}
+
+	if job.Kind == queue.KindRollback {
+		return runRollback(ctx, client, job, namespace, cfg)
 	}
 
 	if job.Kind == queue.KindSpecGrill ||
@@ -510,10 +514,13 @@ func filterModelEnv(secrets map[string]string) map[string]string {
 // Deployment's envFrom reference resolves on first rollout. Once the
 // Deployment/Service exist, an Ingress (ADR 003 §15) makes the primary
 // deployment reachable at <project-slug>.apps.<domain>.
-func runDeploy(ctx context.Context, client *k8s.Client, projectID, namespace string, cfg Config) error {
+//
+// The Helm revision this deploy produced is reported back to the API
+// (ADR 022) so the project has a deploy ledger to show and to roll back to.
+func runDeploy(ctx context.Context, client *k8s.Client, job *queue.Job, namespace string, cfg Config) error {
 	// The trailing "" is the feature id: a deploy is project-scoped, so it has
 	// no feature whose model tier could apply.
-	secrets, err := cfg.APIClient.FetchProjectSecrets(ctx, projectID, string(queue.KindDeploy), "")
+	secrets, err := cfg.APIClient.FetchProjectSecrets(ctx, job.ProjectID, string(queue.KindDeploy), "")
 	if err != nil {
 		return fmt.Errorf("failed to fetch project secrets: %w", err)
 	}
@@ -521,7 +528,7 @@ func runDeploy(ctx context.Context, client *k8s.Client, projectID, namespace str
 		return fmt.Errorf("failed to push project secrets: %w", err)
 	}
 
-	chrt, err := resolveChart(ctx, cfg, projectID)
+	chrt, err := resolveChart(ctx, cfg, job.ProjectID)
 	if err != nil {
 		return err
 	}
@@ -531,11 +538,16 @@ func runDeploy(ctx context.Context, client *k8s.Client, projectID, namespace str
 		return fmt.Errorf("failed to initialize helm: %w", err)
 	}
 	values := map[string]interface{}{"secretsChecksum": secretsChecksum(secrets)}
-	if err := helm.Deploy(ctx, helmCfg, namespace, primaryReleaseName, chrt, values); err != nil {
+	revision, err := helm.Deploy(ctx, helmCfg, namespace, primaryReleaseName, chrt, values)
+	if err != nil {
+		// Reported even on failure: the API records the attempt either way, so
+		// the ledger shows a failed deploy rather than silently omitting it.
+		reportDeployResult(ctx, cfg, job.ID, apiclient.DeployResultInput{LastError: err.Error()})
 		return err
 	}
+	reportDeployResult(ctx, cfg, job.ID, apiclient.DeployResultInput{Revision: revision})
 
-	slug, err := cfg.APIClient.FetchProjectMetadata(ctx, projectID)
+	slug, err := cfg.APIClient.FetchProjectMetadata(ctx, job.ProjectID)
 	if err != nil {
 		return fmt.Errorf("failed to fetch project metadata: %w", err)
 	}
@@ -547,6 +559,61 @@ func runDeploy(ctx context.Context, client *k8s.Client, projectID, namespace str
 		return fmt.Errorf("failed to ensure ingress: %w", err)
 	}
 	return nil
+}
+
+// runRollback reverts a project's primary release to an earlier Helm
+// revision (ADR 022) — the safety net ADR 003 §9 left out when it shipped
+// auto-deploy-on-merge.
+//
+// It deliberately does *not* re-apply the chart, re-push project secrets, or
+// re-ensure the Ingress: those are inputs to a release, not part of it. Only
+// the release's own manifests move backwards. Two consequences worth being
+// explicit about, both documented in ADR 022: project secrets are applied
+// imperatively outside Helm (ADR 003 §16), so a rollback does not roll back
+// rotated credentials; and the Ingress points at the release's Service name,
+// which a rollback does not change.
+//
+// The target revision is read from the job row rather than resolved here, so
+// it stays pinned to what the operator actually chose even if newer deploys
+// land between the request and this claim (ADR 022).
+func runRollback(ctx context.Context, client *k8s.Client, job *queue.Job, namespace string, cfg Config) error {
+	if job.TargetRevision == nil {
+		return errors.New("rollback job has no target revision")
+	}
+	helmCfg, err := helm.NewConfiguration(client.Config, namespace)
+	if err != nil {
+		return fmt.Errorf("failed to initialize helm: %w", err)
+	}
+
+	revision, err := helm.Rollback(ctx, helmCfg, namespace, primaryReleaseName, *job.TargetRevision)
+	if err != nil {
+		reportDeployResult(ctx, cfg, job.ID, apiclient.DeployResultInput{
+			TargetRevision: job.TargetRevision,
+			LastError:      err.Error(),
+		})
+		return err
+	}
+	reportDeployResult(ctx, cfg, job.ID, apiclient.DeployResultInput{
+		Revision:       revision,
+		TargetRevision: job.TargetRevision,
+	})
+	return nil
+}
+
+// reportDeployResult posts one deploy/rollback outcome to the API's deploy
+// ledger (ADR 022). A failed report is deliberately not fatal to the job: the
+// release really was applied or rolled back, so failing the job would report a
+// true outcome as a false one. The consequence of losing this call is real
+// though — the revision is then absent from the ledger and so not offered as a
+// rollback target — so it is logged loudly with the revision named rather than
+// swallowed.
+func reportDeployResult(ctx context.Context, cfg Config, jobID string, result apiclient.DeployResultInput) {
+	if err := cfg.APIClient.ReportDeployResult(ctx, jobID, result); err != nil {
+		log.Printf(
+			"worker: WARNING failed to record deploy result for job %s (revision %d): %v — this revision will be missing from the project's deploy history",
+			jobID, result.Revision, err,
+		)
+	}
 }
 
 // resolveChart fetches the project's scaffolded chart (Phase 3c), falling

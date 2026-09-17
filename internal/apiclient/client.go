@@ -338,6 +338,62 @@ func (c *Client) FetchTestSpec(ctx context.Context, projectID, testID, ref strin
 	return spec, nil
 }
 
+// DeployResultInput is what the Orchestrator reports back after a `deploy`
+// or `rollback` job reaches a terminal state (ADR 022). Deploy jobs were
+// previously silent: only the `jobs` row recorded the outcome, so the Helm
+// revision a deploy produced existed only inside the cluster and there was
+// nothing to roll back *to*.
+//
+// Revision is the revision the operation produced (Helm numbers revisions
+// monotonically; a rollback does not rewind that counter, it creates a new
+// revision whose content matches the target). TargetRevision is set only for
+// a rollback — the earlier revision the operator asked for. LastError is
+// empty on success.
+type DeployResultInput struct {
+	Revision       int
+	TargetRevision *int
+	LastError      string
+}
+
+// ReportDeployResult records the outcome of a deploy/rollback job so the API
+// can persist it in the project's deploy ledger (ADR 022). Errors are the
+// caller's to decide how to handle: like PostJobEvent, a failed report is a
+// visibility gap rather than a job failure — the deployment itself either
+// happened or didn't, independent of whether this side-channel post landed.
+func (c *Client) ReportDeployResult(ctx context.Context, jobID string, result DeployResultInput) error {
+	body, err := json.Marshal(struct {
+		Revision       int    `json:"revision"`
+		TargetRevision *int   `json:"targetRevision,omitempty"`
+		LastError      string `json:"lastError,omitempty"`
+	}{
+		Revision:       result.Revision,
+		TargetRevision: result.TargetRevision,
+		LastError:      result.LastError,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to encode deploy result: %w", err)
+	}
+
+	reqURL := fmt.Sprintf("%s/internal/jobs/%s/deploy-result", c.baseURL, jobID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("API returned status %d reporting deploy result for job %s", resp.StatusCode, jobID)
+	}
+	return nil
+}
+
 type jobEventRequest struct {
 	Type     string `json:"type"`
 	Question string `json:"question,omitempty"`

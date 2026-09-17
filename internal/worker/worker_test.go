@@ -139,7 +139,7 @@ func TestRunDeploy_SurfacesSlugFetchError(t *testing.T) {
 		CertIssuerName:   "selfsigned-issuer",
 	}
 
-	err = runDeploy(ctx, clientset, projectID, namespace, cfg)
+	err = runDeploy(ctx, clientset, &queue.Job{ID: "job-deploy-1", ProjectID: projectID, Kind: queue.KindDeploy}, namespace, cfg)
 	if err == nil {
 		t.Fatal("expected runDeploy to return an error when the slug fetch fails, got nil")
 	}
@@ -605,5 +605,27 @@ func TestBuildAgentEnv_OmitsFeatureIDForJobWithoutFeature(t *testing.T) {
 	}
 	if query.Get("jobKind") != string(queue.KindTestRun) {
 		t.Fatalf("expected jobKind query param %q, got %q", queue.KindTestRun, query.Get("jobKind"))
+	}
+}
+
+// A rollback job whose target revision is missing must fail before Helm is
+// consulted at all — the API always sets target_revision when it enqueues a
+// rollback (ADR 022), so reaching this with nil means the row is malformed or
+// came from a writer that predates the column. Failing here keeps the release
+// untouched rather than guessing a target, and needs no cluster to verify:
+// runRollback returns on the guard before it touches the Kubernetes client.
+func TestRunRollback_RejectsAJobWithNoTargetRevision(t *testing.T) {
+	job := &queue.Job{
+		ID:        "job-rollback-1",
+		ProjectID: "proj-1",
+		Kind:      queue.KindRollback,
+	}
+
+	err := runRollback(context.Background(), nil, job, "proj-ns", Config{})
+	if err == nil {
+		t.Fatal("expected runRollback to reject a job with no target revision, got nil")
+	}
+	if !strings.Contains(err.Error(), "target revision") {
+		t.Fatalf("expected the error to say the target revision is missing, got: %v", err)
 	}
 }

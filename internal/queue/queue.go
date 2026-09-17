@@ -24,6 +24,13 @@ const (
 	KindScriptTestRun JobKind = "script_test_run"
 	KindAgenticReview JobKind = "agentic_review"
 	KindDesignGrill   JobKind = "design_grill"
+	// KindRollback rolls a project's primary deployment back to an earlier
+	// Helm revision (ADR 022). A distinct kind rather than a `deploy` variant,
+	// for the same reason script_test_run is distinct from test_run: the two
+	// operations are distinguishable in history and audit, and a rollback is a
+	// deliberately authorized action rather than routine automation. Like
+	// `deploy` it is fully deterministic — no Pi, no attach/RPC, no agent image.
+	KindRollback JobKind = "rollback"
 )
 
 type JobStatus string
@@ -49,6 +56,13 @@ type Job struct {
 	Status    JobStatus
 	CreatedAt time.Time
 	StartedAt *time.Time
+
+	// TargetRevision is the Helm revision a KindRollback job should roll the
+	// primary release back to (ADR 022). Nil for every other job kind. The API
+	// pins it onto the job row when the rollback is requested, so a queued
+	// rollback keeps the operator's chosen target even if newer deploys land
+	// before it is claimed.
+	TargetRevision *int
 }
 
 type Queue struct {
@@ -76,13 +90,13 @@ func (q *Queue) Claim(ctx context.Context, workerID string) (*Job, error) {
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
 		)
-		RETURNING id, project_id, kind, feature_id, test_id, test_group, ref, trigger_source, status, created_at, started_at
+		RETURNING id, project_id, kind, feature_id, test_id, test_group, ref, trigger_source, status, created_at, started_at, target_revision
 	`, workerID)
 
 	var j Job
 	err := row.Scan(
 		&j.ID, &j.ProjectID, &j.Kind, &j.FeatureID, &j.TestID, &j.TestGroup, &j.Ref, &j.Trigger,
-		&j.Status, &j.CreatedAt, &j.StartedAt,
+		&j.Status, &j.CreatedAt, &j.StartedAt, &j.TargetRevision,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil

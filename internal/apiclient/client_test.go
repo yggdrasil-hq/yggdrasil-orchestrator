@@ -477,3 +477,92 @@ func TestPostJobEvent_ReturnsErrorOnNon201(t *testing.T) {
 		t.Fatal("expected an error for a 500 response, got nil")
 	}
 }
+
+func TestReportDeployResult_PostsRevisionWithBearerToken(t *testing.T) {
+	var gotAuthHeader, gotPath, gotMethod string
+	var gotBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthHeader = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		gotMethod = r.Method
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	err := client.ReportDeployResult(context.Background(), "job-1", apiclient.DeployResultInput{Revision: 7})
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if gotMethod != http.MethodPost {
+		t.Fatalf("expected method %q, got %q", http.MethodPost, gotMethod)
+	}
+	if gotAuthHeader != "Bearer test-token" {
+		t.Fatalf("expected Authorization header %q, got %q", "Bearer test-token", gotAuthHeader)
+	}
+	if gotPath != "/internal/jobs/job-1/deploy-result" {
+		t.Fatalf("expected path %q, got %q", "/internal/jobs/job-1/deploy-result", gotPath)
+	}
+	if gotBody["revision"] != float64(7) {
+		t.Fatalf("expected revision 7 in the body, got %v", gotBody["revision"])
+	}
+	// A successful deploy has no target revision and no error, and both must be
+	// *absent* rather than sent as zero/empty — an empty lastError on a
+	// rollback record would read as "succeeded" in the ledger.
+	if _, present := gotBody["targetRevision"]; present {
+		t.Fatalf("expected no targetRevision key for a plain deploy, got %v", gotBody["targetRevision"])
+	}
+	if _, present := gotBody["lastError"]; present {
+		t.Fatalf("expected no lastError key on success, got %v", gotBody["lastError"])
+	}
+}
+
+func TestReportDeployResult_SendsTargetRevisionAndErrorForAFailedRollback(t *testing.T) {
+	var gotBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	target := 3
+	client := apiclient.New(server.URL, "test-token")
+	err := client.ReportDeployResult(context.Background(), "job-2", apiclient.DeployResultInput{
+		TargetRevision: &target,
+		LastError:      "helm rollback to revision 3 failed: release not found",
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if gotBody["targetRevision"] != float64(3) {
+		t.Fatalf("expected targetRevision 3, got %v", gotBody["targetRevision"])
+	}
+	// A failed operation produces no new revision, so revision stays 0 and the
+	// API stores NULL for it — the ledger row records an attempt that changed
+	// nothing, which is exactly what makes "which revisions can I roll back
+	// to" unambiguous.
+	if gotBody["revision"] != float64(0) {
+		t.Fatalf("expected revision 0 for a failed operation, got %v", gotBody["revision"])
+	}
+	if gotBody["lastError"] == nil || gotBody["lastError"] == "" {
+		t.Fatalf("expected the failure reason to be reported, got %v", gotBody["lastError"])
+	}
+}
+
+func TestReportDeployResult_ErrorsOnNonCreatedStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	err := client.ReportDeployResult(context.Background(), "job-3", apiclient.DeployResultInput{Revision: 1})
+	if err == nil {
+		t.Fatal("expected an error when the API rejects the report, got nil")
+	}
+}

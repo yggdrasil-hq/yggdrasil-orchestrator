@@ -78,7 +78,7 @@ func TestLoadChartFromFiles_ProducesDeployableChart(t *testing.T) {
 		t.Fatalf("failed to build helm configuration: %v", err)
 	}
 
-	if err := helm.Deploy(ctx, cfg, namespace, "primary", chrt, nil); err != nil {
+	if _, err := helm.Deploy(ctx, cfg, namespace, "primary", chrt, nil); err != nil {
 		t.Fatalf("expected deploy of the fetched-shaped chart to succeed, got: %v", err)
 	}
 

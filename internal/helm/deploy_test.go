@@ -35,7 +35,7 @@ func TestDeploy_InstallsPlaceholderChart(t *testing.T) {
 		t.Fatalf("failed to load placeholder chart: %v", err)
 	}
 
-	if err := helm.Deploy(ctx, cfg, namespace, testReleaseName, chrt, nil); err != nil {
+	if _, err := helm.Deploy(ctx, cfg, namespace, testReleaseName, chrt, nil); err != nil {
 		t.Fatalf("expected deploy to succeed, got: %v", err)
 	}
 
@@ -70,13 +70,13 @@ func TestDeploy_Idempotent(t *testing.T) {
 		t.Fatalf("failed to load placeholder chart: %v", err)
 	}
 
-	if err := helm.Deploy(ctx, cfg, namespace, testReleaseName, chrt, nil); err != nil {
+	if _, err := helm.Deploy(ctx, cfg, namespace, testReleaseName, chrt, nil); err != nil {
 		t.Fatalf("expected first deploy (install) to succeed, got: %v", err)
 	}
 	// A second deploy of the same release simulates a second merge to main
 	// (ADR 003 §11) — this must go through Helm's upgrade path cleanly, not
 	// error out or duplicate resources.
-	if err := helm.Deploy(ctx, cfg, namespace, testReleaseName, chrt, nil); err != nil {
+	if _, err := helm.Deploy(ctx, cfg, namespace, testReleaseName, chrt, nil); err != nil {
 		t.Fatalf("expected second deploy (upgrade) to succeed, got: %v", err)
 	}
 }
@@ -103,7 +103,7 @@ func TestDeploy_SecretsChecksumChangeForcesRollout(t *testing.T) {
 		t.Fatalf("failed to load placeholder chart: %v", err)
 	}
 
-	if err := helm.Deploy(ctx, cfg, namespace, testReleaseName, chrt, map[string]interface{}{"secretsChecksum": "v1"}); err != nil {
+	if _, err := helm.Deploy(ctx, cfg, namespace, testReleaseName, chrt, map[string]interface{}{"secretsChecksum": "v1"}); err != nil {
 		t.Fatalf("expected first deploy to succeed, got: %v", err)
 	}
 	firstPod := onlyPodName(ctx, t, clientset, namespace)
@@ -111,7 +111,7 @@ func TestDeploy_SecretsChecksumChangeForcesRollout(t *testing.T) {
 	// A deploy triggered only by a secrets change (no chart/value diff
 	// otherwise) must still roll the Pod — Kubernetes does not restart Pods
 	// just because a referenced Secret's content changed.
-	if err := helm.Deploy(ctx, cfg, namespace, testReleaseName, chrt, map[string]interface{}{"secretsChecksum": "v2"}); err != nil {
+	if _, err := helm.Deploy(ctx, cfg, namespace, testReleaseName, chrt, map[string]interface{}{"secretsChecksum": "v2"}); err != nil {
 		t.Fatalf("expected second deploy to succeed, got: %v", err)
 	}
 	secondPod := onlyPodName(ctx, t, clientset, namespace)
