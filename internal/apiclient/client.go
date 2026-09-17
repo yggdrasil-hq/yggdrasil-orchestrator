@@ -242,6 +242,14 @@ type SpecGrillContext struct {
 	KickbackReason         string                    `json:"kickbackReason"`
 	RequestedActionItems   []rpc.RequestedActionItem `json:"requestedActionItems"`
 	DesignSnapshots        []DesignSnapshotContext   `json:"designSnapshots"`
+	// RestartFromMessage marks a per-message "restart from here" (ADR 024):
+	// the user rewound the interview to an earlier turn and asked for the
+	// conversation from that point to be redone. It changes only how the prompt
+	// is worded — the same fields carry the same kind of content either way —
+	// because a rewind has no kickback reason and its transcript ends
+	// mid-conversation with no conclusion, so describing it as a continuation
+	// of a blocked implementation would be actively misleading.
+	RestartFromMessage bool `json:"restartFromMessage,omitempty"`
 }
 
 // FetchDesignSpec fetches the project-scoped payload for a design_grill job.

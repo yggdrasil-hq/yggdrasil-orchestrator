@@ -658,4 +658,73 @@ func TestBuildInitialPrompt_SpecGrillIncludesKickbackContext(t *testing.T) {
 			t.Fatalf("expected prompt to include %q, got: %s", want, prompt)
 		}
 	}
+	// The kickback wording must stay on this branch, so the rewind branch below
+	// cannot silently take over the common case.
+	if !strings.Contains(prompt, "continuation of an earlier specification run") {
+		t.Fatalf("expected the kickback prompt to read as a continuation, got: %s", prompt)
+	}
+}
+
+// ADR 024: a per-message restart is a *rewind*, not a continuation. The agent
+// is stateless per run and only sees this seed, so if the prompt claimed an
+// implementation had been blocked — the thing a kickback reason means — it
+// would treat an unfinished discussion as settled context and quietly preserve
+// decisions the user deliberately rewound past.
+func TestBuildInitialPrompt_SpecGrillRestartReadsAsARewindNotAKickback(t *testing.T) {
+	prompt := buildInitialPrompt(queue.KindSpecGrill, apiclient.FeatureSpec{
+		Title:       "Add dark mode",
+		FeatureType: "normal",
+		SpecContext: &apiclient.SpecGrillContext{
+			PreviousAdrMarkdown:    "",
+			GrillTranscriptSummary: "Agent question: Light mode first, or both at once?",
+			KickbackReason:         "The user restarted this specification session from an earlier turn.",
+			RestartFromMessage:     true,
+		},
+	})
+
+	if !strings.Contains(prompt, "restarted this specification session from an earlier") {
+		t.Fatalf("expected the rewind wording, got: %s", prompt)
+	}
+	if !strings.Contains(prompt, "up to the point the user rewound to") {
+		t.Fatalf("expected the kept transcript to be labelled as a rewind, got: %s", prompt)
+	}
+	if !strings.Contains(prompt, "Why the earlier session was rewound") {
+		t.Fatalf("expected the restart reason to be labelled as a rewind, got: %s", prompt)
+	}
+	if !strings.Contains(prompt, "Light mode first, or both at once?") {
+		t.Fatalf("expected the kept transcript in the prompt, got: %s", prompt)
+	}
+
+	// The three kickback-only phrasings must not appear: each would misdescribe
+	// a rewind as a blocked implementation.
+	for _, unwanted := range []string{
+		"continuation of an earlier specification run",
+		"Implementation kickback reason",
+		"Preserve useful decisions from the context below",
+	} {
+		if strings.Contains(prompt, unwanted) {
+			t.Fatalf("a rewind must not be worded as a kickback: found %q in %s", unwanted, prompt)
+		}
+	}
+}
+
+// A restart at the session's first turn carries no earlier conversation at all,
+// so the seed has an empty summary — the prompt must still explain itself
+// rather than emit an empty "previous transcript" block.
+func TestBuildInitialPrompt_SpecGrillRestartWithNoKeptTranscript(t *testing.T) {
+	prompt := buildInitialPrompt(queue.KindSpecGrill, apiclient.FeatureSpec{
+		Title:       "Add dark mode",
+		FeatureType: "normal",
+		SpecContext: &apiclient.SpecGrillContext{
+			KickbackReason:     "The user restarted this specification session from an earlier turn.",
+			RestartFromMessage: true,
+		},
+	})
+
+	if !strings.Contains(prompt, "restarted this specification session from an earlier") {
+		t.Fatalf("expected the rewind wording even with nothing kept, got: %s", prompt)
+	}
+	if strings.Contains(prompt, "up to the point the user rewound to") {
+		t.Fatalf("expected no transcript block when nothing was kept, got: %s", prompt)
+	}
 }

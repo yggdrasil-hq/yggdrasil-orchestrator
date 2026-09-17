@@ -362,19 +362,36 @@ func appendSpecContext(b *strings.Builder, context *apiclient.SpecGrillContext) 
 	if context == nil {
 		return
 	}
-	b.WriteString("\n\nThis is a continuation of an earlier specification run. Preserve useful decisions from the context below, revisit anything the kickback makes invalid, and do not make the user repeat settled answers.\n")
+	// Two ways a spec_grill run can be a follow-up (ADR 015's kickback, ADR
+	// 024's per-message rewind), and the agent needs to be told which one it
+	// is: a rewind's transcript ends mid-conversation with no conclusion, so
+	// telling it to "preserve useful decisions" and explaining a kickback that
+	// never happened would push it to treat an unfinished discussion as settled.
+	if context.RestartFromMessage {
+		b.WriteString("\n\nThe user restarted this specification session from an earlier point in the conversation. Only the part of the earlier conversation shown below is preserved; everything the agent concluded after it was discarded deliberately. Treat it as an unfinished discussion: re-establish the open questions, treat no earlier decision as settled, and do not assume the ADR that previously came out of this session still applies.\n")
+	} else {
+		b.WriteString("\n\nThis is a continuation of an earlier specification run. Preserve useful decisions from the context below, revisit anything the kickback makes invalid, and do not make the user repeat settled answers.\n")
+	}
 	if context.PreviousAdrMarkdown != "" {
 		b.WriteString("\nPreviously approved ADR:\n---\n")
 		b.WriteString(context.PreviousAdrMarkdown)
 		b.WriteString("\n---\n")
 	}
 	if context.GrillTranscriptSummary != "" {
-		b.WriteString("\nPrevious grill transcript summary:\n---\n")
+		if context.RestartFromMessage {
+			b.WriteString("\nEarlier conversation, up to the point the user rewound to:\n---\n")
+		} else {
+			b.WriteString("\nPrevious grill transcript summary:\n---\n")
+		}
 		b.WriteString(context.GrillTranscriptSummary)
 		b.WriteString("\n---\n")
 	}
 	if context.KickbackReason != "" {
-		b.WriteString("\nImplementation kickback reason:\n---\n")
+		if context.RestartFromMessage {
+			b.WriteString("\nWhy the earlier session was rewound:\n---\n")
+		} else {
+			b.WriteString("\nImplementation kickback reason:\n---\n")
+		}
 		b.WriteString(context.KickbackReason)
 		b.WriteString("\n---\n")
 	}
