@@ -60,6 +60,19 @@ func startAttachablePod(t *testing.T, ctx context.Context, script string) (names
 	return namespace, podName, jobName
 }
 
+// noStats stands in for the real get_session_stats round trip. The stand-in
+// pods these tests attach to speak canned JSONL, not Pi's RPC protocol, so
+// asking one for session accounting would simply never be answered — the fake
+// keeps these tests about session control (their actual subject) rather than
+// about Pi's bookkeeping endpoint, which has its own tests.
+var noStats = func(context.Context, *rpc.Client, string, string) (rpc.SessionStats, error) {
+	return rpc.SessionStats{}, nil
+}
+
+// discardUsage accepts the accounting the session reports; ADR 023's capture
+// path is asserted in usage_test.go and by TestBuildAgentEnvUsageReport.
+var discardUsage = func(rpc.SessionStats, time.Duration) {}
+
 // blockingReplyWaiter simulates "no human has replied yet": it never
 // resolves until ctx is cancelled. Used to prove ask_user doesn't end a
 // session without needing a real Postgres-backed messages.Store.
@@ -120,7 +133,8 @@ func TestDriveSpecGrillSession_SubmitADREndsSessionAndIsCurated(t *testing.T) {
 	var received []rpc.CuratedEvent
 	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
-	})
+	},
+		noStats, discardUsage)
 	if err != nil {
 		t.Fatalf("expected the session to end cleanly on submit_adr, got: %v", err)
 	}
@@ -155,7 +169,8 @@ func TestDriveAgentSession_SubmitBuildResultSuccessEndsSessionCleanly(t *testing
 	var received []rpc.CuratedEvent
 	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "Implement this feature: dark mode", func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
-	})
+	},
+		noStats, discardUsage)
 	if err != nil {
 		t.Fatalf("expected the session to end cleanly on a successful submit_build_result, got: %v", err)
 	}
@@ -187,7 +202,8 @@ func TestDriveAgentSession_SubmitBuildResultFailureEndsSessionAsError(t *testing
 	var received []rpc.CuratedEvent
 	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "Implement this feature: dark mode", func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
-	})
+	},
+		noStats, discardUsage)
 	if err == nil {
 		t.Fatal("expected a non-nil error when submit_build_result reports failure")
 	}
@@ -225,7 +241,7 @@ func TestDriveSpecGrillSession_AskUserIsNotTerminal(t *testing.T) {
 			mu.Lock()
 			received = append(received, ev)
 			mu.Unlock()
-		})
+		}, noStats, discardUsage)
 	}()
 
 	select {
@@ -271,7 +287,8 @@ func TestDriveSpecGrillSession_ReplyResumesSessionAndReachesSubmitADR(t *testing
 	var received []rpc.CuratedEvent
 	err = driveAgentSession(ctx, clientset.Interface, restConfig, fixedReplyWaiter{reply: "use-oauth"}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
-	})
+	},
+		noStats, discardUsage)
 	if err != nil {
 		t.Fatalf("expected the session to end cleanly on submit_adr, got: %v", err)
 	}
@@ -322,7 +339,8 @@ func TestDriveSpecGrillSession_TrailingEventsFromPriorTurnDontFailTheNextOne(t *
 	var received []rpc.CuratedEvent
 	err = driveAgentSession(ctx, clientset.Interface, restConfig, fixedReplyWaiter{reply: "use-oauth"}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
-	})
+	},
+		noStats, discardUsage)
 	if err != nil {
 		t.Fatalf("expected the session to reach submit_adr despite the prior turn's trailing events, got: %v", err)
 	}
@@ -358,7 +376,8 @@ func TestDriveSpecGrillSession_AgentTextIsForwardedLiveNotTurnEnding(t *testing.
 	var received []rpc.CuratedEvent
 	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
-	})
+	},
+		noStats, discardUsage)
 	if err != nil {
 		t.Fatalf("expected the session to still reach submit_adr despite the intervening agent_text, got: %v", err)
 	}
@@ -399,7 +418,8 @@ func TestDriveSpecGrillSession_AttachFailureSurfacesAsRunFailed(t *testing.T) {
 	var received []rpc.CuratedEvent
 	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
-	})
+	},
+		noStats, discardUsage)
 
 	if err == nil {
 		t.Fatal("expected an error when the attach stream ends without a terminating event")
@@ -492,7 +512,8 @@ func TestDriveSpecGrillSession_CancellationMidTurnEndsSessionAsCancelled(t *test
 	start := time.Now()
 	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, delayedCancel{after: 500 * time.Millisecond}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
-	})
+	},
+		noStats, discardUsage)
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, errJobCancelled) {
@@ -523,7 +544,8 @@ func TestDriveSpecGrillSession_CancellationWhileAwaitingReplyEndsSessionAsCancel
 	var received []rpc.CuratedEvent
 	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, delayedCancel{after: 500 * time.Millisecond}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
-	})
+	},
+		noStats, discardUsage)
 
 	if !errors.Is(err, errJobCancelled) {
 		t.Fatalf("expected errJobCancelled, got: %v", err)

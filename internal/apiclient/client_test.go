@@ -566,3 +566,95 @@ func TestReportDeployResult_ErrorsOnNonCreatedStatus(t *testing.T) {
 		t.Fatal("expected an error when the API rejects the report, got nil")
 	}
 }
+
+// ADR 023: the usage side channel posts provider-reported token/cost
+// accounting to the internal endpoint, with the same auth as every other
+// internal call.
+func TestPostJobUsage_SendsBearerTokenAndBody(t *testing.T) {
+	var gotAuthHeader, gotPath, gotContentType string
+	var gotBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthHeader = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		gotContentType = r.Header.Get("Content-Type")
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	cost := 0.45
+	durationMs := int64(90_000)
+	client := apiclient.New(server.URL, "test-token")
+	err := client.PostJobUsage(context.Background(), "job-123", apiclient.JobUsage{
+		ModelID:          "anthropic/claude-sonnet-4",
+		InputTokens:      50_000,
+		OutputTokens:     10_000,
+		CacheReadTokens:  40_000,
+		CacheWriteTokens: 5_000,
+		TotalTokens:      105_000,
+		CostUSD:          &cost,
+		DurationMs:       &durationMs,
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if gotAuthHeader != "Bearer test-token" {
+		t.Fatalf("expected Authorization header %q, got %q", "Bearer test-token", gotAuthHeader)
+	}
+	if gotPath != "/internal/jobs/job-123/usage" {
+		t.Fatalf("expected path %q, got %q", "/internal/jobs/job-123/usage", gotPath)
+	}
+	if gotContentType != "application/json" {
+		t.Fatalf("expected JSON content type, got %q", gotContentType)
+	}
+	if gotBody["modelId"] != "anthropic/claude-sonnet-4" {
+		t.Fatalf("expected modelId in the body, got %v", gotBody["modelId"])
+	}
+	if gotBody["totalTokens"] != float64(105_000) {
+		t.Fatalf("expected totalTokens 105000, got %v", gotBody["totalTokens"])
+	}
+	if gotBody["costUsd"] != 0.45 {
+		t.Fatalf("expected costUsd 0.45, got %v", gotBody["costUsd"])
+	}
+}
+
+// An unreported cost or duration must serialize as an explicit null rather
+// than being dropped: the API distinguishes "not reported" from zero, and a
+// missing key would otherwise be indistinguishable from an older client.
+func TestPostJobUsage_SendsNullForUnreportedCost(t *testing.T) {
+	var gotBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	err := client.PostJobUsage(context.Background(), "job-123", apiclient.JobUsage{TotalTokens: 10})
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	value, present := gotBody["costUsd"]
+	if !present {
+		t.Fatal("expected costUsd to be present in the payload")
+	}
+	if value != nil {
+		t.Fatalf("expected costUsd null, got %v", value)
+	}
+}
+
+func TestPostJobUsage_ReturnsErrorOnNon201(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	if err := client.PostJobUsage(context.Background(), "job-123", apiclient.JobUsage{}); err == nil {
+		t.Fatal("expected an error for a 500 response, got nil")
+	}
+}

@@ -477,3 +477,56 @@ func (c *Client) PostJobEvent(ctx context.Context, jobID string, event rpc.Curat
 	}
 	return nil
 }
+
+// JobUsage is one job's token/cost accounting (ADR 023), as reported by Pi's
+// own get_session_stats and posted once the job's session ends. Every count is
+// provider-reported — Yggdrasil never tokenizes or estimates.
+//
+// CostUSD and DurationMs are pointers so "not reported" stays distinguishable
+// from a genuine zero all the way into the database: a model billed at nothing
+// is a real fact, whereas a missing figure must be stored NULL rather than as
+// free / instantaneous.
+type JobUsage struct {
+	// ModelID is the literal model-id string the job ran with (the pod's
+	// MODEL_ID env var), which is what actually served the run. The API
+	// resolves the provider/tier itself; the Orchestrator never sees a
+	// provider name, and never sends a key.
+	ModelID          string   `json:"modelId,omitempty"`
+	InputTokens      int64    `json:"inputTokens"`
+	OutputTokens     int64    `json:"outputTokens"`
+	CacheReadTokens  int64    `json:"cacheReadTokens"`
+	CacheWriteTokens int64    `json:"cacheWriteTokens"`
+	TotalTokens      int64    `json:"totalTokens"`
+	CostUSD          *float64 `json:"costUsd"`
+	DurationMs       *int64   `json:"durationMs"`
+}
+
+// PostJobUsage reports a finished job's token/cost accounting (ADR 023).
+// Like PostJobEvent this is a side channel: the caller decides how to handle
+// an error, and a failure here must never change the job's outcome, since the
+// job already succeeded or failed on its own terms by the time this is sent.
+func (c *Client) PostJobUsage(ctx context.Context, jobID string, usage JobUsage) error {
+	body, err := json.Marshal(usage)
+	if err != nil {
+		return fmt.Errorf("failed to encode job usage: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/internal/jobs/%s/usage", c.baseURL, jobID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("API returned status %d posting usage for job %s", resp.StatusCode, jobID)
+	}
+	return nil
+}
