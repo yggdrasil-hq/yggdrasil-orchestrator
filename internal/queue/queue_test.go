@@ -40,6 +40,9 @@ func setupTestQueue(t *testing.T) (*queue.Queue, *pgxpool.Pool) {
 			kind VARCHAR(32) NOT NULL,
 			feature_id UUID,
 			test_id UUID,
+			test_group VARCHAR(16),
+			ref VARCHAR(255),
+			trigger_source VARCHAR(32),
 			status VARCHAR(32) NOT NULL DEFAULT 'pending',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			started_at TIMESTAMPTZ,
@@ -47,7 +50,20 @@ func setupTestQueue(t *testing.T) (*queue.Queue, *pgxpool.Pool) {
 			locked_at TIMESTAMPTZ,
 			locked_by TEXT,
 			attempts INT NOT NULL DEFAULT 0,
-			last_error TEXT
+			last_error TEXT,
+			target_revision INTEGER
+		);
+
+		-- The claim's preview-cap admission clause reads this table (ADR 003
+		-- §17), so the fixture needs it even though the queue package does not
+		-- own it. Mirrors the real table's shape in the two columns that
+		-- matter to the clause: which project, and whether it is still active.
+		DROP TABLE IF EXISTS job_previews;
+		CREATE TABLE job_previews (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			project_id UUID NOT NULL,
+			job_id UUID NOT NULL,
+			status VARCHAR(32) NOT NULL DEFAULT 'active'
 		);
 	`)
 	if err != nil {
@@ -75,7 +91,7 @@ func TestClaim_ReturnsNilWhenEmpty(t *testing.T) {
 	q, _ := setupTestQueue(t)
 	ctx := context.Background()
 
-	job, err := q.Claim(ctx, "worker-1")
+	job, err := q.Claim(ctx, "worker-1", queue.NewAdmission(0, nil))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -90,7 +106,7 @@ func TestClaim_MarksJobRunning(t *testing.T) {
 
 	id := insertJob(t, ctx, pool, "spec_grill")
 
-	job, err := q.Claim(ctx, "worker-1")
+	job, err := q.Claim(ctx, "worker-1", queue.NewAdmission(0, nil))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -108,7 +124,7 @@ func TestClaim_MarksJobRunning(t *testing.T) {
 	}
 
 	// A second claim must not see the same job again — it's no longer pending.
-	again, err := q.Claim(ctx, "worker-1")
+	again, err := q.Claim(ctx, "worker-1", queue.NewAdmission(0, nil))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -139,7 +155,7 @@ func TestClaim_SkipLockedPreventsDoubleClaim(t *testing.T) {
 		go func(workerID string) {
 			defer wg.Done()
 			for {
-				job, err := q.Claim(ctx, workerID)
+				job, err := q.Claim(ctx, workerID, queue.NewAdmission(0, nil))
 				if err != nil {
 					t.Errorf("worker %s: claim failed: %v", workerID, err)
 					return
@@ -170,7 +186,7 @@ func TestComplete(t *testing.T) {
 	ctx := context.Background()
 
 	insertJob(t, ctx, pool, "test_run")
-	claimed, err := q.Claim(ctx, "worker-1")
+	claimed, err := q.Claim(ctx, "worker-1", queue.NewAdmission(0, nil))
 	if err != nil || claimed == nil {
 		t.Fatalf("failed to claim fixture job: %v", err)
 	}
@@ -193,7 +209,7 @@ func TestFail(t *testing.T) {
 	ctx := context.Background()
 
 	insertJob(t, ctx, pool, "test_run")
-	claimed, err := q.Claim(ctx, "worker-1")
+	claimed, err := q.Claim(ctx, "worker-1", queue.NewAdmission(0, nil))
 	if err != nil || claimed == nil {
 		t.Fatalf("failed to claim fixture job: %v", err)
 	}
@@ -231,7 +247,7 @@ func TestComplete_DoesNotOverwriteCancelled(t *testing.T) {
 	ctx := context.Background()
 
 	insertJob(t, ctx, pool, "spec_grill")
-	claimed, err := q.Claim(ctx, "worker-1")
+	claimed, err := q.Claim(ctx, "worker-1", queue.NewAdmission(0, nil))
 	if err != nil || claimed == nil {
 		t.Fatalf("failed to claim fixture job: %v", err)
 	}
@@ -260,7 +276,7 @@ func TestFail_DoesNotOverwriteCancelled(t *testing.T) {
 	ctx := context.Background()
 
 	insertJob(t, ctx, pool, "spec_grill")
-	claimed, err := q.Claim(ctx, "worker-1")
+	claimed, err := q.Claim(ctx, "worker-1", queue.NewAdmission(0, nil))
 	if err != nil || claimed == nil {
 		t.Fatalf("failed to claim fixture job: %v", err)
 	}
@@ -287,7 +303,7 @@ func TestWatchCancellation_ReturnsWhenAlreadyCancelled(t *testing.T) {
 	defer cancel()
 
 	insertJob(t, ctx, pool, "spec_grill")
-	claimed, err := q.Claim(ctx, "worker-1")
+	claimed, err := q.Claim(ctx, "worker-1", queue.NewAdmission(0, nil))
 	if err != nil || claimed == nil {
 		t.Fatalf("failed to claim fixture job: %v", err)
 	}
@@ -306,7 +322,7 @@ func TestWatchCancellation_UnblocksWhenCancelledLater(t *testing.T) {
 	defer cancel()
 
 	insertJob(t, ctx, pool, "spec_grill")
-	claimed, err := q.Claim(ctx, "worker-1")
+	claimed, err := q.Claim(ctx, "worker-1", queue.NewAdmission(0, nil))
 	if err != nil || claimed == nil {
 		t.Fatalf("failed to claim fixture job: %v", err)
 	}
@@ -342,7 +358,7 @@ func TestWatchCancellation_RespectsContextCancellation(t *testing.T) {
 	ctx := context.Background()
 
 	insertJob(t, ctx, pool, "spec_grill")
-	claimed, err := q.Claim(ctx, "worker-1")
+	claimed, err := q.Claim(ctx, "worker-1", queue.NewAdmission(0, nil))
 	if err != nil || claimed == nil {
 		t.Fatalf("failed to claim fixture job: %v", err)
 	}
@@ -361,5 +377,150 @@ func TestWatchCancellation_RespectsContextCancellation(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("WatchCancellation did not return after its context was cancelled")
+	}
+}
+
+// --- ADR 003 §17 preview-cap admission -------------------------------------
+
+// insertJobInProject inserts a pending job with an explicit project id, so a
+// test can build a queue where several projects compete for claims.
+func insertJobInProject(t *testing.T, ctx context.Context, pool *pgxpool.Pool, projectID, kind string) string {
+	t.Helper()
+	var id string
+	err := pool.QueryRow(ctx, `
+		INSERT INTO jobs (project_id, kind, status)
+		VALUES ($1, $2, 'pending')
+		RETURNING id
+	`, projectID, kind).Scan(&id)
+	if err != nil {
+		t.Fatalf("failed to insert fixture job: %v", err)
+	}
+	return id
+}
+
+// addActivePreview records an in-flight preview for projectID, which is what
+// the admission clause counts.
+func addActivePreview(t *testing.T, ctx context.Context, pool *pgxpool.Pool, projectID string) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO job_previews (project_id, job_id, status)
+		VALUES ($1, gen_random_uuid(), 'active')
+	`, projectID); err != nil {
+		t.Fatalf("failed to insert fixture preview: %v", err)
+	}
+}
+
+const (
+	projectA = "11111111-1111-4111-8111-111111111111"
+	projectB = "22222222-2222-4222-8222-222222222222"
+)
+
+func TestClaim_SkipsPreviewJobWhenProjectAtCap(t *testing.T) {
+	q, pool := setupTestQueue(t)
+	ctx := context.Background()
+
+	// Project A is at the cap with three active previews, and has a
+	// preview-eligible job waiting. Project B has an ordinary job.
+	for i := 0; i < 3; i++ {
+		addActivePreview(t, ctx, pool, projectA)
+	}
+	blocked := insertJobInProject(t, ctx, pool, projectA, "feature_build")
+	later := insertJobInProject(t, ctx, pool, projectB, "feature_build")
+
+	admission := queue.NewAdmission(3, []string{"spec_grill", "feature_build", "test_run"})
+	claimed, err := q.Claim(ctx, "worker-1", admission)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("expected the other project's job to be claimed")
+	}
+	// The capped project's job is older, so a claim that ignored the cap would
+	// have returned it. Passing over it — rather than failing or blocking — is
+	// exactly ADR 003 §17's "queue rather than reject".
+	if claimed.ID != later {
+		t.Fatalf("expected project B's job %s to be claimed, got %s (project %s)", later, claimed.ID, claimed.ProjectID)
+	}
+
+	// The skipped job is still queued, not failed or cancelled.
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id = $1`, blocked).Scan(&status); err != nil {
+		t.Fatalf("failed to read skipped job: %v", err)
+	}
+	if status != "pending" {
+		t.Fatalf("expected the skipped job to stay pending, got %q", status)
+	}
+}
+
+func TestClaim_ClaimsSkippedPreviewJobOnceSlotFrees(t *testing.T) {
+	q, pool := setupTestQueue(t)
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		addActivePreview(t, ctx, pool, projectA)
+	}
+	blocked := insertJobInProject(t, ctx, pool, projectA, "test_run")
+
+	admission := queue.NewAdmission(3, []string{"spec_grill", "feature_build", "test_run"})
+	if claimed, err := q.Claim(ctx, "worker-1", admission); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	} else if claimed != nil {
+		t.Fatalf("expected nothing claimable at the cap, got %s", claimed.ID)
+	}
+
+	// One preview ends (the API marks it torn down when the job's teardown
+	// completes), which frees a slot.
+	if _, err := pool.Exec(ctx, `
+		UPDATE job_previews SET status = 'torn_down'
+		WHERE project_id = $1 AND id = (SELECT id FROM job_previews WHERE project_id = $1 LIMIT 1)
+	`, projectA); err != nil {
+		t.Fatalf("failed to free a preview slot: %v", err)
+	}
+
+	claimed, err := q.Claim(ctx, "worker-1", admission)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if claimed == nil || claimed.ID != blocked {
+		t.Fatalf("expected the previously-skipped job %s to be claimable, got %+v", blocked, claimed)
+	}
+}
+
+func TestClaim_NonPreviewKindsIgnoreTheCap(t *testing.T) {
+	q, pool := setupTestQueue(t)
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		addActivePreview(t, ctx, pool, projectA)
+	}
+	// A deploy is not a temporary deployment, so ADR 003 §17's cap does not
+	// apply to it and it must not be held up behind preview jobs.
+	deploy := insertJobInProject(t, ctx, pool, projectA, "deploy")
+
+	admission := queue.NewAdmission(3, []string{"spec_grill", "feature_build", "test_run"})
+	claimed, err := q.Claim(ctx, "worker-1", admission)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if claimed == nil || claimed.ID != deploy {
+		t.Fatalf("expected the deploy job %s to be claimable despite the cap, got %+v", deploy, claimed)
+	}
+}
+
+func TestClaim_DisabledAdmissionIgnoresCap(t *testing.T) {
+	q, pool := setupTestQueue(t)
+	ctx := context.Background()
+
+	for i := 0; i < 5; i++ {
+		addActivePreview(t, ctx, pool, projectA)
+	}
+	eligible := insertJobInProject(t, ctx, pool, projectA, "feature_build")
+
+	claimed, err := q.Claim(ctx, "worker-1", queue.NewAdmission(0, nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if claimed == nil || claimed.ID != eligible {
+		t.Fatalf("expected the job to be claimed with admission disabled, got %+v", claimed)
 	}
 }

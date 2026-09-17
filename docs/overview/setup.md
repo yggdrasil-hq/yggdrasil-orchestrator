@@ -101,6 +101,64 @@ warning on first load (the `selfSigned` `ClusterIssuer` from the previous
 section issues a self-signed cert, not one a browser trusts by default);
 click through it.
 
+## Ephemeral preview deployments (ADR 003 §10/§15)
+
+A `spec_grill`, `feature_build` or `test_run` job gets its own **temporary
+deployment** for the duration of its run, reachable at
+`<project-slug>-<kind>-<id>.preview.<domain>` — the `<kind>` segment is
+hyphenated (`test-run`, not `test_run`) because a DNS label cannot carry an
+underscore. It is a separate Helm release of the project's own chart plus its
+own Ingress, in the same per-project namespace as `primary`; both are removed
+when the job ends, including on failure or cancellation.
+
+Two things have to be true for a preview URL to load, and neither is
+automatic:
+
+1. **The host has to resolve.** This is the one hard prerequisite: every
+   preview host is a *new* hostname, so DNS must answer for all of them. A
+   wildcard DNS record for `*.preview.<domain>` (and for the parent domain) is
+   the normal answer; locally, `APPS_BASE_DOMAIN=127.0.0.1.nip.io` already
+   covers it, because nip.io resolves arbitrarily deep names such as
+   `acme-web-test-run-abc.preview.127.0.0.1.nip.io` to `127.0.0.1`.
+2. **Something has to be serving that host.** The ingress controller must be
+   published on a host port, exactly as for a primary deployment above.
+
+TLS is per preview: each preview's Ingress asks cert-manager for a certificate
+named `<release>-tls`, so the local `selfSigned` issuer works unchanged and no
+wildcard certificate is needed for development. ADR 003 §15 anticipates a
+wildcard certificate for a real deployment instead; on a cluster that has one,
+point previews at it rather than issuing one certificate per run, since a
+public ACME issuer has rate limits that per-run issuance can reach.
+
+A preview shows the project's app **as its chart currently declares it**, not
+the branch under construction: nothing in this system builds or pushes an image
+for a feature branch yet (ADR 003 §12/§14 describe that contract; no code
+implements it). The preview mechanism is the part that exists — dropping a
+branch-built image tag in is the follow-up.
+
+Previews are bounded and self-cleaning, per ADR 003 §17:
+
+- At most `MAX_CONCURRENT_PREVIEWS` (default 3) may be active per project.
+  Beyond that, a preview-eligible job **stays queued** rather than failing or
+  being rejected — admission is enforced when a job is claimed, so the excess
+  job keeps waiting and other jobs (including non-preview kinds) keep flowing.
+- A preview is removed when its job ends. Anything left behind — a crash, a
+  restart mid-job, a failed teardown — is collected by an orphan sweep that
+  runs at startup and every `PREVIEW_SWEEP_INTERVAL` (default 15m), and any
+  preview older than `PREVIEW_TTL` (default 2h) is removed regardless, because
+  a hard-crashed job stays `running` forever and job status alone could never
+  collect its preview.
+- `MAX_CONCURRENT_PREVIEWS=0` disables previews entirely (and with them the
+  queue's admission clause, so the claim query never touches the previews
+  table). That is the supported way to run against a database whose migrations
+  predate `038_job_previews.sql`.
+
+> Note on the meta repo's nginx: its `/preview/<run-id>/` location returns a
+> 503 and is unrelated to this. That location is the **local-dev** path for the
+> Compose nginx, which only routes Yggdrasil's own control-plane services
+> (web/api/landing/docusaurus); ADR 003 §15 keeps preview traffic on the
+> cluster's ingress layer, which is a separate thing entirely.
+
 ## Full stack (recommended)
 
 From the meta repo root, with your cluster already up and registered against

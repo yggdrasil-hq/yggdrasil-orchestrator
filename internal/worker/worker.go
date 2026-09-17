@@ -16,6 +16,7 @@ import (
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/helm"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/k8s"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/messages"
+	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/preview"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/queue"
 	"helm.sh/helm/v3/pkg/chart"
 )
@@ -98,10 +99,24 @@ type Config struct {
 	// deployment's Ingress (ADR 003 §15: <project-slug>.apps.<domain>).
 	// Config values, not code, are what change between a local k3d dev
 	// cluster (Traefik, self-signed cert) and a self-hosted/managed cluster
-	// (ingress-nginx, a real ACME ClusterIssuer).
+	// (ingress-nginx, a real ACME ClusterIssuer). The same values build an
+	// ephemeral preview's Ingress and certificate.
 	AppsDomain       string
 	IngressClassName string
 	CertIssuerName   string
+
+	// MaxConcurrentPreviews caps simultaneously-active ephemeral preview
+	// deployments per project (ADR 003 §17). Zero means the documented
+	// default of 3; a negative value disables previews entirely (and with
+	// them the queue's admission clause, which keeps the claim query free of
+	// any reference to the previews table).
+	MaxConcurrentPreviews int
+
+	// PreviewTTL bounds how long a preview may outlive its job when nothing
+	// else knows the job is gone (default 2h). PreviewSweepInterval is how
+	// often the orphan sweep runs (default 15m).
+	PreviewTTL           time.Duration
+	PreviewSweepInterval time.Duration
 }
 
 // ClusterProvider resolves the Kubernetes client a job should run against,
@@ -163,6 +178,14 @@ func Run(ctx context.Context, q *queue.Queue, cfg Config) {
 	}
 	sem := newLimiter(maxConcurrent)
 
+	// The orphan sweep runs alongside the poll loop rather than inside it:
+	// its job is to collect previews left behind by jobs this replica may
+	// never have seen (ADR 003 §17), which is unrelated to how this replica
+	// is claiming work. The first pass happens immediately, before any job is
+	// claimed — after a restart that is exactly when leftover previews are
+	// most likely to be sitting there.
+	go runPreviewSweeps(ctx, cfg)
+
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
@@ -172,6 +195,27 @@ func Run(ctx context.Context, q *queue.Queue, cfg Config) {
 			return
 		case <-ticker.C:
 			claimAndDispatch(ctx, q, cfg, sem)
+		}
+	}
+}
+
+// runPreviewSweeps performs the orphan sweep once at startup and then on an
+// interval until ctx ends (ADR 003 §17).
+func runPreviewSweeps(ctx context.Context, cfg Config) {
+	if cfg.maxConcurrentPreviews() == 0 {
+		return
+	}
+
+	SweepPreviews(ctx, cfg)
+
+	ticker := time.NewTicker(cfg.previewSweepInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			SweepPreviews(ctx, cfg)
 		}
 	}
 }
@@ -187,7 +231,7 @@ func claimAndDispatch(ctx context.Context, q *queue.Queue, cfg Config, sem limit
 		return
 	}
 
-	job, err := q.Claim(ctx, cfg.WorkerID)
+	job, err := q.Claim(ctx, cfg.WorkerID, previewAdmission(cfg))
 	if err != nil {
 		sem.release()
 		log.Printf("worker %s: claim failed: %v", cfg.WorkerID, err)
@@ -259,6 +303,20 @@ func runInCluster(ctx context.Context, q *queue.Queue, client *k8s.Client, job *
 		return fmt.Errorf("failed to provision namespace: %w", err)
 	}
 
+	// The ephemeral preview exists for the whole job and is removed when this
+	// function returns, however it returns (ADR 003 §10/§15). `defer` is what
+	// covers the failure and cancellation paths as well as success — the run
+	// can unwind from anywhere below, including a ctx cancellation while an
+	// agent session is waiting on a human — so a preview cannot be left behind
+	// by an outcome that was merely unexpected. The sweep in preview.go covers
+	// the cases defer cannot reach at all (a crash, a restart mid-job).
+	//
+	// Created before the agent's env is built so a `test_run`'s PREVIEW_URL
+	// points at a live environment rather than a hostname nothing serves: that
+	// env var has always been set, but until now nothing created the deployment
+	// behind it.
+	livePreview := startJobPreview(ctx, client, job, namespace, cfg)
+	defer livePreview.stop(ctx, client, cfg)
 	if job.Kind == queue.KindDeploy {
 		return runDeploy(ctx, client, job, namespace, cfg)
 	}
@@ -379,12 +437,10 @@ func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]
 			if err != nil {
 				return nil, apiclient.FeatureSpec{}, fmt.Errorf("failed to resolve test preview URL: %w", err)
 			}
-			env["PREVIEW_URL"] = fmt.Sprintf(
-				"https://%s-test-run-%s.preview.%s",
-				slug,
-				job.ID,
-				cfg.AppsDomain,
-			)
+			// The one place the preview URL scheme is spelled (internal/preview),
+			// so this env var and the Ingress a preview creates cannot disagree
+			// about which host the environment is actually on.
+			env["PREVIEW_URL"] = "https://" + preview.Host(slug, job.Kind, job.ID, cfg.AppsDomain)
 		}
 		if job.Kind == queue.KindScriptTestRun {
 			env["SCRIPT_NAME"] = spec.ScriptName

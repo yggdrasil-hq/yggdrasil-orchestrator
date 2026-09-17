@@ -40,6 +40,33 @@ func NewConfiguration(restConfig *rest.Config, namespace string) (*action.Config
 	return cfg, nil
 }
 
+// List returns the names of every release Helm knows about in the
+// Configuration's namespace. Used by the preview orphan sweep, which needs to
+// find ephemeral releases left behind by a job that died before it could tear
+// its own preview down.
+//
+// All namespaces are deliberately not queryable through this: a
+// Configuration is Init'd for exactly one namespace (the project's), which is
+// the only place a project's previews can be.
+func List(ctx context.Context, cfg *action.Configuration) ([]string, error) {
+	_ = ctx
+	list := action.NewList(cfg)
+	// Without this, action.List hides releases in non-deployed states — which
+	// is precisely the case the sweep exists for (a preview left
+	// pending-install or failed by a crash mid-deploy).
+	list.All = true
+	releases, err := list.Run()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list releases: %w", err)
+	}
+
+	names := make([]string, 0, len(releases))
+	for _, rel := range releases {
+		names = append(names, rel.Name)
+	}
+	return names, nil
+}
+
 func Uninstall(ctx context.Context, cfg *action.Configuration, releaseName string) error {
 	_ = ctx
 	uninstall := action.NewUninstall(cfg)

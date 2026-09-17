@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/rpc"
 )
@@ -529,4 +530,109 @@ func (c *Client) PostJobUsage(ctx context.Context, jobID string, usage JobUsage)
 		return fmt.Errorf("API returned status %d posting usage for job %s", resp.StatusCode, jobID)
 	}
 	return nil
+}
+
+// StalePreview is one entry of the API's stale-preview work list (ADR 003
+// §17): a preview the Orchestrator should tear down, either because its job is
+// no longer running or because it has outlived the TTL.
+type StalePreview struct {
+	JobID     string `json:"jobId"`
+	ProjectID string `json:"projectId"`
+	Host      string `json:"host"`
+}
+
+// RegisterPreview records a job's ephemeral preview deployment (ADR 003 §15).
+// Pass a non-empty errMsg when the preview could not be brought up: the API
+// records a failure rather than an active preview, so a broken preview does not
+// occupy one of the project's §17 slots and shows up as failed in the UI
+// instead of silently missing.
+//
+// The API derives the project from the job row, so there is nothing else to
+// send — a caller cannot attribute a preview to another project.
+func (c *Client) RegisterPreview(ctx context.Context, jobID, host, errMsg string) error {
+	body, err := json.Marshal(struct {
+		Host  string `json:"host"`
+		Error string `json:"error,omitempty"`
+	}{Host: host, Error: errMsg})
+	if err != nil {
+		return fmt.Errorf("failed to encode preview: %w", err)
+	}
+
+	reqURL := fmt.Sprintf("%s/internal/jobs/%s/preview", c.baseURL, jobID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("API returned status %d registering preview for job %s", resp.StatusCode, jobID)
+	}
+	return nil
+}
+
+// ReportPreviewTeardown tells the API a job's preview is gone, which is what
+// frees its ADR 003 §17 slot. Idempotent server-side, so the job's own
+// deferred teardown and the orphan sweep can both call it.
+func (c *Client) ReportPreviewTeardown(ctx context.Context, jobID string) error {
+	reqURL := fmt.Sprintf("%s/internal/jobs/%s/preview/teardown", c.baseURL, jobID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("API returned status %d reporting preview teardown for job %s", resp.StatusCode, jobID)
+	}
+	return nil
+}
+
+// FetchStalePreviews returns previews the API considers safe to remove.
+// ttlSeconds bounds how long a preview may outlive its job when nothing else
+// knows the job is gone — a hard-crashed job stays 'running' forever, so job
+// status alone cannot collect its preview.
+func (c *Client) FetchStalePreviews(ctx context.Context, ttlSeconds, limit int) ([]StalePreview, error) {
+	query := url.Values{
+		"ttlSeconds": {strconv.Itoa(ttlSeconds)},
+		"limit":      {strconv.Itoa(limit)},
+	}
+	reqURL := fmt.Sprintf("%s/internal/previews/stale?%s", c.baseURL, query.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API returned status %d fetching stale previews", resp.StatusCode)
+	}
+
+	var parsed struct {
+		Previews []StalePreview `json:"previews"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, fmt.Errorf("failed to decode stale previews response: %w", err)
+	}
+	return parsed.Previews, nil
 }
