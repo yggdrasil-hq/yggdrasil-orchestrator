@@ -43,6 +43,27 @@ const (
 	StatusCancelled JobStatus = "cancelled"
 )
 
+// ConsumesTokens reports whether a job kind spends the organization's model
+// credential, and is therefore governable by a monthly token cap (ADR 030 §2).
+//
+// These are exactly the kinds that resolve a model configuration and run Pi:
+// deploy, script_test_run and rollback are deterministic, so they neither spend
+// tokens nor can be blocked by a spend cap — a project over its model budget
+// must still be able to ship and test its own code.
+//
+// This mirrors the API's own list, which is authoritative: it both defines the
+// rule and evaluates it (the check below is only to avoid asking a question
+// whose answer is always yes). If the two ever disagree, the API's answer is
+// the one that stands.
+func ConsumesTokens(kind JobKind) bool {
+	switch kind {
+	case KindSpecGrill, KindFeatureBuild, KindTestRun, KindAgenticReview, KindDesignGrill:
+		return true
+	default:
+		return false
+	}
+}
+
 // Job mirrors the shape of a row in the API's `jobs` table.
 type Job struct {
 	ID        string

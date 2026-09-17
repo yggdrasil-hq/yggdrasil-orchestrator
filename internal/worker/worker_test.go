@@ -124,7 +124,7 @@ func TestRunDeploy_SurfacesSlugFetchError(t *testing.T) {
 	defer server.Close()
 
 	projectID := "test-" + time.Now().Format("150405")
-	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset.Interface, projectID)
+	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset.Interface, projectID, k8s.DefaultResourceQuota())
 	if err != nil {
 		t.Fatalf("failed to provision namespace: %v", err)
 	}
@@ -476,7 +476,7 @@ func TestRunAgentJob_SpecGrillIncludesFetchedRepoAndTokenEnv(t *testing.T) {
 	defer server.Close()
 
 	projectID := "test-" + time.Now().Format("150405")
-	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset.Interface, projectID)
+	namespace, err := k8s.EnsureProjectNamespace(ctx, clientset.Interface, projectID, k8s.DefaultResourceQuota())
 	if err != nil {
 		t.Fatalf("failed to provision namespace: %v", err)
 	}

@@ -700,3 +700,91 @@ func (c *Client) FetchStalePreviews(ctx context.Context, ttlSeconds, limit int) 
 	}
 	return parsed.Previews, nil
 }
+
+// TokenCapDecision is the API's answer to "may this project run one more
+// job of this kind right now?" (ADR 030 §4).
+//
+// The API owns both halves of the question — the stored cap and the
+// consumption it is measured against — so the Orchestrator never needs to know
+// the cap's period semantics or the usage table's shape. It asks about one job
+// and acts on Allowed.
+type TokenCapDecision struct {
+	Allowed     bool   `json:"allowed"`
+	Cap         *int64 `json:"cap"`
+	UsedTokens  int64  `json:"usedTokens"`
+	Exceeded    bool   `json:"exceeded"`
+	PeriodStart string `json:"periodStart"`
+}
+
+// CheckProjectTokenCap asks whether a job of this kind may run for this
+// project. A cap that does not apply (no cap set, or a kind that consumes no
+// tokens) answers Allowed:true.
+//
+// A failure to reach the API is returned as an error rather than defaulting
+// to "allowed": the caller decides what an unanswerable question means, and
+// silently running unbounded work because a check could not be performed is
+// the one failure mode a spend cap exists to prevent.
+func (c *Client) CheckProjectTokenCap(ctx context.Context, projectID, jobKind string) (*TokenCapDecision, error) {
+	url := fmt.Sprintf("%s/internal/projects/%s/token-cap?kind=%s", c.baseURL, projectID, url.QueryEscape(jobKind))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API returned status %d checking the token cap for project %s", resp.StatusCode, projectID)
+	}
+
+	var parsed TokenCapDecision
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, fmt.Errorf("failed to decode token cap response: %w", err)
+	}
+	return &parsed, nil
+}
+
+// ProjectResourceQuota is a project's effective namespace resource limits
+// (ADR 030 §5), already resolved to concrete numbers by the API — an override
+// where the organization set one, the platform default otherwise — so the
+// Orchestrator applies exactly what an admin sees on /allocations/infra.
+type ProjectResourceQuota struct {
+	CPUmillicores int  `json:"cpuMillicores"`
+	MemoryMiB     int  `json:"memoryMib"`
+	Pods          int  `json:"pods"`
+	FromOverride  bool `json:"fromOverride"`
+}
+
+// FetchProjectResourceQuota fetches the quota to apply to a project's
+// namespace. Callers treat a failure as "use the built-in defaults" rather
+// than failing the job: quota sizing is a guardrail, so a job must not be
+// lost because a limit could not be read (ADR 030 §6).
+func (c *Client) FetchProjectResourceQuota(ctx context.Context, projectID string) (*ProjectResourceQuota, error) {
+	url := fmt.Sprintf("%s/internal/projects/%s/resource-quota", c.baseURL, projectID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API returned status %d fetching the resource quota for project %s", resp.StatusCode, projectID)
+	}
+
+	var parsed ProjectResourceQuota
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, fmt.Errorf("failed to decode resource quota response: %w", err)
+	}
+	return &parsed, nil
+}

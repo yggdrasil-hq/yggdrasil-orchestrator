@@ -16,7 +16,7 @@ func TestEnsureProjectNamespace_Idempotent(t *testing.T) {
 
 	projectID := testProjectID(t)
 
-	ns1, err := k8s.EnsureProjectNamespace(ctx, clientset, projectID)
+	ns1, err := k8s.EnsureProjectNamespace(ctx, clientset, projectID, k8s.DefaultResourceQuota())
 	if err != nil {
 		t.Fatalf("first call failed: %v", err)
 	}
@@ -24,7 +24,7 @@ func TestEnsureProjectNamespace_Idempotent(t *testing.T) {
 		_ = clientset.CoreV1().Namespaces().Delete(context.Background(), ns1, metav1.DeleteOptions{})
 	})
 
-	ns2, err := k8s.EnsureProjectNamespace(ctx, clientset, projectID)
+	ns2, err := k8s.EnsureProjectNamespace(ctx, clientset, projectID, k8s.DefaultResourceQuota())
 	if err != nil {
 		t.Fatalf("second call (should be a no-op) failed: %v", err)
 	}
