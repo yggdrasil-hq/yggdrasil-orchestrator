@@ -149,7 +149,32 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 
 	initialPrompt := buildInitialPrompt(job.Kind, spec)
 
-	return driveAgentSession(ctx, client.Interface, client.Config, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, handle)
+	// ADR 023: once the run is over, ask Pi for its own token/cost accounting
+	// and hand it to the API. Both halves are side channels — a capture or a
+	// post that fails is logged and dropped, never turned into a job failure —
+	// because by this point the job's real outcome (an ADR submitted, a PR
+	// opened, or not) has already been decided and relayed.
+	fetchStats := func(
+		statsCtx context.Context,
+		rpcClient *rpc.Client,
+		statsNamespace, statsPodName string,
+	) (rpc.SessionStats, error) {
+		return fetchSessionStats(statsCtx, client.Interface, client.Config, rpcClient, statsNamespace, statsPodName)
+	}
+	reportUsage := func(stats rpc.SessionStats, turnDuration time.Duration) {
+		usage := usageReportFrom(stats, turnDuration, env)
+		// A background context, like the deferred DeleteJob above, so a
+		// cancellation landing between the stats being read and this post
+		// cannot discard accounting for work the agent already did. (The read
+		// itself is bounded by the session's context, so a cancel that arrives
+		// earlier fails the read instead — this narrow window is the one case
+		// where the post outlives the run.)
+		if err := cfg.APIClient.PostJobUsage(context.Background(), job.ID, usage); err != nil {
+			log.Printf("worker: failed to report usage for job %s: %v", job.ID, err)
+		}
+	}
+
+	return driveAgentSession(ctx, client.Interface, client.Config, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, handle, fetchStats, reportUsage)
 }
 
 func createTestPreview(
@@ -394,6 +419,12 @@ func repoLocalDir(repo apiclient.FeatureSpecRepo) string {
 // always terminal (submit_build_result), with no special-casing needed here
 // to skip it.
 //
+// reportUsage is called once, immediately before the run returns on a
+// terminal event, with Pi's own session accounting (ADR 023) and the
+// cumulative time spent inside turns; fetchStats is how that accounting is
+// obtained. See the call site for why the capture is best-effort and why the
+// duration excludes reply waits.
+//
 // Each turn is its own k8s.Attach call (runTurn), not one continuous attach
 // for the whole session — see k8s.Attach's doc comment for why: client-go's
 // remotecommand doesn't reliably deliver a second stdin write within one
@@ -417,6 +448,8 @@ func driveAgentSession(
 	cancels cancelWatcher,
 	namespace, podName, jobID, initialPrompt string,
 	handle func(rpc.CuratedEvent),
+	fetchStats sessionStatsFetcher,
+	reportUsage func(rpc.SessionStats, time.Duration),
 ) error {
 	rpcClient := rpc.NewClient()
 	defer rpcClient.Close()
@@ -433,13 +466,31 @@ func driveAgentSession(
 	}()
 
 	prompt := initialPrompt
+	// Cumulative time spent inside Pi turns, i.e. the agent actually working.
+	// Deliberately excludes msgs.WaitForReply: a spec_grill can sit idle for
+	// hours waiting on a human, and folding that into "duration" would make
+	// the figure report human latency rather than agent cost (ADR 023).
+	var turnDuration time.Duration
 	for {
+		turnStart := time.Now()
 		curated, err := runTurn(runCtx, clientset, restConfig, rpcClient, namespace, podName, prompt, handle)
+		turnDuration += time.Since(turnStart)
 		if err != nil {
 			return reportSessionError(handle, cancelled.Load(), err)
 		}
 		handle(curated)
 		if curated.Terminal() {
+			// Last chance to read the session's accounting: the Pi process is
+			// about to be deleted along with its pod (runAgentRPCJob's deferred
+			// DeleteJob), and Pi's stdin is per-attach, so there is no asking
+			// afterwards. Best-effort by design — a job that did its real work
+			// must never be reported as failed because a bookkeeping call
+			// didn't land.
+			if stats, statsErr := fetchStats(runCtx, rpcClient, namespace, podName); statsErr != nil {
+				log.Printf("worker: failed to capture token usage for job %s: %v", jobID, statsErr)
+			} else {
+				reportUsage(stats, turnDuration)
+			}
 			if curated.Type == rpc.EventRunFailed {
 				// Unlike reportSessionError's EventRunFailed (a dead
 				// stream/ctx cancellation), this one comes straight from
