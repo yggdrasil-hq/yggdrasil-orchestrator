@@ -69,15 +69,36 @@ type Queue struct {
 	pool *pgxpool.Pool
 }
 
+// Admission carries the per-project preview-cap policy applied when choosing
+// which pending job to claim (ADR 003 §17). Build it with NewAdmission; its
+// zero value — what a caller that doesn't care about previews passes —
+// disables the check entirely.
+type Admission struct {
+	maxPreviews  int
+	previewKinds []string
+}
+
+// NewAdmission builds an Admission policy. maxPreviews <= 0, or an empty kind
+// list, disables the cap — which also keeps the claim query free of any
+// reference to the previews table, so an Orchestrator pointed at a database
+// whose migrations predate that table still claims jobs normally.
+func NewAdmission(maxPreviews int, previewKinds []string) Admission {
+	return Admission{maxPreviews: maxPreviews, previewKinds: previewKinds}
+}
+
+func (a Admission) enabled() bool {
+	return a.maxPreviews > 0 && len(a.previewKinds) > 0
+}
+
 func New(pool *pgxpool.Pool) *Queue {
 	return &Queue{pool: pool}
 }
 
-// Claim atomically picks the oldest pending job and marks it running under
-// this worker's lock. Returns (nil, nil) if there is no pending job — that is
-// the normal "nothing to do" case, not an error.
-func (q *Queue) Claim(ctx context.Context, workerID string) (*Job, error) {
-	row := q.pool.QueryRow(ctx, `
+// claimReturning is the row projection every claim variant must share: it is
+// the full set of columns queue.Job scans.
+const claimReturning = `RETURNING id, project_id, kind, feature_id, test_id, test_group, ref, trigger_source, status, created_at, started_at, target_revision`
+
+const claimSQL = `
 		UPDATE jobs
 		SET status = 'running',
 		    started_at = now(),
@@ -90,9 +111,53 @@ func (q *Queue) Claim(ctx context.Context, workerID string) (*Job, error) {
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
 		)
-		RETURNING id, project_id, kind, feature_id, test_id, test_group, ref, trigger_source, status, created_at, started_at, target_revision
-	`, workerID)
+		` + claimReturning
 
+// claimWithAdmissionSQL is claimSQL plus the ADR 003 §17 preview cap: a
+// preview-eligible job whose project already has the maximum number of active
+// previews is passed over, so the claim selects the oldest *admissible*
+// pending job instead. That is what makes the excess "queue rather than
+// reject" — the skipped job stays `pending` and is claimable the instant a
+// preview slot frees — while later jobs (including non-preview kinds, and
+// preview jobs of other projects) keep flowing.
+//
+// `jobs.project_id` inside the correlated subquery refers to the candidate
+// row, since the subquery's own FROM shadows the UPDATE target.
+const claimWithAdmissionSQL = `
+		UPDATE jobs
+		SET status = 'running',
+		    started_at = now(),
+		    locked_at = now(),
+		    locked_by = $1
+		WHERE id = (
+			SELECT id FROM jobs
+			WHERE status = 'pending'
+			  AND (
+			    NOT (kind = ANY($2::text[]))
+			    OR (
+			      SELECT count(*) FROM job_previews p
+			      WHERE p.project_id = jobs.project_id
+			        AND p.status = 'active'
+			    ) < $3
+			  )
+			ORDER BY created_at ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		` + claimReturning
+
+// Claim atomically picks the oldest admissible pending job and marks it
+// running under this worker's lock. Returns (nil, nil) if there is none —
+// either nothing is pending, or everything pending is waiting on a preview
+// slot — which is the normal "nothing to do" case, not an error.
+func (q *Queue) Claim(ctx context.Context, workerID string, admission Admission) (*Job, error) {
+	if admission.enabled() {
+		return scanClaimed(q.pool.QueryRow(ctx, claimWithAdmissionSQL, workerID, admission.previewKinds, admission.maxPreviews))
+	}
+	return scanClaimed(q.pool.QueryRow(ctx, claimSQL, workerID))
+}
+
+func scanClaimed(row pgx.Row) (*Job, error) {
 	var j Job
 	err := row.Scan(
 		&j.ID, &j.ProjectID, &j.Kind, &j.FeatureID, &j.TestID, &j.TestGroup, &j.Ref, &j.Trigger,

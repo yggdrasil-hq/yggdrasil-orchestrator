@@ -66,6 +66,10 @@ func main() {
 		AppsDomain:        resolveWithDefault("APPS_BASE_DOMAIN", "yggdrasil.local"),
 		IngressClassName:  resolveWithDefault("INGRESS_CLASS_NAME", "traefik"),
 		CertIssuerName:    resolveWithDefault("CERT_ISSUER_NAME", "selfsigned-issuer"),
+
+		MaxConcurrentPreviews: resolveMaxConcurrentPreviews(),
+		PreviewTTL:            resolvePreviewTTL(),
+		PreviewSweepInterval:  resolvePreviewSweepInterval(),
 	})
 
 	mux := http.NewServeMux()
@@ -147,6 +151,52 @@ func resolveMaxConcurrentJobs() int {
 		return 0
 	}
 	return n
+}
+
+// resolveMaxConcurrentPreviews reads the per-project cap on simultaneous
+// ephemeral preview deployments (ADR 003 §17's "initial default: 3").
+//
+// The three cases are deliberately distinct: unset keeps the ADR's default of
+// 3, an explicit 0 disables previews without disabling any other job kind, and
+// a negative value is treated as "off" too. Running with previews off is the
+// supported way to deploy an Orchestrator against a database whose migrations
+// predate the previews table, since the cap is what makes the claim query
+// reference it.
+func resolveMaxConcurrentPreviews() int {
+	raw := os.Getenv("MAX_CONCURRENT_PREVIEWS")
+	if raw == "" {
+		return 0 // worker.Config applies the ADR 003 §17 default
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Printf("invalid MAX_CONCURRENT_PREVIEWS %q, ignoring: %v", raw, err)
+		return 0
+	}
+	return n
+}
+
+// resolvePreviewTTL bounds how long a preview may outlive its job when nothing
+// else knows the job is gone; resolvePreviewSweepInterval is how often the
+// orphan sweep runs. Zero means "use the worker's default".
+func resolvePreviewTTL() time.Duration {
+	return resolveDuration("PREVIEW_TTL")
+}
+
+func resolvePreviewSweepInterval() time.Duration {
+	return resolveDuration("PREVIEW_SWEEP_INTERVAL")
+}
+
+func resolveDuration(envVar string) time.Duration {
+	raw := os.Getenv(envVar)
+	if raw == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		log.Printf("invalid %s %q, ignoring: %v", envVar, raw, err)
+		return 0
+	}
+	return d
 }
 
 // resolveAgentImages reads the per-job-kind agent-images image references
