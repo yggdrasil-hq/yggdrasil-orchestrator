@@ -70,6 +70,7 @@ func main() {
 		MaxConcurrentPreviews: resolveMaxConcurrentPreviews(),
 		PreviewTTL:            resolvePreviewTTL(),
 		PreviewSweepInterval:  resolvePreviewSweepInterval(),
+		RecordingMaxBytes:     resolveRecordingMaxBytes(),
 	})
 
 	mux := http.NewServeMux()
@@ -180,6 +181,29 @@ func resolveMaxConcurrentPreviews() int {
 // orphan sweep runs. Zero means "use the worker's default".
 func resolvePreviewTTL() time.Duration {
 	return resolveDuration("PREVIEW_TTL")
+}
+
+// resolveRecordingMaxBytes bounds the screen recording this replica will
+// collect from a finished test_run pod (ADR 029).
+//
+// Three cases, and the middle one is what makes this different from
+// resolveMaxConcurrentPreviews' "0 means take the default": unset keeps ADR
+// 029's default; an explicit 0 or negative **disables** collection (the
+// supported way to run without the feature, and what a deployment whose API
+// predates the recordings table should set); and an unparseable value falls
+// back to the default rather than to "off", because a typo in an env var must
+// not silently drop every artifact.
+func resolveRecordingMaxBytes() int64 {
+	raw := os.Getenv("RECORDING_MAX_BYTES")
+	if raw == "" {
+		return worker.DefaultRecordingMaxBytes
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		log.Printf("invalid RECORDING_MAX_BYTES %q, using the default: %v", raw, err)
+		return worker.DefaultRecordingMaxBytes
+	}
+	return n
 }
 
 func resolvePreviewSweepInterval() time.Duration {

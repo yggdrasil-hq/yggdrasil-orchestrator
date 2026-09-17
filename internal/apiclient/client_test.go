@@ -1,11 +1,14 @@
 package apiclient_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/apiclient"
@@ -655,6 +658,84 @@ func TestPostJobUsage_ReturnsErrorOnNon201(t *testing.T) {
 
 	client := apiclient.New(server.URL, "test-token")
 	if err := client.PostJobUsage(context.Background(), "job-123", apiclient.JobUsage{}); err == nil {
+		t.Fatal("expected an error for a 500 response, got nil")
+	}
+}
+
+// ADR 029: the recording side channel posts the video itself as the request
+// body, not as JSON, with the same auth as every other internal call.
+func TestPostJobRecording_SendsRawBytesWithBearerToken(t *testing.T) {
+	var gotAuthHeader, gotPath, gotContentType, gotMethod string
+	var gotBody []byte
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthHeader = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		gotContentType = r.Header.Get("Content-Type")
+		gotMethod = r.Method
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	payload := []byte{0x1a, 0x45, 0xdf, 0xa3, 0x00, 0xff}
+	err := client.PostJobRecording(context.Background(), "job-123", "video/webm", payload)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if gotMethod != http.MethodPost {
+		t.Fatalf("expected method %q, got %q", http.MethodPost, gotMethod)
+	}
+	if gotAuthHeader != "Bearer test-token" {
+		t.Fatalf("expected Authorization header %q, got %q", "Bearer test-token", gotAuthHeader)
+	}
+	if gotPath != "/internal/jobs/job-123/recording" {
+		t.Fatalf("expected path %q, got %q", "/internal/jobs/job-123/recording", gotPath)
+	}
+	if gotContentType != "video/webm" {
+		t.Fatalf("expected the video content type, got %q", gotContentType)
+	}
+	// Byte-for-byte: a recording is binary, so any accidental encoding on the
+	// way out (base64, JSON wrapping) would corrupt it silently.
+	if !bytes.Equal(gotBody, payload) {
+		t.Fatalf("expected the raw bytes to survive, got %v", gotBody)
+	}
+}
+
+// A 202 is the API declining to store an artifact (too large, wrong format, or
+// a job kind that does not record). It must read as an error to the caller —
+// which logs it — but crucially NOT as a failure that changes the job's
+// outcome, which is the caller's decision, not this method's.
+func TestPostJobRecording_SurfacesTheAPIsDeclineReason(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"stored":false,"reason":"Recording exceeds the 25 MB limit (30 MB)"}`))
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	err := client.PostJobRecording(context.Background(), "job-123", "video/webm", []byte("x"))
+	if err == nil {
+		t.Fatal("expected an error when the API declines the recording")
+	}
+	// The reason is the actionable part — it is what tells an operator to raise
+	// the cap — so it must survive into the error rather than being flattened.
+	if !strings.Contains(err.Error(), "25 MB") {
+		t.Fatalf("expected the API's reason to be surfaced, got %q", err.Error())
+	}
+}
+
+func TestPostJobRecording_ErrorsOnAnUnexpectedStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	if err := client.PostJobRecording(context.Background(), "job-123", "video/webm", []byte("x")); err == nil {
 		t.Fatal("expected an error for a 500 response, got nil")
 	}
 }

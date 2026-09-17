@@ -540,6 +540,62 @@ func (c *Client) PostJobUsage(ctx context.Context, jobID string, usage JobUsage)
 	return nil
 }
 
+// PostJobRecording uploads a job's screen recording (ADR 029) as the raw
+// bytes, not as JSON.
+//
+// Binary rather than base64-in-JSON because a recording is orders of magnitude
+// larger than every other payload this client sends: base64 would inflate it by
+// a third in transit for no benefit, and the API's JSON body parser has a 2 MB
+// limit that would reject most recordings before the handler ever ran. The API
+// route carries its own raw parser at the recording size cap instead.
+//
+// Like PostJobUsage this is a side channel: the caller decides what an error
+// means, and a failure here must never change the job's outcome. The API
+// answers 202 (not 4xx) for an artifact it declines to store — oversized, wrong
+// format, or a job kind that does not record — so a rejection is reported as a
+// normal error here and logged by the caller rather than treated as a fault. A
+// 201 means stored.
+func (c *Client) PostJobRecording(
+	ctx context.Context,
+	jobID string,
+	contentType string,
+	data []byte,
+) error {
+	url := fmt.Sprintf("%s/internal/jobs/%s/recording", c.baseURL, jobID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", contentType)
+	// The API enforces the authoritative cap; setting a body length lets it
+	// refuse an over-size artifact before buffering rather than mid-stream.
+	req.ContentLength = int64(len(data))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusCreated {
+		return nil
+	}
+	// 202 is the API's "declined, and here is why" — worth surfacing verbatim,
+	// since the reason is what an operator needs to act on (raise the cap, fix
+	// the format) and is not an error in this service.
+	if resp.StatusCode == http.StatusAccepted {
+		var declined struct {
+			Reason string `json:"reason"`
+		}
+		if decodeErr := json.NewDecoder(resp.Body).Decode(&declined); decodeErr == nil && declined.Reason != "" {
+			return fmt.Errorf("API declined the recording for job %s: %s", jobID, declined.Reason)
+		}
+		return fmt.Errorf("API declined the recording for job %s", jobID)
+	}
+	return fmt.Errorf("API returned status %d posting a recording for job %s", resp.StatusCode, jobID)
+}
+
 // StalePreview is one entry of the API's stale-preview work list (ADR 003
 // §17): a preview the Orchestrator should tear down, either because its job is
 // no longer running or because it has outlived the TTL.

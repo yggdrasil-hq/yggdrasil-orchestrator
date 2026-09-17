@@ -24,6 +24,13 @@ import (
 // is a safety net against a hang, not an expected wait.
 const endTurnGrace = 10 * time.Second
 
+// recordingCollectTimeout bounds the ADR 029 read of a finished job's recording
+// out of its pod. Generous relative to endTurnGrace because this moves an
+// artifact up to the recording size cap over the API server's exec stream, on a
+// cluster that may be busy — but bounded all the same, since it runs before the
+// pod is deleted and a wedged exec would otherwise hold teardown open.
+const recordingCollectTimeout = 2 * time.Minute
+
 // errJobCancelled is returned by driveAgentSession (and propagates
 // unwrapped through runAgentRPCJob/runInCluster) when a human asked to
 // stop the run, so runClaimedJob's log line can say "cancelled" instead of
@@ -67,7 +74,17 @@ type cancelWatcher interface {
 // session ends any other way), rather than waiting for Kubernetes to
 // report success.
 func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job *queue.Job, namespace string, cfg Config) error {
+	// ADR 029: the path the agent reported for its screen recording, captured off
+	// the terminal event as it streams past. Held here rather than returned from
+	// driveAgentSession because the artifact must be read *before* the deferred
+	// DeleteJob below destroys the pod, and driveAgentSession has no seam after
+	// its last turn — the recording is collected once the whole session is over.
+	recordingPath := ""
+
 	handle := func(ev rpc.CuratedEvent) {
+		if ev.Type == rpc.EventSubmitTestReport && ev.RecordingPath != "" {
+			recordingPath = ev.RecordingPath
+		}
 		if err := cfg.APIClient.PostJobEvent(ctx, job.ID, ev); err != nil {
 			// A failed relay is a visibility gap, not a job failure: the
 			// job's actual outcome (an ADR submitted, a PR opened, or not)
@@ -174,9 +191,29 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 		}
 	}
 
-	return driveAgentSession(ctx, client.Interface, client.Config, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, handle, fetchStats, reportUsage)
-}
+	err = driveAgentSession(ctx, client.Interface, client.Config, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, handle, fetchStats, reportUsage)
 
+	// ADR 029: collect the recording now — after the session has ended, but
+	// before this function returns and the deferred DeleteJob above destroys the
+	// pod that holds it. `WithoutCancel` on purpose: a run that just finished has
+	// already decided its own outcome, so a shutdown or deadline arriving in this
+	// window must not be what discards an artifact the agent did produce. The
+	// timeout bounds the read so a wedged exec cannot hang teardown.
+	if recordingPath != "" && cfg.RecordingMaxBytes != 0 {
+		collectCtx, cancelCollect := context.WithTimeout(context.WithoutCancel(ctx), recordingCollectTimeout)
+		collectRecording(collectCtx, recordingCollection{
+			read:      podFileReaderFrom(client),
+			api:       cfg.APIClient,
+			jobID:     job.ID,
+			namespace: namespace,
+			podName:   podName,
+			maxBytes:  cfg.RecordingMaxBytes,
+		}, recordingPath)
+		cancelCollect()
+	}
+
+	return err
+}
 func createTestPreview(
 	ctx context.Context,
 	client *k8s.Client,

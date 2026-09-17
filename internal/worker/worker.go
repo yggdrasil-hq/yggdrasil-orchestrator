@@ -80,6 +80,23 @@ type Config struct {
 	// cluster (e.g. a local k3d dev cluster).
 	RuntimeClassName *string
 
+	// RecordingMaxBytes bounds the screen recording the Orchestrator will collect
+	// out of a finished test_run pod and upload (ADR 029). A value <= 0 disables
+	// collection entirely, which is how a deployment that does not want
+	// recordings turns the feature off without touching the API.
+	//
+	// Deliberately unlike MaxConcurrentPreviews' "0 means apply the default"
+	// convention: here 0 is a meaningful, distinct instruction (store nothing),
+	// so the unset case cannot share it. cmd/server/main.go resolves unset and
+	// unparseable values to DefaultRecordingMaxBytes before this struct is built,
+	// which is what leaves 0 free to mean "off".
+	//
+	// Should agree with the API's RECORDING_MAX_BYTES. It is duplicated rather
+	// than fetched because the two sides fail differently and independently: the
+	// Orchestrator's copy avoids moving megabytes to be told no, and the API's is
+	// the authoritative one that a caller cannot lie its way past.
+	RecordingMaxBytes int64
+
 	// APIClient fetches decrypted project secrets at deploy time (ADR 003
 	// §16). Required for `deploy` jobs.
 	APIClient *apiclient.Client
