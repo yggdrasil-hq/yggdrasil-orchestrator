@@ -51,6 +51,21 @@ const (
 // concern, handled separately by runDeploy/EnsureProjectSecret).
 var modelEnvKeys = []string{"MODEL_BASE_URL", "MODEL_API_KEY", "MODEL_ID"}
 
+// modelSessionEnv is the env var this component contributes to the "who is this
+// request for" contract (issue #37). It is a two-part name on purpose:
+//
+//   - this side owns the *value* — the job id, which makes a gateway's cost and
+//     traffic breakdown per-run rather than per-project;
+//   - agent-images owns the *header* the value ends up in
+//     (`x-opencode-session`, declared in `models.json.template`), because the
+//     pod is what actually issues the provider request. The Orchestrator does
+//     not talk to a model provider at all.
+//
+// So the constant here names the env var, not the header. Deliberately not
+// logged: it is not a credential, but there is no reason to put a run
+// identifier into the worker's output either.
+const modelSessionEnv = "MODEL_SESSION_ID"
+
 // Config configures a worker's poll loop.
 type Config struct {
 	WorkerID     string
@@ -435,6 +450,18 @@ func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]
 		"JOB_KIND":   string(job.Kind),
 		"PROJECT_ID": job.ProjectID,
 	}
+
+	// Always set, even with no gateway in front of the provider: sending the
+	// header unconditionally is the safe default (a provider with no use for it
+	// ignores it), whereas the gateway this product is deployed against refuses
+	// a request without it:
+	//
+	//	400 {"type":"MissingSessionID","message":"Error from provider (Console
+	//	     Go): Request is missing x-opencode-session and cannot be routed
+	//	     efficiently."}
+	//
+	// See modelSessionEnv for which side owns what.
+	env[modelSessionEnv] = job.ID
 
 	// Empty for a job with no feature (a scheduled test_run, a deploy, or a
 	// design session — ADR 014 keeps design jobs project-scoped), which makes
