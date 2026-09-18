@@ -57,6 +57,7 @@ func main() {
 		PollInterval:      resolvePollInterval(),
 		MaxConcurrentJobs: resolveMaxConcurrentJobs(),
 		Images:            resolveAgentImages(),
+		ImagePullSecret:   os.Getenv("JOB_IMAGE_PULL_SECRET"),
 		PlaceholderImage:  os.Getenv("JOB_PLACEHOLDER_IMAGE"),
 		PlaceholderScript: os.Getenv("JOB_PLACEHOLDER_SCRIPT"),
 		RuntimeClassName:  resolveRuntimeClassName(),

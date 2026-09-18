@@ -66,6 +66,18 @@ type JobSpec struct {
 	Command   []string
 	Env       map[string]string
 
+	// ImagePullSecret names a docker-config object in the namespace that has to
+	// be presented to pull Image, or "" when the image needs none.
+	//
+	// Set from JOB_IMAGE_PULL_SECRET (issue #29). Without it, the agent images
+	// published to GHCR — private by default (ADR 004) — cannot be pulled on a
+	// cluster that has no credential on the namespace's default service
+	// account, and the operator's only signal was a pod stuck in
+	// ImagePullBackOff. A namespaced credential object does not authenticate
+	// anything on its own: the pod spec or its service account has to name it,
+	// which is what this field exists to do.
+	ImagePullSecret string
+
 	// RuntimeClassName is left nil unless the deployment has a sandboxed
 	// runtime (gVisor/Kata, ADR 003 §6) installed on its nodes — not every
 	// cluster (e.g. a local k3d dev cluster) has one available.
@@ -95,6 +107,15 @@ func buildJob(spec JobSpec) *batchv1.Job {
 	backoffLimit := int32(0)
 	ttlSecondsAfterFinished := int32(300)
 
+	// Only set when named: an empty LocalObjectReference is not a no-op — the
+	// API server rejects `imagePullSecrets: [{}]` as an invalid name, so a
+	// deployment that configured nothing must produce a pod spec that says
+	// nothing.
+	var pullSecrets []corev1.LocalObjectReference
+	if spec.ImagePullSecret != "" {
+		pullSecrets = []corev1.LocalObjectReference{{Name: spec.ImagePullSecret}}
+	}
+
 	resources := spec.Resources
 	if resources == nil {
 		resources = &corev1.ResourceRequirements{
@@ -121,9 +142,10 @@ func buildJob(spec JobSpec) *batchv1.Job {
 				Spec: corev1.PodSpec{
 					RestartPolicy:    corev1.RestartPolicyNever,
 					RuntimeClassName: spec.RuntimeClassName,
+					ImagePullSecrets: pullSecrets,
 					Containers: []corev1.Container{
 						{
-							Name:      "run",
+							Name:      RunContainerName,
 							Image:     spec.Image,
 							Command:   spec.Command,
 							Env:       envVars,
@@ -171,6 +193,13 @@ func RunJob(ctx context.Context, clientset kubernetes.Interface, spec JobSpec) e
 // WaitForJobPod blocks until a Job's pod exists and is running, returning
 // its name. A Job's pod name isn't known until Kubernetes schedules it
 // (unlike a Deployment's fixed name), so Attach needs this first.
+//
+// Returns an `*SetupError` as soon as any of the job's pods reports an image
+// pull failure (issue #29). That check is why this function does not simply
+// block until a deadline in that case: a pod that cannot pull its image stays
+// `Pending` forever, so without it the caller waits out the whole session
+// timeout and then reports "context deadline exceeded" — a message that says
+// nothing about the cause and reads like a hung agent.
 func WaitForJobPod(ctx context.Context, clientset kubernetes.Interface, namespace, jobName string) (string, error) {
 	ticker := time.NewTicker(defaultPollInterval)
 	defer ticker.Stop()
@@ -185,6 +214,9 @@ func WaitForJobPod(ctx context.Context, clientset kubernetes.Interface, namespac
 			})
 			if err != nil {
 				return "", fmt.Errorf("failed to list pods for job %s/%s: %w", namespace, jobName, err)
+			}
+			if failure := ImagePullFailureInPods(pods.Items); failure != nil {
+				return "", failure
 			}
 			for _, pod := range pods.Items {
 				switch pod.Status.Phase {
@@ -215,7 +247,7 @@ func DeleteJob(ctx context.Context, clientset kubernetes.Interface, namespace, n
 }
 
 // PodContainerTerminationReason best-effort describes why the pod's "run"
-// container (buildJob's fixed container name) most recently exited — e.g.
+// container (buildJob's fixed container name — see RunContainerName) most recently exited — e.g.
 // "container exited with code 137 (OOMKilled)" — or "" if the pod is
 // already gone or nothing terminated has been recorded yet. Meant to be
 // called right after an attach stream ends with no error and no
@@ -230,7 +262,7 @@ func PodContainerTerminationReason(ctx context.Context, clientset kubernetes.Int
 		return ""
 	}
 	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.Name != "run" || cs.State.Terminated == nil {
+		if cs.Name != RunContainerName || cs.State.Terminated == nil {
 			continue
 		}
 		t := cs.State.Terminated
@@ -265,6 +297,20 @@ func waitForCompletion(ctx context.Context, clientset kubernetes.Interface, name
 			}
 			if job.Status.Failed > 0 {
 				return fmt.Errorf("job %s/%s failed", namespace, name)
+			}
+
+			// Issue #29: same reason as WaitForJobPod's check — a Job whose pod
+			// cannot pull its image never reaches Succeeded *or* Failed, so
+			// without this the caller blocks until its deadline and reports a
+			// timeout rather than the setup gap that caused it.
+			pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+				LabelSelector: "job-name=" + name,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to list pods for job %s/%s: %w", namespace, name, err)
+			}
+			if failure := ImagePullFailureInPods(pods.Items); failure != nil {
+				return failure
 			}
 		}
 	}

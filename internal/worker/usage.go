@@ -67,7 +67,7 @@ func fetchSessionStats(
 
 	attachErr := make(chan error, 1)
 	go func() {
-		attachErr <- k8s.Attach(attachCtx, clientset, restConfig, namespace, podName, "run", stdin, rpcClient, rpcClient)
+		attachErr <- k8s.Attach(attachCtx, clientset, restConfig, namespace, podName, k8s.RunContainerName, stdin, rpcClient, rpcClient)
 	}()
 
 	if err := rpcClient.Send(rpc.Command{Type: rpc.CommandGetSessionStats}); err != nil {
