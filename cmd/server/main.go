@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/apiclient"
+	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/capabilities"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/messages"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/queue"
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/worker"
@@ -52,11 +53,22 @@ func main() {
 	id := resolveWorkerID()
 	q := queue.New(pool)
 	msgs := messages.New(pool)
+
+	// Issue #63: publish which job kinds this installation can actually run, so
+	// the API stops dispatching the `script_test_run` probes it has no image for.
+	// Started alongside the worker rather than inside it, for the same reason the
+	// worker is: the claim is about the *installation*, not about any one job, and
+	// it must keep being re-asserted while jobs are running. See the package doc
+	// for the channel choice and `DefaultReportInterval` for why this repeats
+	// rather than reporting once.
+	agentImages := resolveAgentImages()
+	go capabilities.New(pool, agentImages, resolveCapabilityReportInterval()).Run(ctx)
+
 	go worker.Run(ctx, q, worker.Config{
 		WorkerID:          id,
 		PollInterval:      resolvePollInterval(),
 		MaxConcurrentJobs: resolveMaxConcurrentJobs(),
-		Images:            resolveAgentImages(),
+		Images:            agentImages,
 		ImagePullSecret:   os.Getenv("JOB_IMAGE_PULL_SECRET"),
 		PlaceholderImage:  os.Getenv("JOB_PLACEHOLDER_IMAGE"),
 		PlaceholderScript: os.Getenv("JOB_PLACEHOLDER_SCRIPT"),
@@ -242,6 +254,19 @@ func resolveScreenshotMaxBytes() int64 {
 
 func resolvePreviewSweepInterval() time.Duration {
 	return resolveDuration("PREVIEW_SWEEP_INTERVAL")
+}
+
+// resolveCapabilityReportInterval reads CAPABILITY_REPORT_INTERVAL, defaulting to
+// `capabilities.DefaultReportInterval` when unset. Zero (the value resolveDuration
+// returns for an unset or unparseable var) is passed through as "use the default"
+// rather than "report never" — there is no useful configuration in which this
+// process should stop telling the API what it can run, and the package's own
+// interval floor is what stops a small value becoming a busy loop.
+func resolveCapabilityReportInterval() time.Duration {
+	if d := resolveDuration("CAPABILITY_REPORT_INTERVAL"); d > 0 {
+		return d
+	}
+	return capabilities.DefaultReportInterval
 }
 
 func resolveDuration(envVar string) time.Duration {
