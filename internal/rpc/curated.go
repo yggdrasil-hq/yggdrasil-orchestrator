@@ -93,6 +93,19 @@ const (
 	// EventSubmitDesign carries the finalized design snapshot and ends the
 	// design_grill session.
 	EventSubmitDesign CuratedEventType = "submit_design"
+	// EventMergeConflicts is synthesized locally (issue #27, ADR 021 follow-up
+	// 1), never translated from Pi: it reports that this build's entrypoint
+	// resolved conflicts between the feature branch and its base before the
+	// agent started, which the agent's own stream has no way to know.
+	//
+	// It exists because a conflict resolution is the highest-risk part of a
+	// build's diff — it is where the agent guessed at how two changes should
+	// coexist, the judgement ADR 021 §9 says cannot be automated — and until
+	// now nothing in the product said one had happened, so a reviewer read the
+	// resolution interleaved with ordinary work with no signal at all.
+	//
+	// Never terminal: it is context for a reviewer, not a result.
+	EventMergeConflicts CuratedEventType = "merge_conflicts"
 )
 
 // CuratedEvent is one product-meaningful event translated from Pi's raw
@@ -102,7 +115,7 @@ type CuratedEvent struct {
 	Question         string // set for EventAskUser
 	Markdown         string // set for EventSubmitADR
 	HasDesignSurface *bool  // set when project_init answers the UI question
-	Message          string // set for EventRunFailed/EventRunCancelled/EventAgentText
+	Message          string // set for EventRunFailed/EventRunCancelled/EventAgentText/EventMergeConflicts
 	Status           string // set for EventSubmitBuildResult: "success" | "failure"
 	PRUrl            string // set for EventSubmitBuildResult on success
 	Summary          string // set for EventSubmitBuildResult

@@ -246,7 +246,18 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 		}
 	}
 
-	err = driveAgentSession(ctx, client.Interface, client.Config, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, handle, fetchStats, reportUsage)
+	// Issue #27: report a conflict resolution this build performed. Wrapped
+	// around the *session's* sink, not the shared `handle`, and deliberately:
+	// the check must not fire on run_started, which is sent before the
+	// entrypoint has necessarily finished merging. Pi cannot produce an event
+	// until the entrypoint exec'd it, which is strictly after the merge, so
+	// tying the one-shot read to the session's first event orders it correctly
+	// by construction rather than by a timeout.
+	sessionHandle := newMergeConflictReporter(
+		client, namespace, podName, job.ID, string(job.Kind), handle,
+	).observe
+
+	err = driveAgentSession(ctx, client.Interface, client.Config, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, sessionHandle, fetchStats, reportUsage)
 
 	// ADR 029: collect the recording now — after the session has ended, but
 	// before this function returns and the deferred DeleteJob above destroys the
