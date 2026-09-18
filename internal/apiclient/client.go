@@ -596,6 +596,71 @@ func (c *Client) PostJobRecording(
 	return fmt.Errorf("API returned status %d posting a recording for job %s", resp.StatusCode, jobID)
 }
 
+// PostJobScreenshot uploads one step's screenshot (issue #22) as the raw bytes,
+// the same binary-over-JSON choice PostJobRecording makes and for the same two
+// reasons: base64 would inflate the image by a third in transit for nothing, and
+// the API's JSON body parser has a 2 MB limit that would reject the larger
+// screenshots before the handler ever ran. The API route carries its own raw
+// parser at the screenshot size cap instead.
+//
+// **The step name is a query parameter, not part of the path**, matching the
+// API's own contract. A step name is a `##` heading from the project's test
+// markdown — arbitrary text, potentially long, and needing URL encoding that a
+// path segment makes awkward to get right for every case. `url.Values` encodes
+// it correctly here without this side having to reason about which characters
+// are safe in a path.
+//
+// Like PostJobUsage and PostJobRecording this is a side channel: the caller
+// decides what an error means, and a failure here must never change the job's
+// outcome. The API answers 202 for an artifact it declines (oversized, wrong
+// format, or a kind that does not report steps) and 400 for a step name it
+// cannot store, so both are surfaced as errors for the caller to log rather than
+// treated as faults. A 201 means stored.
+func (c *Client) PostJobScreenshot(
+	ctx context.Context,
+	jobID, stepName, contentType string,
+	data []byte,
+) error {
+	query := url.Values{"stepName": {stepName}}
+	reqURL := fmt.Sprintf(
+		"%s/internal/jobs/%s/screenshot?%s",
+		c.baseURL, jobID, query.Encode(),
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", contentType)
+	// The API enforces the authoritative cap; setting a body length lets it
+	// refuse an over-size artifact before buffering rather than mid-stream.
+	req.ContentLength = int64(len(data))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusCreated {
+		return nil
+	}
+	// 202 is the API's "declined, and here is why" — worth surfacing verbatim,
+	// since the reason is what an operator needs to act on (raise the cap, fix
+	// the format) and is not an error in this service. The screenshot endpoint's
+	// declines carry the same `reason` field as the recording endpoint's.
+	if resp.StatusCode == http.StatusAccepted {
+		var declined struct {
+			Reason string `json:"reason"`
+		}
+		if decodeErr := json.NewDecoder(resp.Body).Decode(&declined); decodeErr == nil && declined.Reason != "" {
+			return fmt.Errorf("API declined the screenshot for step %q on job %s: %s", stepName, jobID, declined.Reason)
+		}
+		return fmt.Errorf("API declined the screenshot for step %q on job %s", stepName, jobID)
+	}
+	return fmt.Errorf("API returned status %d posting a screenshot for job %s", resp.StatusCode, jobID)
+}
+
 // StalePreview is one entry of the API's stale-preview work list (ADR 003
 // §17): a preview the Orchestrator should tear down, either because its job is
 // no longer running or because it has outlived the TTL.

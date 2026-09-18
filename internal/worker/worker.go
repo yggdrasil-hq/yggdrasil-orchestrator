@@ -130,6 +130,26 @@ type Config struct {
 	// the authoritative one that a caller cannot lie its way past.
 	RecordingMaxBytes int64
 
+	// ScreenshotMaxBytes bounds each step screenshot the Orchestrator will collect
+	// out of a finished job pod and upload (issue #22). A value <= 0 disables
+	// screenshot collection entirely, on the same terms as RecordingMaxBytes: it is
+	// how a deployment that does not want the artifacts turns the feature off
+	// without touching the API.
+	//
+	// Same convention, and same reasoning, as RecordingMaxBytes above — 0 means
+	// "off", not "use the default", so cmd/server/main.go resolves unset and
+	// unparseable values to DefaultScreenshotMaxBytes before this struct is built.
+	//
+	// Should agree with the API's SCREENSHOT_MAX_BYTES (2 MB by default), and is
+	// duplicated for the same reason: this copy avoids shipping bytes only to be
+	// declined, while the API's is the authoritative one.
+	//
+	// Note this is a *per-screenshot* cap, not a per-job one. The API also enforces
+	// a per-job count (SCREENSHOT_MAX_PER_JOB) which is deliberately not mirrored
+	// here — see screenshotCollector's own comment for why a second, silently
+	// divergent bound is worse than a logged decline.
+	ScreenshotMaxBytes int64
+
 	// APIClient fetches decrypted project secrets at deploy time (ADR 003
 	// §16). Required for `deploy` jobs.
 	APIClient *apiclient.Client

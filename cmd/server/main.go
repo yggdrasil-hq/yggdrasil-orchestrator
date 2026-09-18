@@ -72,6 +72,7 @@ func main() {
 		PreviewTTL:            resolvePreviewTTL(),
 		PreviewSweepInterval:  resolvePreviewSweepInterval(),
 		RecordingMaxBytes:     resolveRecordingMaxBytes(),
+		ScreenshotMaxBytes:    resolveScreenshotMaxBytes(),
 
 		// Issue #19: absent by default, so a preview keeps the chart's declared
 		// image on every install that has not opted in. See the field's comment.
@@ -209,6 +210,32 @@ func resolveRecordingMaxBytes() int64 {
 	if err != nil {
 		log.Printf("invalid RECORDING_MAX_BYTES %q, using the default: %v", raw, err)
 		return worker.DefaultRecordingMaxBytes
+	}
+	return n
+}
+
+// resolveScreenshotMaxBytes bounds each step screenshot this replica will collect
+// from a finished job pod (issue #22).
+//
+// Deliberately the same three cases as resolveRecordingMaxBytes above, including
+// the middle one: unset keeps the default, an explicit 0 or negative **disables**
+// collection, and an unparseable value falls back to the default rather than to
+// "off" — a typo in an env var must not silently drop every artifact.
+//
+// The reasoning for a separate knob rather than one shared "artifact size" value
+// is that the two artifacts are three orders of magnitude apart: a size that is
+// sensible for a video (25 MB) would accept anything a screenshot could be, and
+// one sensible for a screenshot (2 MB) would refuse most recordings. They are
+// separate on the API side for the same reason.
+func resolveScreenshotMaxBytes() int64 {
+	raw := os.Getenv("SCREENSHOT_MAX_BYTES")
+	if raw == "" {
+		return worker.DefaultScreenshotMaxBytes
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		log.Printf("invalid SCREENSHOT_MAX_BYTES %q, using the default: %v", raw, err)
+		return worker.DefaultScreenshotMaxBytes
 	}
 	return n
 }
