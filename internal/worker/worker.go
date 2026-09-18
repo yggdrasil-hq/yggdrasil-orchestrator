@@ -167,6 +167,25 @@ type Config struct {
 	// often the orphan sweep runs (default 15m).
 	PreviewTTL           time.Duration
 	PreviewSweepInterval time.Duration
+
+	// ImageRegistry is the registry a preview's image is built and pushed to,
+	// from which the preview's Deployment then pulls (ADR 003 §14: "a bundled
+	// registry alongside the bundled k3s cluster").
+	//
+	// **Empty disables the build entirely**, which is why it defaults to empty
+	// rather than to a guessed in-cluster hostname: with no registry configured
+	// there is nowhere to push and nowhere to pull from, so a preview falls back
+	// to the chart's declared image exactly as it did before this existed. That
+	// makes landing this a no-op for every install that has not opted in, which
+	// matters because a preview that broke on a missing registry would be a
+	// regression in a feature previews do not depend on.
+	ImageRegistry string
+
+	// ImageBuildAuthSecret names a docker-config Secret in the project's namespace
+	// that carries push credentials for ImageRegistry. Empty is correct for the
+	// bundled `registry:2` of ADR 003 §14, which takes unauthenticated pushes
+	// inside the cluster.
+	ImageBuildAuthSecret string
 }
 
 // ClusterProvider resolves the Kubernetes client a job should run against,
@@ -576,13 +595,53 @@ func buildAgentEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]
 // directly, defaulting to main; feature-stage test runs carry a feature_id
 // and target the persisted ref.
 func agentRepoEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]string, apiclient.FeatureSpec, error) {
+	spec, err := fetchJobSpec(ctx, cfg, job)
+	if err != nil {
+		return nil, apiclient.FeatureSpec{}, err
+	}
+
+	targetRepos, err := json.Marshal(spec.Repos)
+	if err != nil {
+		return nil, apiclient.FeatureSpec{}, fmt.Errorf("failed to encode target repos: %w", err)
+	}
+
+	env := map[string]string{
+		"TARGET_REPOS": string(targetRepos),
+		"GITHUB_TOKEN": spec.GithubToken,
+	}
+	if spec.AdrMarkdown != "" {
+		env["ADR_MARKDOWN"] = spec.AdrMarkdown
+	}
+	if spec.Branch != "" {
+		if job.Kind == queue.KindTestRun ||
+			job.Kind == queue.KindScriptTestRun ||
+			job.Kind == queue.KindAgenticReview {
+			env["FEATURE_REF"] = spec.Branch
+		} else {
+			env["FEATURE_BRANCH"] = spec.Branch
+		}
+	}
+	return env, spec, nil
+}
+
+// fetchJobSpec resolves the API payload a job's pod payload is built from — the
+// feature or test it belongs to, the project's linked repositories, and a
+// freshly minted job-scoped GitHub token.
+//
+// Split out of agentRepoEnv for issue #19: the preview's image build needs the
+// same repositories and the same token, and it runs *before* the agent's env is
+// assembled (a preview exists for the whole job, and the build has to finish
+// before the preview is deployed). Duplicating the dispatch below — which has
+// three branches across two job shapes and a design-session special case — would
+// be the kind of copy that drifts the first time a job kind is added.
+func fetchJobSpec(ctx context.Context, cfg Config, job *queue.Job) (apiclient.FeatureSpec, error) {
 	var spec apiclient.FeatureSpec
 	var err error
 	if job.FeatureID == nil {
 		if job.Kind == queue.KindDesignGrill {
 			spec, err = cfg.APIClient.FetchDesignSpec(ctx, job.ProjectID, job.ID)
 		} else if job.Kind != queue.KindTestRun || job.TestID == nil {
-			return nil, apiclient.FeatureSpec{}, fmt.Errorf("job %s (kind=%s) has no feature_id", job.ID, job.Kind)
+			return apiclient.FeatureSpec{}, fmt.Errorf("job %s (kind=%s) has no feature_id", job.ID, job.Kind)
 		} else {
 			ref := "main"
 			if job.Ref != nil && *job.Ref != "" {
@@ -612,31 +671,9 @@ func agentRepoEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]s
 		)
 	}
 	if err != nil {
-		return nil, apiclient.FeatureSpec{}, fmt.Errorf("failed to fetch feature spec: %w", err)
+		return apiclient.FeatureSpec{}, fmt.Errorf("failed to fetch feature spec: %w", err)
 	}
-
-	targetRepos, err := json.Marshal(spec.Repos)
-	if err != nil {
-		return nil, apiclient.FeatureSpec{}, fmt.Errorf("failed to encode target repos: %w", err)
-	}
-
-	env := map[string]string{
-		"TARGET_REPOS": string(targetRepos),
-		"GITHUB_TOKEN": spec.GithubToken,
-	}
-	if spec.AdrMarkdown != "" {
-		env["ADR_MARKDOWN"] = spec.AdrMarkdown
-	}
-	if spec.Branch != "" {
-		if job.Kind == queue.KindTestRun ||
-			job.Kind == queue.KindScriptTestRun ||
-			job.Kind == queue.KindAgenticReview {
-			env["FEATURE_REF"] = spec.Branch
-		} else {
-			env["FEATURE_BRANCH"] = spec.Branch
-		}
-	}
-	return env, spec, nil
+	return spec, nil
 }
 
 // resolveAgentImage returns the image to run for a job kind and the command

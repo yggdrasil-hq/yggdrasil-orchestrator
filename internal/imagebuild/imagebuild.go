@@ -25,7 +25,6 @@
 package imagebuild
 
 import (
-	"context"
 	"fmt"
 	"regexp"
 	"strings"
@@ -66,6 +65,18 @@ const (
 	// ordinary command failure uses by accident.
 	NoDockerfileExitCode = 42
 
+	// RefUnavailableExitCode is what the clone step exits with when the requested
+	// ref is not a branch or tag on the remote yet.
+	//
+	// This is the **common** case rather than an edge one, and it is why the code
+	// exists: a preview is created when a job *starts*, and a `feature_build`'s
+	// branch is not pushed until the agent finishes. So on a feature's first
+	// build the branch genuinely does not exist yet, and on every build of a
+	// feature whose ref was never pushed it never will. Treating that as a build
+	// failure would replace a working preview with a failed-looking one, for a
+	// reason the operator can do nothing about mid-run.
+	RefUnavailableExitCode = 43
+
 	// defaultBuildTimeout bounds one build. A first build of a real application
 	// compiles dependencies and can legitimately take minutes; this is generous
 	// enough for that and still bounds a wedged build, which is what matters —
@@ -94,10 +105,13 @@ func sanitizeName(value string) string {
 }
 
 // sanitizeTag makes a git ref usable as an image tag: a tag may not contain `/`
-// or `:` and must not begin with a separator, so `yggdrasil/feature-abc` has to
-// become something else. Deterministic (the same ref always yields the same tag)
-// so repeated builds of one branch reuse the tag rather than filling the
-// registry with a new one per run.
+// or `:`, so `yggdrasil/feature-abc` has to become something else. Deterministic
+// (the same ref always yields the same tag) so repeated builds of one branch
+// reuse the tag rather than filling the registry with a new one per run.
+//
+// A purely sanitising transform, not a hash: the tag is meant to be readable in
+// a registry listing so an operator can tell which branch an image is, which a
+// digest would defeat.
 func sanitizeTag(ref string) string {
 	tag := regexp.MustCompile(`[^A-Za-z0-9_.-]+`).ReplaceAllString(ref, "-")
 	tag = strings.TrimLeft(tag, "-_.")
@@ -160,7 +174,12 @@ type Config struct {
 	RepoName string
 	// CloneURL is the repository to clone, without the token embedded.
 	CloneURL string
-	// GitRef is the branch, tag or commit the build is of.
+	// GitRef is the branch or tag the build is of. Not a commit: the clone is
+	// shallow and single-ref (`git clone --depth 1 --branch`), which a bare SHA
+	// cannot express without fetching history first. Narrowed deliberately rather
+	// than left as the WIP's "branch, tag or commit" — every caller in this suite
+	// passes a branch, and a ref that is not a branch or tag is reported as
+	// RefUnavailableExitCode rather than failing opaquely.
 	GitRef string
 	// GithubToken authenticates the clone. Required for a private repository.
 	GithubToken string
@@ -238,18 +257,33 @@ func buildJob(cfg Config) *batchv1.Job {
 	// is the only place it appears (a Job's container command is readable by
 	// anyone who can read Jobs in the namespace, which is the same audience that
 	// can read the project's secrets).
+	//
+	// `git ls-remote` runs first, before the clone, so "this ref does not exist on
+	// the remote" is a definite answer rather than a message to pattern-match out
+	// of git's stderr — and so a missing ref costs one cheap round trip instead of
+	// a failed clone. See RefUnavailableExitCode for why it matters.
 	cloneScript := fmt.Sprintf(`
 set -eu
 git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+if ! git ls-remote --exit-code --heads --tags "${CLONE_URL}" "${GIT_REF}" >/dev/null 2>&1; then
+  echo "ref ${GIT_REF} is not a branch or tag on the remote yet"
+  exit %d
+fi
 git clone --depth 1 --branch "${GIT_REF}" "${CLONE_URL}" %s
 git -C %s log -1 --format=%%H > %s/.yggdrasil-commit
-`, buildContextDir, buildContextDir, buildContextDir)
+`, RefUnavailableExitCode, buildContextDir, buildContextDir, buildContextDir)
 
 	// The build container decides for itself whether there is anything to build.
 	// Exiting with NoDockerfileExitCode is how it says "this repository has no
 	// Dockerfile at the contract's path" — a state a freshly scaffolded project
 	// is in, and one the caller must handle by falling back to the chart's image
 	// rather than by failing the job.
+	//
+	// The cache repository is derived with SplitImage rather than by cutting the
+	// destination at its first colon: a registry that carries a port (`reg:5000`)
+	// would otherwise yield a cache repository of just `reg`, pushing cache layers
+	// to a registry that is not the one configured.
+	destinationRepo, _ := SplitImage(cfg.Destination)
 	buildScript := fmt.Sprintf(`
 set -eu
 if [ ! -f "%s/%s" ]; then
@@ -264,7 +298,7 @@ exec /kaniko/executor \
   --cache-repo=%s-cache
 `, buildContextDir, cfg.dockerfilePath(), cfg.dockerfilePath(), NoDockerfileExitCode,
 		buildContextDir, buildContextDir, cfg.dockerfilePath(), cfg.Destination,
-		strings.Split(cfg.Destination, ":")[0])
+		destinationRepo)
 
 	backoffLimit := int32(0)
 	ttl := int32(300)
@@ -299,9 +333,9 @@ exec /kaniko/executor \
 						Resources:    cloneResources(),
 					}},
 					Containers: []corev1.Container{{
-						Name:         "build",
-						Image:        cfg.executorImage(),
-						Command:      []string{"sh", "-c", buildScript},
+						Name:    "build",
+						Image:   cfg.executorImage(),
+						Command: []string{"sh", "-c", buildScript},
 						VolumeMounts: append(
 							[]corev1.VolumeMount{{Name: "build-context", MountPath: buildContextDir}},
 							optionalMount(authMount)...,

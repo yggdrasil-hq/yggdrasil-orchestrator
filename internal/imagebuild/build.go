@@ -19,10 +19,11 @@ const resultPollInterval = 2 * time.Second
 
 // Result is what a build produced.
 type Result struct {
-	// Built is false when the build was deliberately skipped — currently only
-	// for a repository with no Dockerfile at the contract's path. A skipped build
-	// is not a failure: a project that has not added a Dockerfile yet still gets
-	// a preview (of its chart's declared image), and saying so is the honest
+	// Built is false when the build was deliberately skipped — a repository with
+	// no Dockerfile at the contract's path, or a ref that is not on the remote
+	// yet. A skipped build is not a failure: a project that has not added a
+	// Dockerfile still gets a preview (of its chart's declared image), and so does
+	// one whose feature branch has not been pushed. Saying so is the honest
 	// outcome rather than inventing an image reference that does not exist.
 	Built bool
 	// Image is the pushed reference, empty when Built is false.
@@ -59,9 +60,9 @@ func Build(ctx context.Context, cfg Config) (Result, error) {
 // that state into a Result or an error.
 //
 // Reads the *pod's* container status rather than the Job's counters, because the
-// skip case is an exit code (NoDockerfileExitCode) and a Job only reports
-// success/failure. That is also why this does not reuse the k8s package's
-// blocking RunJob, which knows nothing about exit codes.
+// two skip cases are exit codes (NoDockerfileExitCode, RefUnavailableExitCode)
+// and a Job only reports success/failure. That is also why this does not reuse
+// the k8s package's blocking RunJob, which knows nothing about exit codes.
 func awaitResult(
 	ctx context.Context,
 	clientset kubernetes.Interface,
@@ -98,6 +99,17 @@ func awaitResult(
 						Built: false,
 						Reason: "the repository has no " + DefaultDockerfilePath +
 							" at its root (ADR 003 §12), so there is nothing to build",
+					}, nil
+				case RefUnavailableExitCode:
+					// Ordinarily reached because a preview is created before the agent
+					// has pushed the branch it is previewing — see the exit code's own
+					// comment. Not a failure, and deliberately not silent either: the
+					// reason is what tells an operator looking at a preview that shows
+					// the old app whether that is expected or a broken build.
+					return Result{
+						Built: false,
+						Reason: "the ref being previewed is not on the remote yet, so there is " +
+							"nothing to build from; the preview shows the chart's declared image",
 					}, nil
 				default:
 					return Result{}, fmt.Errorf(

@@ -72,6 +72,11 @@ func main() {
 		PreviewTTL:            resolvePreviewTTL(),
 		PreviewSweepInterval:  resolvePreviewSweepInterval(),
 		RecordingMaxBytes:     resolveRecordingMaxBytes(),
+
+		// Issue #19: absent by default, so a preview keeps the chart's declared
+		// image on every install that has not opted in. See the field's comment.
+		ImageRegistry:        os.Getenv("IMAGE_REGISTRY"),
+		ImageBuildAuthSecret: os.Getenv("IMAGE_BUILD_AUTH_SECRET"),
 	})
 
 	mux := http.NewServeMux()
