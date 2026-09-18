@@ -629,3 +629,78 @@ func TestRunRollback_RejectsAJobWithNoTargetRevision(t *testing.T) {
 		t.Fatalf("expected the error to say the target revision is missing, got: %v", err)
 	}
 }
+
+// Issue #37: the pod's models.json declares `x-opencode-session` with this env
+// var's value, so a model gateway can attribute and group the run's traffic.
+// The gateway this product is deployed against refuses a request without the
+// header outright ("Request is missing x-opencode-session and cannot be routed
+// efficiently"), which is what this pins — the value is the job id, so the
+// gateway's breakdown is per-run rather than per-project.
+//
+// The header name itself lives in agent-images/models.json.template, not here:
+// the Orchestrator does not call a model provider, it only supplies the value.
+func TestBuildAgentEnv_SetsTheModelSessionIDToTheJobID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/secrets") {
+			// An empty secret set, so the value can only come from the worker.
+			_ = json.NewEncoder(w).Encode(map[string]any{"secrets": map[string]string{}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"title": "T", "ref": "main"})
+	}))
+	defer server.Close()
+
+	featureID := "11111111-1111-4111-8111-111111111111"
+	job := &queue.Job{
+		ID:        "job-session-1",
+		ProjectID: "proj-1",
+		Kind:      queue.KindSpecGrill,
+		FeatureID: &featureID,
+	}
+	cfg := Config{APIClient: apiclient.New(server.URL, "test-token")}
+
+	env, _, err := buildAgentEnv(context.Background(), cfg, job)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if env[modelSessionEnv] != job.ID {
+		t.Fatalf("expected %s to be the job id %q, got %q", modelSessionEnv, job.ID, env[modelSessionEnv])
+	}
+}
+
+// A project secret named MODEL_SESSION_ID must not be able to override the
+// value: the run's identity is the worker's to set, and a project that could
+// set it could make two different runs look like one to the gateway.
+func TestBuildAgentEnv_ModelSessionIDIsNotOverridableByProjectSecrets(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/secrets") {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"secrets": map[string]string{modelSessionEnv: "spoofed"},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"title": "T", "ref": "main"})
+	}))
+	defer server.Close()
+
+	featureID := "11111111-1111-4111-8111-111111111111"
+	job := &queue.Job{
+		ID:        "job-session-2",
+		ProjectID: "proj-1",
+		Kind:      queue.KindSpecGrill,
+		FeatureID: &featureID,
+	}
+	cfg := Config{APIClient: apiclient.New(server.URL, "test-token")}
+
+	env, _, err := buildAgentEnv(context.Background(), cfg, job)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if env[modelSessionEnv] != job.ID {
+		t.Fatalf("expected the job id to win, got %q", env[modelSessionEnv])
+	}
+}
