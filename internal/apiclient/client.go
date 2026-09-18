@@ -417,20 +417,25 @@ type jobEventRequest struct {
 	// ActionItems is set for request_action_item (ADR 015 item 8 / Track B3):
 	// the needed items the blocked implement skill reported, or the batch
 	// returned by submit_adr.
-	ActionItems      []rpc.RequestedActionItem `json:"actionItems,omitempty"`
-	TestName         string                    `json:"testName,omitempty"`
-	TestStatus       string                    `json:"testStatus,omitempty"`
-	TestDetails      string                    `json:"testDetails,omitempty"`
-	ScreenshotPath   string                    `json:"screenshotPath,omitempty"`
-	Passed           *int                      `json:"passed,omitempty"`
-	Failed           *int                      `json:"failed,omitempty"`
-	Skipped          *int                      `json:"skipped,omitempty"`
-	Total            *int                      `json:"total,omitempty"`
-	CoveragePercent  *float64                  `json:"coveragePercent,omitempty"`
-	FailingTests     []string                  `json:"failingTests,omitempty"`
-	RecordingPath    string                    `json:"recordingPath,omitempty"`
-	Snapshot         map[string]string         `json:"snapshot,omitempty"`
-	HasDesignSurface *bool                     `json:"hasDesignSurface,omitempty"`
+	ActionItems     []rpc.RequestedActionItem `json:"actionItems,omitempty"`
+	TestName        string                    `json:"testName,omitempty"`
+	TestStatus      string                    `json:"testStatus,omitempty"`
+	TestDetails     string                    `json:"testDetails,omitempty"`
+	ScreenshotPath  string                    `json:"screenshotPath,omitempty"`
+	Passed          *int                      `json:"passed,omitempty"`
+	Failed          *int                      `json:"failed,omitempty"`
+	Skipped         *int                      `json:"skipped,omitempty"`
+	Total           *int                      `json:"total,omitempty"`
+	CoveragePercent *float64                  `json:"coveragePercent,omitempty"`
+	FailingTests    []string                  `json:"failingTests,omitempty"`
+	RecordingPath   string                    `json:"recordingPath,omitempty"`
+	// SkipReason is set for submit_test_report when a group was skipped rather
+	// than run: "no_script" or "runner_unavailable" (issue #53). The API's schema
+	// is a closed enum over exactly these two values, so this must stay optional —
+	// absent is the pre-existing behaviour for every runner that does not report it.
+	SkipReason       string            `json:"skipReason,omitempty"`
+	Snapshot         map[string]string `json:"snapshot,omitempty"`
+	HasDesignSurface *bool             `json:"hasDesignSurface,omitempty"`
 }
 
 // PostJobEvent relays one curated event (ADR 006 items 7-8) from a running
@@ -460,6 +465,7 @@ func (c *Client) PostJobEvent(ctx context.Context, jobID string, event rpc.Curat
 		CoveragePercent:  event.CoveragePercent,
 		FailingTests:     event.FailingTests,
 		RecordingPath:    event.RecordingPath,
+		SkipReason:       event.SkipReason,
 		Snapshot:         event.Snapshot,
 		HasDesignSurface: event.HasDesignSurface,
 	})
