@@ -267,9 +267,19 @@ func TestSkipWhenScriptImageUnconfigured_ReportsTheGroupAsSkipped(t *testing.T) 
 		t.Fatalf("expected total=1 (the schema requires total >= passed+failed+skipped), got %v", total)
 	}
 
-	// The summary is the only field that can carry *why*, and the Testing tab
-	// renders it against the run — without it a skipped group is
-	// indistinguishable from a project that has no unit tests.
+	// Issue #53: the *reason* travels as a value, not only as prose. The API's gate
+	// has to decide differently for the two causes of a skip — an install that
+	// cannot run a group means nothing was verified, whereas a repository with no
+	// script has disabled the group by choice — and inferring that from the
+	// summary's words would fail silently in the direction of advancing if the
+	// sentence were ever reworded. So this is the field the gate acts on, and the
+	// summary below is what a human reads.
+	if reason, _ := event["skipReason"].(string); reason != "runner_unavailable" {
+		t.Fatalf("expected skipReason=runner_unavailable, got %#v", event["skipReason"])
+	}
+
+	// The summary carries the same cause for a person looking at the run, and
+	// names the variable to fix.
 	summary, _ := event["summary"].(string)
 	for _, want := range []string{"unit", "SCRIPT_TEST_RUN_IMAGE", "No verification was performed"} {
 		if !strings.Contains(summary, want) {
@@ -281,6 +291,31 @@ func TestSkipWhenScriptImageUnconfigured_ReportsTheGroupAsSkipped(t *testing.T) 
 	// accurate: there are no failing assertions to name.
 	if failures, present := event["failingTests"]; present {
 		t.Fatalf("expected no failingTests for a skipped group, got %#v", failures)
+	}
+}
+
+// The other value of the enum belongs to the runner that actually looked and
+// found no script (agent-images' script_test_run entrypoint). This path only runs
+// when the image for the kind is missing outright, so nothing ever looked — and
+// sending `no_script` here would tell the gate to advance over a group the
+// install could not run, which is the exact bug #53 exists to fix.
+func TestSkipWhenScriptImageUnconfigured_DoesNotClaimTheProjectHasNoScript(t *testing.T) {
+	recorder := newEventRecorder(t)
+	cfg := Config{
+		Images:    map[queue.JobKind]string{},
+		APIClient: recorder.config().APIClient,
+	}
+	captureLog(t)
+
+	if _, err := skipWhenScriptImageUnconfigured(context.Background(), scriptTestJob("unit"), cfg); err != nil {
+		t.Fatalf("expected no error: %v", err)
+	}
+
+	if len(recorder.events) != 1 {
+		t.Fatalf("expected one event, got %d", len(recorder.events))
+	}
+	if reason, _ := recorder.events[0]["skipReason"].(string); reason == "no_script" {
+		t.Fatal("an unconfigured image must not report no_script — that would tell the gate to advance over unverified work")
 	}
 }
 

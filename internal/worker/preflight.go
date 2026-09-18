@@ -45,14 +45,21 @@ resulting skip as a hard error rather than as a pass — is not here; see the is
 // one broken setting from failing every feature in the install. That is the
 // trade-off #44 names explicitly, and this is the shape it recommends.
 //
-// **The report says which cause it was.** `summary` is the only field in the
-// canonical schema that can carry the distinction, and the Testing tab renders
-// it against the run, so an operator looking at a skipped group is told that the
-// installation is missing an image rather than left to infer that a project
-// chose not to have unit tests. `skipped: 1, total: 1` says "one group was there
-// to run and was skipped", which is more accurate than the all-zero report a
-// missing script produces ("there was nothing to run") and still satisfies the
-// schema's `total >= passed+failed+skipped` rule.
+// **The report says which cause it was, as a field and not only in prose**
+// (issue #53). `summary` is what the Testing tab renders against the run, so an
+// operator looking at a skipped group is told the installation is missing an
+// image rather than left to infer that a project chose not to have unit tests.
+// But a sentence is not a value: the API's gate has to *decide* differently for
+// the two causes, and inferring it from the summary's words would fail silently
+// in the direction of advancing if this sentence were ever reworded — the same
+// shape of bug as #21, and the reason #53 put a closed enum on the report. So
+// `skipReason: "runner_unavailable"` carries the cause the gate acts on, and the
+// summary carries the cause a human reads.
+//
+// `skipped: 1, total: 1` says "one group was there to run and was skipped", which
+// is more accurate than the all-zero report a missing script produces ("there was
+// nothing to run") and still satisfies the schema's `total >= passed+failed+skipped`
+// rule.
 //
 // A failed post is logged and not fatal: the caller's job outcome is decided by
 // the report the API already has or does not have, and turning a reporting
@@ -81,6 +88,11 @@ func reportUnrunnableTestGroup(
 		Failed:  &failed,
 		Skipped: &skipped,
 		Total:   &total,
+		// Issue #53: this is the install's fault, not the project's. The API's
+		// gate reads it as `errored` rather than as a pass, so a feature whose
+		// only runs were unconfigurable groups lands on `failed` with the cause
+		// visible — instead of advancing to review having verified nothing.
+		SkipReason: skipReasonRunnerUnavailable,
 		// `FailingTests` is deliberately not set, and cannot be: the relay's
 		// request struct tags it `omitempty`, so an empty slice is dropped on the
 		// wire. That is the right shape here anyway — the API's schema treats the
@@ -92,6 +104,24 @@ func reportUnrunnableTestGroup(
 	}
 	return nil
 }
+
+/*
+skipReasonRunnerUnavailable is the canonical report's value for "the installation
+could not run this group" (issue #53).
+
+A constant rather than a literal at the call site because the spelling is a
+cross-repo contract: the API's schema is a closed enum over `no_script` |
+`runner_unavailable`, and a typo here would be rejected by a CHECK constraint
+deep in the API rather than caught here. Named `skipReason…` to match the field it
+fills, and to distinguish it from the human-readable `cause` string this file's
+callers pass.
+
+The other value, `no_script`, belongs to the runner that looked and found no
+script (agent-images' script_test_run entrypoint) — it is not this file's to
+send, because this file only runs when the image for the kind is missing outright
+and nothing ever looked.
+*/
+const skipReasonRunnerUnavailable = "runner_unavailable"
 
 /*
 skipWhenScriptImageUnconfigured decides whether a `script_test_run` job can run

@@ -135,7 +135,18 @@ type CuratedEvent struct {
 	CoveragePercent *float64
 	FailingTests    []string
 	RecordingPath   string
-	Snapshot        map[string]string
+	// SkipReason is set for EventSubmitTestReport when a group was skipped rather
+	// than run, and says *why*: "no_script" or "runner_unavailable" (issue #53).
+	//
+	// The two causes look identical in the counts — both report
+	// `passed: 0, failed: 0, skipped: 1, total: 1` — but they mean opposite things
+	// to the Testing gate: a project with no test-unit.sh has disabled the group by
+	// its own choice (ADR 015 item 10) and nothing is wrong, whereas an install with
+	// no image for the kind could not run a group it has, so advancing would put a
+	// review over unverified work. Absent means "the runner did not say", which the
+	// API treats exactly as it did before the field existed.
+	SkipReason string
+	Snapshot   map[string]string
 }
 
 // RequestedActionItem is one item feature_build reported it needs via
