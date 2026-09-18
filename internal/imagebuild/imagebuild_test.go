@@ -1,6 +1,8 @@
 package imagebuild
 
 import (
+	"path"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -13,12 +15,15 @@ import (
 )
 
 /*
-Issue #19. The parts of an in-cluster image build that are worth testing are the
-ones that decide *what the cluster is asked to run* and *what a build's outcome
-means* — both of which are pure here, so they are asserted without a cluster.
+Issue #19. The parts of an in-cluster image build that are worth testing here are
+the ones that decide *what the cluster is asked to run* and *what a build's
+outcome means* — both of which are pure, so they are asserted without a cluster.
 
-The parts that genuinely need one (does Kaniko push, does the registry accept the
-push) cannot be covered by these, and are not pretended to be.
+That is not enough on its own, and issue #69 is the proof: a valid Job can
+describe a pod the cluster refuses to create, and every test in this file passed
+while every preview build failed. The cluster-dependent half is covered instead by
+`cluster_test.go`, which is opt-in (it needs a cluster) and asserts the properties
+a spec cannot: that the pod starts, that Kaniko runs, and that the image lands.
 */
 
 // --- naming and references -------------------------------------------------
@@ -179,6 +184,59 @@ func TestSplitImage_LeavesADigestPinnedReferenceVisiblyWrong(t *testing.T) {
 	}
 }
 
+// mustContainer finds a container by name, failing rather than returning a zero
+// value — a test that silently read an empty container would assert nothing.
+func mustContainer(t *testing.T, containers []corev1.Container, name string) corev1.Container {
+	t.Helper()
+	for _, container := range containers {
+		if container.Name == name {
+			return container
+		}
+	}
+	t.Fatalf("no container named %q among %v", name, containers)
+	return corev1.Container{}
+}
+
+func prepareContainer(t *testing.T, job *batchv1.Job) corev1.Container {
+	t.Helper()
+	return mustContainer(t, job.Spec.Template.Spec.InitContainers, prepareContainerName)
+}
+
+func buildContainer(t *testing.T, job *batchv1.Job) corev1.Container {
+	t.Helper()
+	return mustContainer(t, job.Spec.Template.Spec.Containers, buildContainerName)
+}
+
+// prepareScriptOf returns the shell script the context container runs. It is a
+// shell invocation by design — that image has a shell — so the script is the
+// third element of `sh -c <script>`.
+func prepareScriptOf(t *testing.T, job *batchv1.Job) string {
+	t.Helper()
+	command := prepareContainer(t, job).Command
+	if len(command) < 3 {
+		t.Fatalf("expected a shell invocation in the context container, got %v", command)
+	}
+	return command[2]
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasArgPrefix(args []string, prefix string) bool {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // --- the Job the cluster is asked to run ----------------------------------
 
 func baseConfig() Config {
@@ -194,24 +252,24 @@ func baseConfig() Config {
 	}
 }
 
-func TestBuildJob_ClonesBeforeBuilding(t *testing.T) {
+func TestBuildJob_PreparesTheContextBeforeBuilding(t *testing.T) {
 	job := buildJob(baseConfig())
 
 	spec := job.Spec.Template.Spec
 	if len(spec.InitContainers) != 1 {
 		t.Fatalf("expected exactly one init container, got %d", len(spec.InitContainers))
 	}
-	if spec.InitContainers[0].Name != "clone" {
-		t.Fatalf("expected the clone init container, got %q", spec.InitContainers[0].Name)
+	if spec.InitContainers[0].Name != prepareContainerName {
+		t.Fatalf("expected the %s init container, got %q", prepareContainerName, spec.InitContainers[0].Name)
 	}
-	if len(spec.Containers) != 1 || spec.Containers[0].Name != "build" {
+	if len(spec.Containers) != 1 || spec.Containers[0].Name != buildContainerName {
 		t.Fatalf("expected one build container, got %v", spec.Containers)
 	}
 	// The build must not start against a half-populated context; an init
 	// container is Kubernetes' own expression of that ordering, so asserting the
 	// separation is asserting the ordering.
-	if !strings.Contains(spec.InitContainers[0].Command[2], "git clone") {
-		t.Fatalf("expected the init container to clone, got %q", spec.InitContainers[0].Command[2])
+	if !strings.Contains(prepareScriptOf(t, job), "git clone") {
+		t.Fatalf("expected the init container to clone, got %q", prepareScriptOf(t, job))
 	}
 }
 
@@ -219,8 +277,7 @@ func TestBuildJob_ClonesBeforeBuilding(t *testing.T) {
 // and is reported as a skip rather than a build failure — the common case,
 // because a preview is created before a feature branch is pushed.
 func TestBuildJob_ChecksTheRefExistsBeforeCloning(t *testing.T) {
-	job := buildJob(baseConfig())
-	script := job.Spec.Template.Spec.InitContainers[0].Command[2]
+	script := prepareScriptOf(t, buildJob(baseConfig()))
 
 	if !strings.Contains(script, "git ls-remote --exit-code --heads --tags") {
 		t.Fatalf("expected an ls-remote guard before the clone, got %q", script)
@@ -238,8 +295,7 @@ func TestBuildJob_ChecksTheRefExistsBeforeCloning(t *testing.T) {
 // and it must do so through git's URL rewrite (nothing written to a remote)
 // rather than being embedded in the stored origin URL.
 func TestBuildJob_PassesTheTokenThroughGitURLRewrite(t *testing.T) {
-	job := buildJob(baseConfig())
-	init := job.Spec.Template.Spec.InitContainers[0]
+	init := prepareContainer(t, buildJob(baseConfig()))
 
 	if !strings.Contains(init.Command[2], "insteadOf") {
 		t.Fatalf("expected a URL rewrite, got %q", init.Command[2])
@@ -261,14 +317,16 @@ func TestBuildJob_PassesTheTokenThroughGitURLRewrite(t *testing.T) {
 }
 
 func TestBuildJob_BuildsFromTheContractDockerfilePath(t *testing.T) {
-	job := buildJob(baseConfig())
-	script := job.Spec.Template.Spec.Containers[0].Command[2]
+	args := buildContainer(t, buildJob(baseConfig())).Args
 
-	if !strings.Contains(script, "/workspace/Dockerfile") {
-		t.Fatalf("expected the contract's Dockerfile path, got %q", script)
+	if !containsArg(args, "--dockerfile=/workspace/Dockerfile") {
+		t.Fatalf("expected the contract's Dockerfile path, got %v", args)
 	}
-	if !strings.Contains(script, "--destination=registry.local/proj-1/luffy-portfolio:yggdrasil-feature-abc") {
-		t.Fatalf("expected the push destination, got %q", script)
+	if !containsArg(args, "--context=dir:///workspace") {
+		t.Fatalf("expected Kaniko's context to be the cloned directory, got %v", args)
+	}
+	if !containsArg(args, "--destination=registry.local/proj-1/luffy-portfolio:yggdrasil-feature-abc") {
+		t.Fatalf("expected the push destination, got %v", args)
 	}
 }
 
@@ -279,20 +337,29 @@ func TestBuildJob_DerivesTheCacheRepoWithoutBreakingARegistryPort(t *testing.T) 
 	cfg := baseConfig()
 	cfg.Destination = "registry.local:5000/proj-1/repo:main"
 
-	script := buildJob(cfg).Spec.Template.Spec.Containers[0].Command[2]
+	args := buildContainer(t, buildJob(cfg)).Args
 
-	if !strings.Contains(script, "--cache-repo=registry.local:5000/proj-1/repo-cache") {
-		t.Fatalf("expected the cache repo to keep the registry port, got %q", script)
+	if !containsArg(args, "--cache-repo=registry.local:5000/proj-1/repo-cache") {
+		t.Fatalf("expected the cache repo to keep the registry port, got %v", args)
 	}
 }
 
 // A missing Dockerfile is a skip, not a failure: a freshly scaffolded project
 // has none, and its preview should still work.
+//
+// The check lives in the *context* container, not the build container, because
+// the build container has no shell to run it with (issue #69) — asserting the
+// container it lives in is therefore part of asserting the fix.
 func TestBuildJob_ReportsAMissingDockerfileWithItsOwnExitCode(t *testing.T) {
-	script := buildJob(baseConfig()).Spec.Template.Spec.Containers[0].Command[2]
+	script := prepareScriptOf(t, buildJob(baseConfig()))
 
 	if !strings.Contains(script, "exit 42") {
 		t.Fatalf("expected the no-Dockerfile exit code, got %q", script)
+	}
+	// After the clone, necessarily: the file being checked is the one the clone
+	// just wrote, so a check before it would always report "no Dockerfile".
+	if strings.Index(script, "exit 42") < strings.Index(script, "git clone") {
+		t.Fatalf("expected the Dockerfile check after the clone, got %q", script)
 	}
 }
 
@@ -300,10 +367,143 @@ func TestBuildJob_HonoursAConfiguredDockerfilePath(t *testing.T) {
 	cfg := baseConfig()
 	cfg.DockerfilePath = "build/Dockerfile"
 
-	script := buildJob(cfg).Spec.Template.Spec.Containers[0].Command[2]
+	job := buildJob(cfg)
 
-	if !strings.Contains(script, "/workspace/build/Dockerfile") {
-		t.Fatalf("expected the configured path, got %q", script)
+	if !containsArg(buildContainer(t, job).Args, "--dockerfile=/workspace/build/Dockerfile") {
+		t.Fatalf("expected the configured path in Kaniko's args, got %v", buildContainer(t, job).Args)
+	}
+	// And in the guard, which is what actually decides whether to build: a guard
+	// still looking for the default path would report a skip for a repository
+	// that has a Dockerfile.
+	if !strings.Contains(prepareScriptOf(t, job), "/workspace/build/Dockerfile") {
+		t.Fatalf("expected the configured path in the guard, got %q", prepareScriptOf(t, job))
+	}
+}
+
+// --- the invariant issue #69 broke -----------------------------------------
+
+/*
+The build container used to be configured as `sh -c <script>` against Kaniko's
+executor image, which is distroless. Nothing asserted that the container this code
+described could actually *start*, so it produced valid YAML describing a pod that
+runc refused to create:
+
+	StartError: exec: "sh": executable file not found in $PATH
+
+Every preview image build failed that way, for every repository, whatever its
+Dockerfile — and the suite passed, because those tests assert the Job's serialised
+shape, and a command that cannot run round-trips perfectly well.
+
+The tests below assert the *property* instead: that no container here invokes a
+shell its image does not have. That is checkable without a cluster, because which
+images carry a shell is a fact about the images — which is why it is written down
+in one place, next to the containers it governs.
+*/
+
+// shellCapableImages records, for the images this package uses by default,
+// whether the image contains a shell.
+//
+// A hand-maintained table rather than a probe: proving it at test time means
+// pulling the image, which a unit test cannot do, and the answer for a pinned tag
+// does not change. An image that is *not* in this table is treated as *unknown*
+// rather than as shell-less, so introducing one forces a decision rather than
+// silently inheriting a guess in either direction.
+var shellCapableImages = map[string]bool{
+	// Alpine-based, which is why it is the context image. It runs the guards a
+	// shell-less image cannot.
+	DefaultCloneImage: true,
+	// Distroless, deliberately: the executor, and nothing else. The finding in
+	// issue #69.
+	DefaultExecutorImage: false,
+}
+
+// usesShellInvocation reports whether a container is configured to run a shell as
+// its command.
+func usesShellInvocation(container corev1.Container) bool {
+	if len(container.Command) == 0 {
+		return false
+	}
+	switch path.Base(container.Command[0]) {
+	case "sh", "bash", "ash", "dash":
+		return true
+	}
+	return false
+}
+
+func TestBuildJob_NoContainerInvokesAShellItsImageLacks(t *testing.T) {
+	job := buildJob(baseConfig())
+
+	containers := append(
+		append([]corev1.Container{}, job.Spec.Template.Spec.InitContainers...),
+		job.Spec.Template.Spec.Containers...,
+	)
+
+	for _, container := range containers {
+		if !usesShellInvocation(container) {
+			continue
+		}
+		capable, known := shellCapableImages[container.Image]
+		if !known {
+			t.Fatalf(
+				"container %q invokes a shell against image %q, and this test does not know whether that image has one; "+
+					"either use a shell-less invocation or record the image in shellCapableImages",
+				container.Name, container.Image,
+			)
+		}
+		if !capable {
+			t.Fatalf(
+				"container %q invokes a shell, but image %q has none — this is the issue #69 failure "+
+					"(StartError: exec: \"sh\": executable file not found in $PATH)",
+				container.Name, container.Image,
+			)
+		}
+	}
+}
+
+// The fix itself: Kaniko is driven through its own CLI, so nothing about the
+// build container depends on a shell existing.
+func TestBuildJob_RunsKanikoDirectlyWithoutAShell(t *testing.T) {
+	build := buildContainer(t, buildJob(baseConfig()))
+
+	if usesShellInvocation(build) {
+		t.Fatalf("expected a direct invocation, got a shell: %v", build.Command)
+	}
+	if len(build.Command) != 1 || build.Command[0] != kanikoExecutorPath {
+		t.Fatalf("expected exactly [%q], got %v", kanikoExecutorPath, build.Command)
+	}
+
+	// Every argument the wrapper script used to pass has to survive the move to
+	// Args. A dropped one would leave a build that starts and then silently does
+	// the wrong thing — no cache, or worse, no destination.
+	want := []string{
+		"--context=dir:///workspace",
+		"--dockerfile=/workspace/Dockerfile",
+		"--destination=registry.local/proj-1/luffy-portfolio:yggdrasil-feature-abc",
+		"--cache=true",
+		"--cache-repo=registry.local/proj-1/luffy-portfolio-cache",
+	}
+	if len(build.Args) != len(want) {
+		t.Fatalf("expected %d args, got %d: %v", len(want), len(build.Args), build.Args)
+	}
+	for _, arg := range want {
+		if !containsArg(build.Args, arg) {
+			t.Fatalf("expected %q among %v", arg, build.Args)
+		}
+	}
+}
+
+// The context container is the other half of the same invariant, stated
+// positively: it *does* rely on a shell, so its image must provide one. Stated
+// separately from the table above because it is the reason the Dockerfile guard
+// could move here at all.
+func TestBuildJob_TheContextStepInvokesAShellItsImageProvides(t *testing.T) {
+	prepare := prepareContainer(t, buildJob(baseConfig()))
+
+	if !usesShellInvocation(prepare) {
+		t.Fatalf("expected the context container's guards to run in a shell, got %v", prepare.Command)
+	}
+	if !shellCapableImages[prepare.Image] {
+		t.Fatalf("expected a shell-capable image, got %q", prepare.Image)
 	}
 }
 
@@ -318,7 +518,7 @@ func TestBuildJob_OmitsRegistryAuthWhenNoSecretIsConfigured(t *testing.T) {
 			t.Fatalf("expected no registry-auth volume, got %v", job.Spec.Template.Spec.Volumes)
 		}
 	}
-	for _, mount := range job.Spec.Template.Spec.Containers[0].VolumeMounts {
+	for _, mount := range buildContainer(t, job).VolumeMounts {
 		if mount.Name == "registry-auth" {
 			t.Fatal("expected no registry-auth mount")
 		}
@@ -345,7 +545,7 @@ func TestBuildJob_MountsRegistryAuthAtTheDockerConfigPath(t *testing.T) {
 	}
 	// Kaniko reads push credentials from the standard docker config path, so a
 	// mount anywhere else would be a build that silently cannot push.
-	for _, mount := range job.Spec.Template.Spec.Containers[0].VolumeMounts {
+	for _, mount := range buildContainer(t, job).VolumeMounts {
 		if mount.Name == "registry-auth" && mount.MountPath != "/kaniko/.docker" {
 			t.Fatalf("expected /kaniko/.docker, got %q", mount.MountPath)
 		}
@@ -423,15 +623,17 @@ func TestBuildOutcome_ReportsTheBuildContainersExitCode(t *testing.T) {
 	}
 }
 
-// A clone failure is the most likely reason a real build does not start (a token
-// that cannot read the repository, or a ref that does not exist), so the
-// outcome has to name the clone rather than reporting a bare build failure.
-func TestBuildOutcome_AttributesAFailureToTheCloneStep(t *testing.T) {
+// A context-preparation failure is the most likely reason a real build does not
+// start (a token that cannot read the repository, or a ref that does not exist),
+// so the outcome has to name that step rather than reporting a bare build
+// failure. The read order matters: the pods above assert which container the
+// outcome is attributed to, so the name here has to match buildJob's.
+func TestBuildOutcome_AttributesAFailureToTheContextStep(t *testing.T) {
 	pod := corev1.Pod{
 		Status: corev1.PodStatus{
 			Phase: corev1.PodFailed,
 			InitContainerStatuses: []corev1.ContainerStatus{{
-				Name: "clone",
+				Name: prepareContainerName,
 				State: corev1.ContainerState{
 					Terminated: &corev1.ContainerStateTerminated{ExitCode: 128, Reason: "Error"},
 				},
@@ -443,19 +645,23 @@ func TestBuildOutcome_AttributesAFailureToTheCloneStep(t *testing.T) {
 	if !done {
 		t.Fatal("expected a terminal outcome")
 	}
-	if !strings.Contains(outcome.reason, "clone") {
-		t.Fatalf("expected the clone named as the cause, got %q", outcome.reason)
+	if outcome.exitCode != 128 {
+		t.Fatalf("expected the context container's exit code, got %d", outcome.exitCode)
+	}
+	if !strings.Contains(outcome.reason, "context") {
+		t.Fatalf("expected the context step named as the cause, got %q", outcome.reason)
 	}
 }
 
-// A clone that succeeded is not an outcome — something else has to decide the
-// build's fate, so the init status must not be mistaken for the build's.
-func TestBuildOutcome_IgnoresASuccessfulClone(t *testing.T) {
+// A context container that succeeded is not an outcome — something else has to
+// decide the build's fate, so its init status must not be mistaken for the
+// build's.
+func TestBuildOutcome_IgnoresASuccessfulContextStep(t *testing.T) {
 	pod := corev1.Pod{
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
 			InitContainerStatuses: []corev1.ContainerStatus{{
-				Name: "clone",
+				Name: prepareContainerName,
 				State: corev1.ContainerState{
 					Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Reason: "Completed"},
 				},
@@ -521,15 +727,16 @@ func TestConfig_KeepsExplicitValues(t *testing.T) {
 
 // --- the Job survives serialization ---------------------------------------
 
-// The tests above assert *strings* inside the Job's command. This asserts the
+// The tests above assert *strings and arguments* inside the Job. This asserts the
 // object itself is a well-formed `batch/v1` Job that survives being written and
 // read back — which is what the API server does with it, and the closest thing to
-// cluster validation reachable from here (the sandbox has neither a registry nor
-// permission to create Jobs; see the issue).
+// cluster validation reachable from the default suite (which has no cluster).
 //
 // Deliberately not a substitute for a real build: it cannot say whether Kaniko
 // can push, whether the registry accepts the push, or whether the pod is
-// schedulable.
+// schedulable. `cluster_test.go` covers those, opt-in, against a real cluster —
+// and the fact that this test passed while the build container could not start
+// (issue #69) is why that file exists.
 func TestBuildJob_RoundTripsThroughSerialization(t *testing.T) {
 	cfg := baseConfig()
 	cfg.RegistryAuthSecret = "registry-push"
@@ -572,14 +779,28 @@ func TestBuildJob_RoundTripsThroughSerialization(t *testing.T) {
 			len(decoded.Spec.Template.Spec.InitContainers), len(decoded.Spec.Template.Spec.Containers))
 	}
 
-	// The scripts are multi-line with backslash continuations, so they are the
-	// part most likely to be mangled by encoding — and a mangled Kaniko
-	// invocation would surface only as a failed build in a cluster.
-	if decoded.Spec.Template.Spec.Containers[0].Command[2] != original.Spec.Template.Spec.Containers[0].Command[2] {
-		t.Fatal("the build script did not survive serialization")
+	// The context script is multi-line with shell metacharacters and a `%H` format
+	// specifier, so it is the part most likely to be mangled by encoding.
+	if decoded.Spec.Template.Spec.InitContainers[0].Command[2] != original.Spec.Template.Spec.InitContainers[0].Command[2] {
+		t.Fatal("the context script did not survive serialization")
 	}
-	if !strings.Contains(decoded.Spec.Template.Spec.Containers[0].Command[2], "--destination=") {
-		t.Fatalf("expected the Kaniko invocation intact, got %q", decoded.Spec.Template.Spec.Containers[0].Command[2])
+
+	// The build container's invocation is an argv rather than a script (issue
+	// #69), so what has to survive is the array itself: a dropped argument would
+	// leave a build that starts and then does the wrong thing — no `--destination`,
+	// say, or a cache written somewhere unintended.
+	decodedBuild := decoded.Spec.Template.Spec.Containers[0]
+	originalBuild := original.Spec.Template.Spec.Containers[0]
+	if !reflect.DeepEqual(decodedBuild.Command, originalBuild.Command) {
+		t.Fatalf("the executor command did not survive: %v became %v", originalBuild.Command, decodedBuild.Command)
+	}
+	if !reflect.DeepEqual(decodedBuild.Args, originalBuild.Args) {
+		t.Fatalf("the executor args did not survive: %v became %v", originalBuild.Args, decodedBuild.Args)
+	}
+	for _, prefix := range []string{"--context=", "--dockerfile=", "--destination=", "--cache-repo="} {
+		if !hasArgPrefix(decodedBuild.Args, prefix) {
+			t.Fatalf("expected an argument starting with %q after serialization, got %v", prefix, decodedBuild.Args)
+		}
 	}
 
 	// The auth volume is what would silently break a push if it were dropped:
