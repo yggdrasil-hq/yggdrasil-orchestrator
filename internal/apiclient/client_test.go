@@ -739,3 +739,169 @@ func TestPostJobRecording_ErrorsOnAnUnexpectedStatus(t *testing.T) {
 		t.Fatal("expected an error for a 500 response, got nil")
 	}
 }
+
+/*
+Issue #22: the screenshot upload. The step name travels as a query parameter
+because a step is a `##` heading from the project's own test markdown — arbitrary
+text, potentially long — so the encoding is the risky part of this method and is
+what these tests pin.
+*/
+
+func TestPostJobScreenshot_SendsRawBytesWithTheStepNameEncoded(t *testing.T) {
+	var gotAuthHeader, gotPath, gotContentType, gotStepName, gotRawQuery, gotMethod string
+	var gotBody []byte
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthHeader = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		gotRawQuery = r.URL.RawQuery
+		gotStepName = r.URL.Query().Get("stepName")
+		gotContentType = r.Header.Get("Content-Type")
+		gotMethod = r.Method
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	payload := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}
+
+	// A step name carrying the characters a heading really can: spaces, a
+	// slash, an ampersand and a `#`. All of them must survive, because the step
+	// name is the API's identity for the row and a mangled one would store the
+	// screenshot against a step that does not exist.
+	const stepName = "opens checkout & pays: step 2/3 #happy-path"
+	if err := client.PostJobScreenshot(context.Background(), "job-123", stepName, "image/png", payload); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if gotMethod != http.MethodPost {
+		t.Fatalf("expected method %q, got %q", http.MethodPost, gotMethod)
+	}
+	if gotAuthHeader != "Bearer test-token" {
+		t.Fatalf("expected Authorization header %q, got %q", "Bearer test-token", gotAuthHeader)
+	}
+	if gotPath != "/internal/jobs/job-123/screenshot" {
+		t.Fatalf("expected path %q, got %q", "/internal/jobs/job-123/screenshot", gotPath)
+	}
+	if gotStepName != stepName {
+		t.Fatalf("expected the step name to round-trip %q, got %q", stepName, gotStepName)
+	}
+	// The name must be in the query, not smuggled into the path: a `/` in a
+	// heading would otherwise become a path separator and 404.
+	if !strings.Contains(gotRawQuery, "stepName=") {
+		t.Fatalf("expected stepName in the query string, got %q", gotRawQuery)
+	}
+	if gotContentType != "image/png" {
+		t.Fatalf("expected the image content type, got %q", gotContentType)
+	}
+	// Byte-for-byte: a screenshot is binary, so any accidental encoding on the way
+	// out (base64, JSON wrapping) would corrupt it silently.
+	if !bytes.Equal(gotBody, payload) {
+		t.Fatalf("expected the raw bytes to survive, got %v", gotBody)
+	}
+}
+
+// A step name with a `/` must not become a path separator — the single case where
+// a query parameter and a path segment genuinely differ.
+func TestPostJobScreenshot_ASlashInTheStepNameStaysInTheQuery(t *testing.T) {
+	var gotPath, gotStepName string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotStepName = r.URL.Query().Get("stepName")
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	if err := client.PostJobScreenshot(context.Background(), "job-1", "runs/lints", "image/png", []byte("x")); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if gotPath != "/internal/jobs/job-1/screenshot" {
+		t.Fatalf("expected the step name not to reach the path, got %q", gotPath)
+	}
+	if gotStepName != "runs/lints" {
+		t.Fatalf("expected the step name intact, got %q", gotStepName)
+	}
+}
+
+// A 202 is the API declining to store an artifact (too large, wrong format, or a
+// job kind that does not report steps). It must read as an error to the caller —
+// which logs it — but NOT as a failure that changes the job's outcome, which is
+// the caller's decision, not this method's.
+func TestPostJobScreenshot_SurfacesTheAPIsDeclineReason(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"stored":false,"reason":"Screenshot exceeds the 2000000 byte limit"}`))
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	err := client.PostJobScreenshot(context.Background(), "job-123", "step", "image/png", []byte("x"))
+	if err == nil {
+		t.Fatal("expected an error when the API declines the screenshot")
+	}
+	// The reason is the actionable part — it is what tells an operator to raise
+	// the cap — so it must survive into the error rather than being flattened.
+	if !strings.Contains(err.Error(), "2000000 byte limit") {
+		t.Fatalf("expected the API's reason to be surfaced, got %q", err.Error())
+	}
+	// And the step must be named, so a run with many steps says which one failed.
+	if !strings.Contains(err.Error(), `"step"`) {
+		t.Fatalf("expected the step name in the error, got %q", err.Error())
+	}
+}
+
+// A 400 is the API's answer to a step name it cannot store (empty, or beyond its
+// length limit). Surfaced like the decline — logged by the caller, non-fatal —
+// rather than silently swallowed, since it means a screenshot was not stored.
+func TestPostJobScreenshot_ErrorsOnARejectedStepName(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	if err := client.PostJobScreenshot(context.Background(), "job-123", "", "image/png", []byte("x")); err == nil {
+		t.Fatal("expected an error for a 400 response, got nil")
+	}
+}
+
+func TestPostJobScreenshot_ErrorsOnAnUnexpectedStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	if err := client.PostJobScreenshot(context.Background(), "job-123", "step", "image/png", []byte("x")); err == nil {
+		t.Fatal("expected an error for a 500 response, got nil")
+	}
+}
+
+// The API's route is mounted at a path the Orchestrator must match exactly; a
+// typo here would 404 on every upload and the failure would look like a missing
+// endpoint rather than a client bug.
+func TestPostJobScreenshot_UsesTheDocumentedRoute(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	if err := client.PostJobScreenshot(context.Background(), "job-abc", "s", "image/webp", []byte("x")); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if gotPath != "/internal/jobs/job-abc/screenshot" {
+		t.Fatalf("unexpected route %q", gotPath)
+	}
+	// Sanity: the recording endpoint is a path sibling, not the same path.
+	if strings.Contains(gotPath, "recording") {
+		t.Fatalf("screenshot upload must not target the recording route, got %q", gotPath)
+	}
+}

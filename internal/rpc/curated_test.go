@@ -392,3 +392,75 @@ func TestRunStartedIsNotTerminal(t *testing.T) {
 		t.Fatal("expected EventRunStarted not to be terminal — it only signals the pod is up, the run has barely begun")
 	}
 }
+
+/*
+Issue #22: `report_test_step` carries the screenshot the step produced, which is
+what the Orchestrator reads out of the pod and uploads. The wiring was untested
+before this — the field existed only for the API's benefit — and a typo in either
+the JSON tag or the mapping would make screenshot collection a silent no-op while
+every test for the collection itself still passed.
+*/
+
+func TestTranslate_ReportTestStepCarriesTheScreenshotPath(t *testing.T) {
+	ev := rawEvent(t, `{"type":"tool_execution_end","toolName":"report_test_step","result":{"details":{"kind":"report_test_step","name":"opens checkout","status":"pass","details":"went fine","screenshotPath":"/workspace/.yggdrasil/screenshots/step-1.png"}}}`)
+
+	curated, ok := rpc.Translate(ev)
+	if !ok {
+		t.Fatal("expected report_test_step to be curated")
+	}
+	if curated.Type != rpc.EventReportTestStep {
+		t.Fatalf("expected type %q, got %q", rpc.EventReportTestStep, curated.Type)
+	}
+	// The step name is the API's identity for a screenshot, and the path is what
+	// gets read out of the pod. Both must arrive, or the upload either targets the
+	// wrong step or reads nothing.
+	if curated.TestName != "opens checkout" {
+		t.Fatalf("expected the step name to be carried through, got %q", curated.TestName)
+	}
+	if curated.ScreenshotPath != "/workspace/.yggdrasil/screenshots/step-1.png" {
+		t.Fatalf("expected the screenshot path to be carried through, got %q", curated.ScreenshotPath)
+	}
+	if curated.TestStatus != "pass" {
+		t.Fatalf("expected the status to be carried through, got %q", curated.TestStatus)
+	}
+	if curated.Terminal() {
+		t.Fatal("expected report_test_step not to be terminal — it is progress, not a result")
+	}
+}
+
+// A step that reported no screenshot is the common case (a project need not
+// capture any), and must translate cleanly with an empty path rather than being
+// dropped or erroring — the collector treats an empty path as "nothing to read".
+func TestTranslate_ReportTestStepWithoutAScreenshotIsStillCurated(t *testing.T) {
+	ev := rawEvent(t, `{"type":"tool_execution_end","toolName":"report_test_step","result":{"details":{"kind":"report_test_step","name":"runs lints","status":"fail"}}}`)
+
+	curated, ok := rpc.Translate(ev)
+	if !ok {
+		t.Fatal("expected report_test_step to be curated even with no screenshot")
+	}
+	if curated.TestName != "runs lints" {
+		t.Fatalf("expected the step name to survive, got %q", curated.TestName)
+	}
+	if curated.ScreenshotPath != "" {
+		t.Fatalf("expected an empty screenshot path, got %q", curated.ScreenshotPath)
+	}
+}
+
+// The default apiUrl-less form: a step name long enough to matter for the API's
+// 1-256 limit must survive translation intact, since truncating it here would
+// store the screenshot against a step name the API does not know.
+func TestTranslate_ReportTestStepKeepsALongStepNameIntact(t *testing.T) {
+	long := ""
+	for i := 0; i < 200; i++ {
+		long += "x"
+	}
+	ev := rawEvent(t, `{"type":"tool_execution_end","toolName":"report_test_step","result":{"details":{"kind":"report_test_step","name":"`+long+`","status":"pass","screenshotPath":"/s.png"}}}`)
+
+	curated, ok := rpc.Translate(ev)
+	if !ok {
+		t.Fatal("expected report_test_step to be curated")
+	}
+	if curated.TestName != long {
+		t.Fatalf("expected the long step name intact (%d chars), got %d chars", len(long), len(curated.TestName))
+	}
+}

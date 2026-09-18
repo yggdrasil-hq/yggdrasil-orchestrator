@@ -126,6 +126,13 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 	// its last turn — the recording is collected once the whole session is over.
 	recordingPath := ""
 
+	// Issue #22: the screenshots each step reported, accumulated as their events
+	// stream past and read in a batch once the session is over. Collected here
+	// rather than inside the sink for the reason screenshots.go's header gives:
+	// reading one needs a pod exec and an HTTP round trip, and doing that inline
+	// would add both to the agent's own turn, once per step.
+	screenshots := newScreenshotCollector()
+
 	// Issue #23: one HTTP POST per curated event, so a token stream is one POST
 	// per token unless it is coalesced first. The coalescer sits *in front of*
 	// `post`, changing only how many posts a turn's deltas become — the API,
@@ -133,6 +140,13 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 	post := func(ev rpc.CuratedEvent) {
 		if ev.Type == rpc.EventSubmitTestReport && ev.RecordingPath != "" {
 			recordingPath = ev.RecordingPath
+		}
+		// Issue #22: each step's own screenshot, if it reported one. Steps only
+		// ever come from `test_run`'s report_test_step (see the API's events
+		// route), so this needs no job-kind branch — a kind that reports no steps
+		// accumulates nothing and the batch below is a no-op.
+		if ev.Type == rpc.EventReportTestStep {
+			screenshots.add(ev.TestName, ev.ScreenshotPath)
 		}
 		if err := cfg.APIClient.PostJobEvent(ctx, job.ID, ev); err != nil {
 			// A failed relay is a visibility gap, not a job failure: the
@@ -276,6 +290,28 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 			podName:   podName,
 			maxBytes:  cfg.RecordingMaxBytes,
 		}, recordingPath)
+		cancelCollect()
+	}
+
+	// Issue #22: the screenshots, on the same terms and in the same window — after
+	// the session has ended, before the deferred DeleteJob destroys the pod.
+	// `WithoutCancel` for the reason the recording collection gives: a run that
+	// just finished has already decided its own outcome, so a shutdown or deadline
+	// arriving in this window must not be what discards artifacts the agent did
+	// produce. The bound is the whole batch rather than one file, so a long tail of
+	// steps cannot hold teardown open — and the guard skips the batch entirely when
+	// collection is switched off, so a disabled deployment does not even enumerate.
+	pendingScreenshots := screenshots.pending()
+	if len(pendingScreenshots) > 0 && cfg.ScreenshotMaxBytes > 0 {
+		collectCtx, cancelCollect := context.WithTimeout(context.WithoutCancel(ctx), screenshotCollectTimeout)
+		collectScreenshots(collectCtx, screenshotCollection{
+			read:      podFileReaderFrom(client),
+			api:       cfg.APIClient,
+			jobID:     job.ID,
+			namespace: namespace,
+			podName:   podName,
+			maxBytes:  cfg.ScreenshotMaxBytes,
+		}, pendingScreenshots)
 		cancelCollect()
 	}
 
