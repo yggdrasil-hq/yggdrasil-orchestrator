@@ -80,13 +80,14 @@ type jobPreview struct {
 // after the release, so the preview coexists with `primary` — and with other
 // previews — inside the one per-project namespace (§5).
 //
-// The chart is deliberately the *same* one the primary deployment uses, with
-// no image override. Nothing in this system builds or pushes an image for a
-// feature branch (ADR 003 §12/§14 describe that contract, but no code
-// implements it), so a preview shows the project's app as its chart currently
-// declares it rather than the branch under construction. Passing an image
-// override here is the seam for that work; inventing a build pipeline in this
-// lane would be a much larger, undesigned change.
+// The chart is the *same* one the primary deployment uses, but with an image
+// override (issue #19): `buildPreviewImage` builds and pushes the primary
+// repository's Dockerfile at this job's ref and the resulting reference is
+// passed as `image.repository`/`image.tag`, so the preview serves the branch
+// under construction rather than the image the chart declares. When there is
+// nothing to build — no registry configured, no Dockerfile yet, or a ref not yet
+// pushed — the override is absent and the preview falls back to the chart's image
+// exactly as it did before that work landed.
 func ensureJobPreview(
 	ctx context.Context,
 	client *k8s.Client,
@@ -125,6 +126,11 @@ func ensureJobPreview(
 		return nil, fmt.Errorf("failed to initialize helm: %w", err)
 	}
 
+	values := map[string]interface{}{"secretsChecksum": secretsChecksum(secrets)}
+	for key, value := range previewImageValues(buildPreviewImage(ctx, client, job, namespace, cfg)) {
+		values[key] = value
+	}
+
 	if _, err := preview.Ensure(ctx, preview.Config{
 		Clientset:        client.Interface,
 		HelmConfig:       helmCfg,
@@ -134,7 +140,7 @@ func ensureJobPreview(
 		IngressClassName: cfg.IngressClassName,
 		CertIssuerName:   cfg.CertIssuerName,
 		Chart:            chrt,
-		Values:           map[string]interface{}{"secretsChecksum": secretsChecksum(secrets)},
+		Values:           values,
 	}); err != nil {
 		return nil, err
 	}
