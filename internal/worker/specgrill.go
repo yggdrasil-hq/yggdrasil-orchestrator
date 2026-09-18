@@ -187,6 +187,7 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 		Command:          command,
 		Env:              env,
 		RuntimeClassName: cfg.RuntimeClassName,
+		ImagePullSecret:  cfg.ImagePullSecret,
 		Stdin:            true,
 		Resources:        k8s.AgentResources(),
 	}); err != nil {
@@ -705,7 +706,7 @@ func runTurn(
 
 	attachErr := make(chan error, 1)
 	go func() {
-		attachErr <- k8s.Attach(attachCtx, clientset, restConfig, namespace, podName, "run", stdin, rpcClient, rpcClient)
+		attachErr <- k8s.Attach(attachCtx, clientset, restConfig, namespace, podName, k8s.RunContainerName, stdin, rpcClient, rpcClient)
 	}()
 
 	if err := rpcClient.Send(rpc.Command{Type: "prompt", Message: prompt}); err != nil {

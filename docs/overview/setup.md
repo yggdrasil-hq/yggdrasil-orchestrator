@@ -35,6 +35,74 @@ that variable is only a local-dev/test convenience for tools that call
 `k8s.NewClient()` directly (see `internal/k8s/client.go`), not the real
 per-org dispatch path.
 
+## Agent images: `imagePullSecret` provisioning (issue #29)
+
+The agent images come from GHCR (`ghcr.io/yggdrasil-hq/yggdrasil-agent-images`,
+ADR 004), and **not all of those packages are public**. As of this writing
+`test_run` refuses an anonymous pull (`401` from GHCR) while `spec_grill`,
+`feature_build`, `script_test_run`, `agentic_review` and `design_grill` allow one.
+A package can be flipped either way at any time, so which ones need a credential
+is a property of the registry rather than something to hardcode — and the
+Orchestrator asks the registry rather than assuming.
+
+If a package is not publicly pullable, a job pod cannot start, and the failure is
+reported as a **setup error** naming the remedy rather than as a timeout or a
+crashed agent:
+
+```
+setup error: the agent image "ghcr.io/.../test_run:latest" could not be pulled, so this job never started.
+ErrImagePull: the image could not be pulled. The cluster said: failed to pull and unpack image ... 401 Unauthorized.
+create a registry credential for the target cluster and reference it — `kubectl -n <project namespace>
+create secret docker-registry <name> --docker-server=ghcr.io --docker-username=<github user>
+--docker-password=<token with read:packages>`, then either set JOB_IMAGE_PULL_SECRET=<name> on the
+Orchestrator or attach it to that namespace's `default` service account. ...
+```
+
+### Fixing it
+
+Either make the package public, or give the cluster a credential:
+
+```bash
+# A `read:packages`-scoped PAT is the credential; it is not the Git token.
+kubectl -n <project namespace> create secret docker-registry ghcr-pull \
+  --docker-server=ghcr.io \
+  --docker-username=<github user> \
+  --docker-password=<token with read:packages>
+```
+
+Then make the pods use it — **one of these, and the choice matters**:
+
+1. **`JOB_IMAGE_PULL_SECRET=ghcr-pull` on the Orchestrator** (`.env`). It is put
+   into every job pod's spec, so it applies to this install's job pods only.
+2. **Attach it to the namespace's `default` service account**:
+
+   ```bash
+   kubectl -n <project namespace> patch serviceaccount default \
+     -p '{"imagePullSecrets":[{"name":"ghcr-pull"}]}'
+   ```
+
+   Kubernetes then applies it to every pod in that namespace, and the
+   Orchestrator needs no configuration. This has to be repeated per project
+   namespace — every project gets its own (`proj-<id>`, ADR 003 §5) — which is
+   the trade-off against option 1 applying everywhere at once.
+
+The credential is **not** used just by existing in the namespace: a namespaced
+docker-config object authenticates nothing until a pod or its service account
+references it. That is why option 1 exists in the Orchestrator at all, and why
+the message above names both.
+
+### What the Orchestrator checks, and when
+
+- **Before** a job's pod is created, for the first job in each namespace: it asks
+  GHCR whether the package accepts an anonymous pull. If it does not, and
+  neither option above is in place, it logs a warning naming the image and the
+  remedy. This is the *preflight* — it cannot fail a job, deliberately, because a
+  registry answer is not the cluster's answer.
+- **As soon as** a pod reports a pull failure (`ErrImagePull`,
+  `ImagePullBackOff`, `InvalidImageName`, `ImageInspectError`): the job fails
+  immediately with that setup error, instead of waiting out the session deadline.
+  This is the evidence-based path and it is what actually stops a job.
+
 ## One-time: ingress + TLS (cert-manager)
 
 Per ADR 003 §15, primary deployments are reached through an in-cluster

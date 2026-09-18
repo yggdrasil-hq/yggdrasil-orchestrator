@@ -85,6 +85,24 @@ type Config struct {
 	// keep working before agent-images has published real images anywhere.
 	Images map[queue.JobKind]string
 
+	// ImagePullSecret names a docker-config object in the target cluster that
+	// has to be presented to pull the images above (issue #29), or "" when they
+	// need none.
+	//
+	// Only the agent images need this: they come from GHCR, where packages are
+	// private by default (ADR 004), whereas the placeholder default is a public
+	// docker.io image. Without it, a namespaced credential object is unused —
+	// Docker and Kubernetes only send one for a pod that (or whose service
+	// account) references it — so this field is what makes provisioning it
+	// actually take effect.
+	ImagePullSecret string
+
+	// PullPreflight answers, once per namespace and once per repository per
+	// process, whether this job's image can be pulled at all (issue #29). Run
+	// fills it in when nil; tests pass their own so a finding is observable
+	// without a process boundary, and so a fake registry can stand in for GHCR.
+	PullPreflight *k8s.ImagePullPreflight
+
 	// PlaceholderImage/PlaceholderScript stand in for a real Pi agent image,
 	// for any job kind not present in Images.
 	PlaceholderImage  string
@@ -200,6 +218,9 @@ func Run(ctx context.Context, q *queue.Queue, cfg Config) {
 	}
 	if cfg.PlaceholderImage == "" {
 		cfg.PlaceholderImage = defaultPlaceholderImage
+	}
+	if cfg.PullPreflight == nil {
+		cfg.PullPreflight = k8s.NewImagePullPreflight()
 	}
 	if cfg.PlaceholderScript == "" {
 		cfg.PlaceholderScript = defaultPlaceholderScript
@@ -328,16 +349,28 @@ func runClaimedJob(ctx context.Context, q *queue.Queue, cfg Config, job *queue.J
 // kind with no real image configured yet, test_run, or the non-Pi
 // script_test_run — ADR 015 item 10) runs the standalone non-Pi image through
 // the blocking k8s.RunJob path; its entrypoint posts the canonical report
-// before returning. Jobs without a configured script image fail explicitly.
+// before returning. A `script_test_run` whose image is not configured on this
+// installation has its group recorded as skipped rather than failing the job
+// (issue #44, see preflight.go).
 //
-// Two ADR 030 steps bracket everything else: a token-cap check that can stop
-// the job before any work happens, and the project's configured namespace
-// quota applied when the namespace is provisioned.
+// Three ADR 030 steps and one setup check bracket everything else: the token cap
+// and quota resolve before any work happens, issue #29's image-pull preflight
+// runs once the namespace exists and the image is known (so it can read the
+// namespace and report before a pod exists), and the namespace quota applies
+// when the namespace is provisioned.
 func runInCluster(ctx context.Context, q *queue.Queue, client *k8s.Client, job *queue.Job, cfg Config) error {
 	// ADR 030 §4: the token cap is checked before anything expensive happens,
 	// so an over-cap job never provisions a namespace, starts a preview, or
 	// mints a GitHub token. The API owns the decision; this asks it once.
 	if err := enforceTokenCap(ctx, job, cfg); err != nil {
+		return err
+	}
+
+	// Issue #44: a `script_test_run` this installation cannot run at all. Handled
+	// before the quota fetch, the namespace, and the preview, because none of
+	// them can help — there is no image to run — and leaving them out keeps a
+	// broken setting from also costing a namespace and a GitHub token.
+	if handled, err := skipWhenScriptImageUnconfigured(ctx, job, cfg); handled {
 		return err
 	}
 
@@ -360,6 +393,12 @@ func runInCluster(ctx context.Context, q *queue.Queue, client *k8s.Client, job *
 	if err != nil {
 		return fmt.Errorf("failed to provision namespace: %w", err)
 	}
+
+	// Issue #29: warn, before any pod exists, when this job's image cannot
+	// plausibly be pulled. Placed here because the check reads the namespace
+	// (which has just been provisioned) and because everything below — the
+	// preview, the GitHub token, the pod — is work an unpullable image wastes.
+	preflightImagePull(ctx, client, job, namespace, cfg)
 
 	// The ephemeral preview exists for the whole job and is removed when this
 	// function returns, however it returns (ADR 003 §10/§15). `defer` is what
@@ -388,17 +427,13 @@ func runInCluster(ctx context.Context, q *queue.Queue, client *k8s.Client, job *
 		job.Kind == queue.KindTestRun ||
 		job.Kind == queue.KindAgenticReview ||
 		job.Kind == queue.KindDesignGrill {
-		if img, ok := cfg.Images[job.Kind]; ok && img != "" {
+		if configuredImage(cfg, job.Kind) != "" {
 			return runAgentRPCJob(ctx, q, client, job, namespace, cfg)
 		}
 	}
 
-	if job.Kind == queue.KindScriptTestRun {
-		if _, ok := cfg.Images[job.Kind]; !ok || cfg.Images[job.Kind] == "" {
-			return fmt.Errorf("no image configured for %s", job.Kind)
-		}
-	}
-
+	// A `script_test_run` without an image never reaches here — that case is
+	// decided in skipWhenScriptImageUnconfigured, above.
 	return runAgentJob(ctx, client, job, namespace, cfg)
 }
 
@@ -427,6 +462,7 @@ func runAgentJob(ctx context.Context, client *k8s.Client, job *queue.Job, namesp
 		Command:          command,
 		Env:              env,
 		RuntimeClassName: cfg.RuntimeClassName,
+		ImagePullSecret:  cfg.ImagePullSecret,
 	})
 }
 
@@ -610,10 +646,25 @@ func agentRepoEnv(ctx context.Context, cfg Config, job *queue.Job) (map[string]s
 // takes over. A kind with no configured image falls back to the placeholder
 // dev stand-in and its shell-script Command.
 func resolveAgentImage(cfg Config, kind queue.JobKind) (image string, command []string) {
-	if img, ok := cfg.Images[kind]; ok && img != "" {
-		return img, nil
+	if image := configuredImage(cfg, kind); image != "" {
+		return image, nil
 	}
 	return cfg.PlaceholderImage, []string{"sh", "-c", cfg.PlaceholderScript}
+}
+
+// configuredImage returns the real agent-images image for a job kind, or "" when
+// this installation has none.
+//
+// One predicate rather than the `img, ok := cfg.Images[kind]; ok && img != ""`
+// idiom repeated at each call site: an empty-string entry and an absent one mean
+// the same thing ("not configured") and are easy to treat differently by
+// accident — a map that holds a kind mapped to "" is exactly what an
+// `.env`-driven config produces when an env var is set but blank.
+func configuredImage(cfg Config, kind queue.JobKind) string {
+	if img, ok := cfg.Images[kind]; ok && img != "" {
+		return img
+	}
+	return ""
 }
 
 // filterModelEnv picks the per-project model config keys (ADR 004) out of a

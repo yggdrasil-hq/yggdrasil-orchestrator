@@ -11,8 +11,9 @@ import (
 
 // recordingContainer is the container name every agent job pod runs its Pi
 // session in (see runTurn's attach call) — the same container the skill wrote
-// the recording inside.
-const recordingContainer = "run"
+// the recording inside. Aliased rather than re-spelled: the k8s package owns
+// the name because it is what creates the container.
+const recordingContainer = k8s.RunContainerName
 
 // podFileReader reads one file out of a running pod. A function type rather than
 // the k8s package's signature directly, so this module's logic can be exercised
