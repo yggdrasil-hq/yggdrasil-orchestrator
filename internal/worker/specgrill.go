@@ -126,7 +126,11 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 	// its last turn — the recording is collected once the whole session is over.
 	recordingPath := ""
 
-	handle := func(ev rpc.CuratedEvent) {
+	// Issue #23: one HTTP POST per curated event, so a token stream is one POST
+	// per token unless it is coalesced first. The coalescer sits *in front of*
+	// `post`, changing only how many posts a turn's deltas become — the API,
+	// the socket frames and the Web client's delta handling are all untouched.
+	post := func(ev rpc.CuratedEvent) {
 		if ev.Type == rpc.EventSubmitTestReport && ev.RecordingPath != "" {
 			recordingPath = ev.RecordingPath
 		}
@@ -138,6 +142,12 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 			log.Printf("worker: failed to relay event %s for job %s: %v", ev.Type, job.ID, err)
 		}
 	}
+
+	deltas := newDeltaCoalescer(post, defaultDeltaFlushInterval, defaultDeltaMaxBytes)
+	// Flushed even on the error paths below, so a turn's last few tokens are
+	// never the thing a failed run silently drops.
+	defer deltas.stop()
+	handle := deltas.event
 
 	env, spec, err := buildAgentEnv(ctx, cfg, job)
 	if err != nil {
@@ -646,13 +656,14 @@ func reportSessionError(handle func(rpc.CuratedEvent), cancelled bool, err error
 // progress records) — the curated event types this loop forwards without also
 // ending the turn on them; see each type's doc comment for why.
 //
-// Note that handle is called *synchronously* and, for an RPC-driven job, does
-// an HTTP POST per event — which is what makes the delta stream (ADR 019 item
-// 13) a genuine throughput question rather than a free one: a turn's total time
-// grows with the number of deltas, and a terminating event behind a long delta
-// stream waits for those POSTs to drain. That is a deliberate cost of keeping
-// the relay's transport unchanged, and coalescing deltas before they reach here
-// is the documented follow-up (ADR 019 item 13).
+// Note that handle is called *synchronously* and, for an RPC-driven job, does an
+// HTTP POST per event — which is what makes the delta stream (ADR 019 item 13) a
+// genuine throughput question rather than a free one: a turn's total time grows
+// with the number of deltas, and a terminating event behind a long delta stream
+// waits for those POSTs to drain. Coalescing deltas before they reach here is
+// what removes that (issue #23, `deltas.go`): the sink this loop calls is a
+// deltaCoalescer, so consecutive deltas become one POST while every other event
+// keeps its own.
 func runTurn(
 	ctx context.Context,
 	clientset kubernetes.Interface,
@@ -745,7 +756,9 @@ func runTurn(
 				// form arrives as EventAgentText at message_end. Keep
 				// reading — the real terminating event (a tool call,
 				// agent_settled's failure branch above, or the attach stream
-				// ending) is what actually ends the turn.
+				// ending) is what actually ends the turn. The coalescer this
+				// reaches will buffer it (issue #23) and flush before the
+				// next non-delta, so ordering is preserved.
 				handle(curated)
 				continue
 			}
