@@ -62,7 +62,9 @@ func Build(ctx context.Context, cfg Config) (Result, error) {
 // Reads the *pod's* container status rather than the Job's counters, because the
 // two skip cases are exit codes (NoDockerfileExitCode, RefUnavailableExitCode)
 // and a Job only reports success/failure. That is also why this does not reuse
-// the k8s package's blocking RunJob, which knows nothing about exit codes.
+// the k8s package's blocking RunJob, which knows nothing about exit codes. Both
+// skip codes are emitted by the context container (see buildJob), and the build
+// container never runs in either case.
 func awaitResult(
 	ctx context.Context,
 	clientset kubernetes.Interface,
@@ -144,17 +146,22 @@ func (o podOutcome) describe() string {
 }
 
 // buildOutcome reports whether the pod has finished, and how. The build
-// container is named "build" (see buildJob); a pod that failed before it ran
-// (the clone init container failing, most likely) is reported with that
-// container's state instead, since "the clone failed" is the real cause an
-// operator needs to see.
+// container is named buildContainerName (see buildJob); a pod that failed before
+// it ran is reported with the *context* container's state instead, because "the
+// build context could not be prepared" is the real cause an operator needs to
+// see rather than a bare build failure.
+//
+// Note that the two deliberate skip codes (NoDockerfileExitCode,
+// RefUnavailableExitCode) also originate in that container, and both are handled
+// by exit code in awaitResult — which is why reporting the context container's
+// state here is not the same as reporting a failure.
 func buildOutcome(pod *corev1.Pod) (podOutcome, bool) {
 	if pod.Status.Phase == corev1.PodSucceeded {
 		return podOutcome{exitCode: 0, reason: "Completed"}, true
 	}
 
 	for _, status := range pod.Status.ContainerStatuses {
-		if status.Name != "build" || status.State.Terminated == nil {
+		if status.Name != buildContainerName || status.State.Terminated == nil {
 			continue
 		}
 		terminated := status.State.Terminated
@@ -169,10 +176,12 @@ func buildOutcome(pod *corev1.Pod) (podOutcome, bool) {
 		}, true
 	}
 
-	// The init container is where a clone failure lands, including the common
-	// case of a token that cannot read the repository.
+	// The context container is where a skip lands (both of its exit codes mean
+	// "nothing to build" rather than a failure — see awaitResult), and also where
+	// a clone failure lands, including the common case of a token that cannot read
+	// the repository.
 	for _, status := range pod.Status.InitContainerStatuses {
-		if status.Name != "clone" || status.State.Terminated == nil {
+		if status.Name != prepareContainerName || status.State.Terminated == nil {
 			continue
 		}
 		terminated := status.State.Terminated
@@ -185,7 +194,7 @@ func buildOutcome(pod *corev1.Pod) (podOutcome, bool) {
 		}
 		return podOutcome{
 			exitCode: terminated.ExitCode,
-			reason:   "the clone step failed (" + reason + ")",
+			reason:   "the build context could not be prepared (" + reason + ")",
 			message:  terminated.Message,
 		}, true
 	}

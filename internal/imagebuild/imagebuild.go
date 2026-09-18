@@ -22,6 +22,16 @@
 // private repositories (the token in a URL rewrite, never in a committed remote),
 // and it makes the "this repository has no Dockerfile" case a plain filesystem
 // check rather than a tool-specific failure to decode.
+//
+// **The two containers are not interchangeable** (issue #69). The context
+// container runs `alpine/git`, which has a shell; the build container runs
+// Kaniko's executor image, which is distroless and has none. So every guard and
+// every conditional belongs in the context container, and the build container is
+// invoked through Kaniko's own CLI and nothing else. Treating that split as
+// arbitrary — putting a shell script in the build container, say — produces a pod
+// that fails at container start rather than a build that fails, which is a much
+// less obvious failure to read. `TestBuildJob_NoContainerInvokesAShellItsImageLacks`
+// is what keeps that honest.
 package imagebuild
 
 import (
@@ -55,6 +65,21 @@ const (
 	// buildContextDir is where the clone lands. Both containers share it through
 	// one emptyDir, which is the only handoff between them.
 	buildContextDir = "/workspace"
+
+	// prepareContainerName and buildContainerName are the two containers in a
+	// build Job, named so that the code which resolves a pod's outcome by
+	// matching on them (buildOutcome, build.go) cannot drift from the code that
+	// creates them. A rename in one place only would silently misattribute a
+	// failure to the wrong step — the operator would be told the build failed
+	// when the context was never prepared, or the reverse.
+	prepareContainerName = "prepare"
+	buildContainerName   = "build"
+
+	// kanikoExecutorPath is the executor binary inside the executor image,
+	// which the build container invokes directly (see buildJob). Named rather
+	// than inlined so the test that guards that invocation looks for the same
+	// string the code uses.
+	kanikoExecutorPath = "/kaniko/executor"
 
 	// NoDockerfileExitCode is what the build container exits with when the
 	// checkout has no Dockerfile at the contract's path. A distinct code rather
@@ -247,10 +272,15 @@ func buildJob(cfg Config) *batchv1.Job {
 		authMount = &corev1.VolumeMount{Name: "registry-auth", MountPath: "/kaniko/.docker"}
 	}
 
-	// The clone is an init container rather than a second app container: the
+	// The context step is an init container rather than a second app container: the
 	// build must not start against a half-populated context, and `initContainers`
 	// is Kubernetes' own expression of that ordering — no polling, no readiness
 	// signal to invent.
+	//
+	// It carries **both** reasons a build is skipped rather than failing, which is
+	// why it is named `prepare` rather than `clone`: it fetches the ref and then
+	// decides whether there is anything buildable at the other end. The two
+	// belong together, and issue #69 is why they are here — see below.
 	//
 	// The token goes in through git's URL rewrite, exactly as the agent images do
 	// it: nothing is written to a remote, and the command line of this container
@@ -262,7 +292,16 @@ func buildJob(cfg Config) *batchv1.Job {
 	// the remote" is a definite answer rather than a message to pattern-match out
 	// of git's stderr — and so a missing ref costs one cheap round trip instead of
 	// a failed clone. See RefUnavailableExitCode for why it matters.
-	cloneScript := fmt.Sprintf(`
+	//
+	// The Dockerfile check runs last, against the context just materialised.
+	// **It has to live here rather than in the build container** (issue #69): that
+	// container is Kaniko's executor image, which is distroless, so the
+	// `if [ ! -f ... ]` guard it used to carry could not survive there — the
+	// container could not start at all (`StartError: exec: "sh": executable file
+	// not found in $PATH`). A container that cannot run a guard cannot report what
+	// the guard would have said. Here it costs nothing: this container already has
+	// a shell, and the emptyDir means it already sees the files it is checking.
+	prepareScript := fmt.Sprintf(`
 set -eu
 git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
 if ! git ls-remote --exit-code --heads --tags "${CLONE_URL}" "${GIT_REF}" >/dev/null 2>&1; then
@@ -271,34 +310,37 @@ if ! git ls-remote --exit-code --heads --tags "${CLONE_URL}" "${GIT_REF}" >/dev/
 fi
 git clone --depth 1 --branch "${GIT_REF}" "${CLONE_URL}" %s
 git -C %s log -1 --format=%%H > %s/.yggdrasil-commit
-`, RefUnavailableExitCode, buildContextDir, buildContextDir, buildContextDir)
+if [ ! -f "%s/%s" ]; then
+  echo "no %s at the repository root; nothing to build"
+  exit %d
+fi
+`, RefUnavailableExitCode, buildContextDir, buildContextDir, buildContextDir,
+		buildContextDir, cfg.dockerfilePath(), cfg.dockerfilePath(), NoDockerfileExitCode)
 
-	// The build container decides for itself whether there is anything to build.
-	// Exiting with NoDockerfileExitCode is how it says "this repository has no
-	// Dockerfile at the contract's path" — a state a freshly scaffolded project
-	// is in, and one the caller must handle by falling back to the chart's image
-	// rather than by failing the job.
+	// The build container runs Kaniko through its own CLI, with no shell involved
+	// anywhere.
+	//
+	// That is not a style preference — it is the only thing that works (issue
+	// #69). Kaniko's executor image is distroless: it contains the executor and
+	// nothing else, *including no shell*. Configuring this container as
+	// `sh -c <script>` therefore fails at container start, before any build logic
+	// runs, for every repository regardless of its Dockerfile. Distroless is
+	// Kaniko's choice and a good one for a container whose whole job is to execute
+	// a Dockerfile, so the fix is to stop asking it for something it does not have
+	// rather than to swap in a builder that ships a shell.
+	//
+	// `Command` names the binary rather than relying on the image's entrypoint.
+	// The entrypoint *is* the executor today, so `Args` alone would work — but an
+	// explicit `Command` stays honest if `ExecutorImage` is ever pointed at a
+	// variant, and it is what the tests assert. (`gcr.io/kaniko-project/executor:debug`
+	// is the shell-bearing variant; nothing here uses it, and using it would
+	// reintroduce exactly the thing this container no longer depends on.)
 	//
 	// The cache repository is derived with SplitImage rather than by cutting the
 	// destination at its first colon: a registry that carries a port (`reg:5000`)
 	// would otherwise yield a cache repository of just `reg`, pushing cache layers
 	// to a registry that is not the one configured.
 	destinationRepo, _ := SplitImage(cfg.Destination)
-	buildScript := fmt.Sprintf(`
-set -eu
-if [ ! -f "%s/%s" ]; then
-  echo "no %s at the repository root; nothing to build"
-  exit %d
-fi
-exec /kaniko/executor \
-  --context=dir://%s \
-  --dockerfile=%s/%s \
-  --destination=%s \
-  --cache=true \
-  --cache-repo=%s-cache
-`, buildContextDir, cfg.dockerfilePath(), cfg.dockerfilePath(), NoDockerfileExitCode,
-		buildContextDir, buildContextDir, cfg.dockerfilePath(), cfg.Destination,
-		destinationRepo)
 
 	backoffLimit := int32(0)
 	ttl := int32(300)
@@ -321,9 +363,9 @@ exec /kaniko/executor \
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
 					InitContainers: []corev1.Container{{
-						Name:    "clone",
+						Name:    prepareContainerName,
 						Image:   cfg.cloneImage(),
-						Command: []string{"sh", "-c", cloneScript},
+						Command: []string{"sh", "-c", prepareScript},
 						Env: []corev1.EnvVar{
 							{Name: "CLONE_URL", Value: cfg.CloneURL},
 							{Name: "GIT_REF", Value: cfg.GitRef},
@@ -333,9 +375,16 @@ exec /kaniko/executor \
 						Resources:    cloneResources(),
 					}},
 					Containers: []corev1.Container{{
-						Name:    "build",
+						Name:    buildContainerName,
 						Image:   cfg.executorImage(),
-						Command: []string{"sh", "-c", buildScript},
+						Command: []string{kanikoExecutorPath},
+						Args: []string{
+							"--context=dir://" + buildContextDir,
+							"--dockerfile=" + buildContextDir + "/" + cfg.dockerfilePath(),
+							"--destination=" + cfg.Destination,
+							"--cache=true",
+							"--cache-repo=" + destinationRepo + "-cache",
+						},
 						VolumeMounts: append(
 							[]corev1.VolumeMount{{Name: "build-context", MountPath: buildContextDir}},
 							optionalMount(authMount)...,
