@@ -700,18 +700,63 @@ func runRollback(ctx context.Context, client *k8s.Client, job *queue.Job, namesp
 }
 
 // reportDeployResult posts one deploy/rollback outcome to the API's deploy
-// ledger (ADR 022). A failed report is deliberately not fatal to the job: the
-// release really was applied or rolled back, so failing the job would report a
-// true outcome as a false one. The consequence of losing this call is real
-// though — the revision is then absent from the ledger and so not offered as a
-// rollback target — so it is logged loudly with the revision named rather than
-// swallowed.
+// ledger (ADR 022), retrying a transient failure first.
+//
+// A failed report is deliberately not fatal to the job: the release really was
+// applied or rolled back, so failing the job would report a true outcome as a
+// false one. The consequence of losing the call is not cosmetic though — the
+// revision is then absent from the ledger, so it is not offered as a rollback
+// target, and the user cannot undo a deploy that is live (issue #26). That is a
+// worse outcome than a few seconds of retrying, which is why this is the one
+// reporting call in this package that retries.
+//
+// Retrying is safe because the API's ingest is idempotent on the job id
+// (migration 043): the case a retry cannot distinguish from a fresh attempt —
+// "the write landed but the response didn't" — records one row, not two.
+//
+// It narrows the window rather than closing it: a pod that is evicted between
+// the Helm operation and this call still loses the report, and no amount of
+// retrying inside that pod can fix it. Closing it properly would need the
+// revision to be recoverable from the cluster by something that outlives the
+// job — recorded as a limitation in ADR 022 §5 rather than pretended away.
+// deployReportBackoff is the wait before retrying a lost deploy report. Three
+// entries means up to four attempts: long enough to ride out an API restart or
+// a dropped packet (~7s), short enough that the job is not held open for it.
+//
+// A variable rather than a slice literal inside the loop so a test can shrink
+// it; nothing in production reassigns it.
+var deployReportBackoff = []time.Duration{
+	time.Second, 2 * time.Second, 4 * time.Second,
+}
+
 func reportDeployResult(ctx context.Context, cfg Config, jobID string, result apiclient.DeployResultInput) {
-	if err := cfg.APIClient.ReportDeployResult(ctx, jobID, result); err != nil {
-		log.Printf(
-			"worker: WARNING failed to record deploy result for job %s (revision %d): %v — this revision will be missing from the project's deploy history",
-			jobID, result.Revision, err,
-		)
+	attempts := len(deployReportBackoff) + 1
+
+	for attempt := 1; ; attempt++ {
+		err := cfg.APIClient.ReportDeployResult(ctx, jobID, result)
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("worker: recorded deploy result for job %s (revision %d) on attempt %d", jobID, result.Revision, attempt)
+			}
+			return
+		}
+
+		if attempt >= attempts || ctx.Err() != nil {
+			log.Printf(
+				"worker: WARNING failed to record deploy result for job %s (revision %d) after %d attempt(s): %v — this revision will be missing from the project's deploy history",
+				jobID, result.Revision, attempt, err,
+			)
+			return
+		}
+
+		delay := deployReportBackoff[attempt-1]
+		log.Printf("worker: failed to record deploy result for job %s (attempt %d/%d): %v; retrying in %s", jobID, attempt, attempts, err, delay)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
 	}
 }
 
