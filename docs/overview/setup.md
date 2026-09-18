@@ -198,11 +198,33 @@ wildcard certificate for a real deployment instead; on a cluster that has one,
 point previews at it rather than issuing one certificate per run, since a
 public ACME issuer has rate limits that per-run issuance can reach.
 
-A preview shows the project's app **as its chart currently declares it**, not
-the branch under construction: nothing in this system builds or pushes an image
-for a feature branch yet (ADR 003 §12/§14 describe that contract; no code
-implements it). The preview mechanism is the part that exists — dropping a
-branch-built image tag in is the follow-up.
+A preview shows the branch under construction, by building and pushing that
+branch's image: set `IMAGE_REGISTRY` and a preview release is given the built
+image reference instead of the image its chart declares (issue #19).
+
+**Unset, the build is disabled and a preview keeps the chart's image** — the
+scaffolded template's `nginxdemos/hello` — which is what every install did before
+this existed. That is the default because a registry is a prerequisite rather
+than an optimisation: with nowhere to push there is nowhere to pull from, so an
+unconfigured install must not attempt anything.
+
+When it is set:
+
+- The build runs as an ordinary in-cluster Job (Kaniko, unprivileged), cloning the
+  repository into an `emptyDir` and pushing to
+  `<registry>/proj-<project-id>/<repo>:<sanitised-ref>` per ADR 003 §12/§14.
+- `IMAGE_BUILD_AUTH_SECRET` names a docker-config Secret in the **project's**
+  namespace for push credentials. Unset is correct for the bundled `registry:2`,
+  which takes unauthenticated pushes inside the cluster. This does not create the
+  Secret; a missing one fails the build.
+- **Only the primary repository is built.** ADR 003 §12 has each *linked*
+  repository providing its own Dockerfile, but which chart values key carries
+  which repository's image is not yet a convention, so a project that splits its
+  runtime across sub-repositories does not get a correct preview from this.
+- **A build never fails a job.** No registry, no Dockerfile yet, a ref that is not
+  on the remote (the common case — a preview is created when a job *starts*, and a
+  `feature_build`'s branch is not pushed until the agent finishes), a registry that
+  is down: each is logged and the preview falls back to the chart's image.
 
 Previews are bounded and self-cleaning, per ADR 003 §17:
 
