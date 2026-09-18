@@ -5,9 +5,11 @@ import (
 	"testing"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	"sigs.k8s.io/yaml"
 )
 
 /*
@@ -514,5 +516,81 @@ func TestConfig_KeepsExplicitValues(t *testing.T) {
 	}
 	if got := cfg.timeout(); got != time.Minute {
 		t.Fatalf("got %s", got)
+	}
+}
+
+// --- the Job survives serialization ---------------------------------------
+
+// The tests above assert *strings* inside the Job's command. This asserts the
+// object itself is a well-formed `batch/v1` Job that survives being written and
+// read back — which is what the API server does with it, and the closest thing to
+// cluster validation reachable from here (the sandbox has neither a registry nor
+// permission to create Jobs; see the issue).
+//
+// Deliberately not a substitute for a real build: it cannot say whether Kaniko
+// can push, whether the registry accepts the push, or whether the pod is
+// schedulable.
+func TestBuildJob_RoundTripsThroughSerialization(t *testing.T) {
+	cfg := baseConfig()
+	cfg.RegistryAuthSecret = "registry-push"
+
+	original := buildJob(cfg)
+
+	encoded, err := yaml.Marshal(original)
+	if err != nil {
+		t.Fatalf("failed to serialize the Job: %v", err)
+	}
+
+	var decoded batchv1.Job
+	if err := yaml.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("failed to parse the Job back: %v", err)
+	}
+
+	// TypeMeta is deliberately empty on a Job built here, and that is correct
+	// rather than an omission: this object is created through the typed client
+	// (`Clientset.BatchV1().Jobs().Create`), which addresses
+	// `/apis/batch/v1/namespaces/<ns>/jobs` and takes the group/version from the
+	// scheme. Setting it here would be the thing that is redundant. Asserted so
+	// the fact is recorded where someone wondering about it will look.
+	if original.APIVersion != "" || original.Kind != "" {
+		t.Fatalf("expected empty TypeMeta for a typed-client create, got %q %q",
+			original.APIVersion, original.Kind)
+	}
+
+	if decoded.Name != original.Name || decoded.Namespace != original.Namespace {
+		t.Fatalf("identity did not survive: %s/%s became %s/%s",
+			original.Namespace, original.Name, decoded.Namespace, decoded.Name)
+	}
+	if decoded.Spec.BackoffLimit == nil || *decoded.Spec.BackoffLimit != 0 {
+		t.Fatalf("the backoff limit did not survive: %v", decoded.Spec.BackoffLimit)
+	}
+	if decoded.Spec.TTLSecondsAfterFinished == nil {
+		t.Fatal("the TTL did not survive")
+	}
+	if len(decoded.Spec.Template.Spec.InitContainers) != 1 || len(decoded.Spec.Template.Spec.Containers) != 1 {
+		t.Fatalf("expected one init container and one container, got %d and %d",
+			len(decoded.Spec.Template.Spec.InitContainers), len(decoded.Spec.Template.Spec.Containers))
+	}
+
+	// The scripts are multi-line with backslash continuations, so they are the
+	// part most likely to be mangled by encoding — and a mangled Kaniko
+	// invocation would surface only as a failed build in a cluster.
+	if decoded.Spec.Template.Spec.Containers[0].Command[2] != original.Spec.Template.Spec.Containers[0].Command[2] {
+		t.Fatal("the build script did not survive serialization")
+	}
+	if !strings.Contains(decoded.Spec.Template.Spec.Containers[0].Command[2], "--destination=") {
+		t.Fatalf("expected the Kaniko invocation intact, got %q", decoded.Spec.Template.Spec.Containers[0].Command[2])
+	}
+
+	// The auth volume is what would silently break a push if it were dropped:
+	// Kaniko would find no credentials and fail at the far end.
+	var found bool
+	for _, volume := range decoded.Spec.Template.Spec.Volumes {
+		if volume.Name == "registry-auth" && volume.Secret != nil && volume.Secret.SecretName == "registry-push" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the auth volume did not survive: %v", decoded.Spec.Template.Spec.Volumes)
 	}
 }
