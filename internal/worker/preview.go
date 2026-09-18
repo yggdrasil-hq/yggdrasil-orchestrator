@@ -32,8 +32,9 @@ const defaultPreviewSweepInterval = 15 * time.Minute
 const defaultPreviewSweepBatch = 100
 
 // previewAdmission is the queue-claim policy for ADR 003 §17's per-project cap
-// on simultaneous temporary deployments. Disabled (zero) when the cap is
-// configured to 0, which also keeps the claim query free of the previews table.
+// on simultaneous temporary deployments. Disabled (zero) when the configured cap
+// is negative; an unset or zero cap means the default (preview.DefaultMaxConcurrent),
+// which also keeps the claim query free of the previews table.
 func previewAdmission(cfg Config) queue.Admission {
 	return queue.NewAdmission(cfg.maxConcurrentPreviews(), preview.EligibleKinds())
 }

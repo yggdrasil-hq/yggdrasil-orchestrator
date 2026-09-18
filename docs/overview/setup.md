@@ -148,10 +148,12 @@ Previews are bounded and self-cleaning, per ADR 003 §17:
   preview older than `PREVIEW_TTL` (default 2h) is removed regardless, because
   a hard-crashed job stays `running` forever and job status alone could never
   collect its preview.
-- `MAX_CONCURRENT_PREVIEWS=0` disables previews entirely (and with them the
-  queue's admission clause, so the claim query never touches the previews
-  table). That is the supported way to run against a database whose migrations
-  predate `038_job_previews.sql`.
+- A **negative** `MAX_CONCURRENT_PREVIEWS` disables previews entirely (and with
+  them the queue's admission clause, so the claim query never touches the
+  previews table). That is the supported way to run against a database whose
+  migrations predate `038_job_previews.sql`. Note `0` does **not** do this — an
+  unset or zero value means "use the default of 3", deliberately, matching how
+  every other cap in this service treats zero.
 
 > Note on the meta repo's nginx: its `/preview/<run-id>/` location returns a
 > 503 and is unrelated to this. That location is the **local-dev** path for the

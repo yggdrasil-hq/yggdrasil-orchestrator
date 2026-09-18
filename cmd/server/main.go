@@ -157,12 +157,13 @@ func resolveMaxConcurrentJobs() int {
 // resolveMaxConcurrentPreviews reads the per-project cap on simultaneous
 // ephemeral preview deployments (ADR 003 §17's "initial default: 3").
 //
-// The three cases are deliberately distinct: unset keeps the ADR's default of
-// 3, an explicit 0 disables previews without disabling any other job kind, and
-// a negative value is treated as "off" too. Running with previews off is the
+// The three cases are deliberately distinct, and the middle one is easy to get
+// wrong: unset (or unparseable) keeps the ADR's default of 3, an explicit 0
+// **also** means "apply the default" — it is not an off switch — and only a
+// **negative** value disables previews. Running with previews off is the
 // supported way to deploy an Orchestrator against a database whose migrations
 // predate the previews table, since the cap is what makes the claim query
-// reference it.
+// reference it; that requires a negative value here, not 0.
 func resolveMaxConcurrentPreviews() int {
 	raw := os.Getenv("MAX_CONCURRENT_PREVIEWS")
 	if raw == "" {
