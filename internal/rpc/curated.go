@@ -137,6 +137,15 @@ type CuratedEvent struct {
 	Summary             string // set for EventSubmitBuildResult
 	// Verdict is set for EventSubmitReview: "approved" | "changes_requested".
 	Verdict string
+	// Findings is set for EventSubmitReview when the reviewing agent listed its
+	// issues per location (issue #73).
+	//
+	// A pointer to a slice for the same reason `QuestionOptions` is: the API
+	// distinguishes an absent list (prose — the count is not knowable) from an
+	// empty one (structured, and there are none), and Go's zero value would make
+	// `Findings []ReviewFinding` send those two as the same thing. See the field's
+	// counterpart on `contractToolResult.Details` for the full argument.
+	Findings *[]ReviewFinding
 	// ActionItems is set for submit_adr and request_action_item: the Action
 	// Item batch or the needed items the blocked implement skill reported.
 	ActionItems     []RequestedActionItem
@@ -187,6 +196,37 @@ type QuestionOption struct {
 	Description string `json:"description,omitempty"`
 }
 
+// ReviewFinding is one issue an `agentic_review` run located (issue #73), as
+// emitted by `submit_review`'s `findings` list.
+//
+// **The field names and their optionality match the API's schema exactly**
+// (`api/src/jobs/internal-routes.ts`, `reviewFindingSchema`'s `findings`), which
+// in turn matches the tool's own arguments — the same rule `ask_user`'s
+// structured half follows, so a reader comparing
+// `agent-images/agentic_review/skills/review/SKILL.md`, the contract extension
+// and this struct is comparing the same words.
+//
+// `Path` and `Line` are optional because a finding legitimately may carry
+// neither: a remark about the change as a whole has no location, and neither
+// does one about a requirement implemented *nowhere* — the SKILL tells the agent
+// not to invent a location to fill the field, so an invented one must not be
+// manufactured here either.
+//
+// **`Blocking` is a `*bool`, and the pointer is load-bearing.** The API defaults
+// an absent flag to `true` at ingest (`finding.blocking ?? true`), deliberately
+// fail-closed: on a `changes_requested` verdict an omitted flag means "these are
+// the blockers", and defaulting to `false` would let a review pass its gate
+// while displaying the findings that should stop it. A plain `bool` would send
+// `false` for every finding the agent left the flag off, which is the exact
+// inversion of that decision — so the absence has to survive this hop rather
+// than being resolved here.
+type ReviewFinding struct {
+	Path     string `json:"path,omitempty"`
+	Line     *int   `json:"line,omitempty"`
+	Body     string `json:"body"`
+	Blocking *bool  `json:"blocking,omitempty"`
+}
+
 // Terminal reports whether this event ends the whole job run (ADR 006 item
 // 11): the Orchestrator should stop driving the session and tear the pod
 // down, rather than waiting for more events.
@@ -229,6 +269,21 @@ type contractToolResult struct {
 		Header      string            `json:"header,omitempty"`
 		MultiSelect *bool             `json:"multiSelect,omitempty"`
 		Options     *[]QuestionOption `json:"options,omitempty"`
+		// Findings carries submit_review's per-location findings (issue #73).
+		//
+		// A **pointer to a slice**, and the pointer is the whole contract — the
+		// same shape and the same reason as `Options` above. The API stores
+		// `undefined` as SQL NULL and `[]` as an empty jsonb array, and calls the
+		// two different answers to "how many blocking issues": absent means
+		// *prose — the count is not knowable*, while `[]` means *structured, and
+		// there are genuinely none*. A plain slice collapses them, so every review
+		// written as a paragraph would arrive claiming zero findings — turning
+		// "we cannot say" into a statement of fact, in the reassuring direction.
+		//
+		// `omitempty` on the tag is what makes the absent case send no key at all
+		// rather than `"findings":null`, which is how #38's `options` contract
+		// works too.
+		Findings *[]ReviewFinding `json:"findings,omitempty"`
 		// ActionItems carries the needed items for request_action_item.
 		ActionItems     []RequestedActionItem `json:"actionItems,omitempty"`
 		TestName        string                `json:"name,omitempty"`
@@ -443,9 +498,10 @@ func translateToolExecutionEnd(ev Event) (CuratedEvent, bool) {
 			summary = parsed.Result.Details.Summary
 		}
 		return CuratedEvent{
-			Type:    EventSubmitReview,
-			Verdict: parsed.Result.Details.Verdict,
-			Summary: summary,
+			Type:     EventSubmitReview,
+			Verdict:  parsed.Result.Details.Verdict,
+			Summary:  summary,
+			Findings: parsed.Result.Details.Findings,
 		}, true
 	case "report_test_step":
 		return CuratedEvent{

@@ -1045,3 +1045,246 @@ func TestPostJobEvent_OmitsTheStructuredFieldsForAProseQuestion(t *testing.T) {
 		}
 	}
 }
+
+/*
+ * Issue #88's transport, tested the same way #38's was and for the same reason.
+ *
+ * `submit_review`'s `findings` crossed the same two silent drops #38's question
+ * half did:
+ *
+ *	Pi event → rpc.Translate → rpc.CuratedEvent → PostJobEvent → JSON body
+ *	              (struct)                          (explicit field list)
+ *
+ * `grep -rn findings orchestrator/ --include=*.go` returned **zero hits** before
+ * this — the tool emitted the field, the API accepted and stored it, and nothing
+ * in between carried it. Every test on both sides passed, and the feature looked
+ * unbuilt rather than broken. That is four instances of one shape now (#38, #59,
+ * #73, #88), so this file's job is to make the next dropped field fail loudly
+ * rather than silently.
+ *
+ * These cases therefore start from raw Pi JSON and assert on the *marshalled
+ * body*. A test stopping at `Translate` would miss the second drop, and one
+ * asserting mere presence would miss a finding arriving with its `body` — the one
+ * required field — stripped.
+ */
+func TestPostJobEvent_CarriesReviewFindingsThroughBothHops(t *testing.T) {
+	var gotBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	// Shaped exactly as the contract extension emits it
+	// (agent-images/extensions/yggdrasil-contract/src/index.ts). The second
+	// finding deliberately omits `blocking` and carries no `path`/`line`, because
+	// those absences are part of the contract rather than incidental: the API
+	// defaults an omitted flag to `true`, and the SKILL tells the agent not to
+	// invent a location to fill the field.
+	raw := `{"type":"tool_execution_end","toolName":"submit_review","result":{"details":{` +
+		`"kind":"submit_review",` +
+		`"verdict":"changes_requested",` +
+		`"comment":"Two issues, one blocking.",` +
+		`"findings":[` +
+		`{"path":"src/app/page.tsx","line":42,"body":"Missing null check","blocking":true},` +
+		`{"body":"Requirement implemented nowhere"}` +
+		`]},"terminate":true}}`
+
+	curated, ok := rpc.Translate(rpc.Event{Type: "tool_execution_end", Raw: json.RawMessage(raw)})
+	if !ok {
+		t.Fatal("expected the submit_review tool call to translate")
+	}
+
+	// Hop one: the fields must exist on the curated event, not merely in the JSON
+	// Pi sent. Asserting the *values* here is deliberate — a length-only check
+	// would pass for a list whose entries had all been zeroed.
+	if curated.Findings == nil {
+		t.Fatal("Translate dropped the findings list entirely")
+	}
+	findings := *curated.Findings
+	if len(findings) != 2 {
+		t.Fatalf("expected two findings after Translate, got %d (%v)", len(findings), findings)
+	}
+	if findings[0].Path != "src/app/page.tsx" || findings[0].Body != "Missing null check" {
+		t.Fatalf("Translate mangled the first finding: %+v", findings[0])
+	}
+	if findings[0].Line == nil || *findings[0].Line != 42 {
+		t.Fatalf("Translate dropped the first finding's line, got %v", findings[0].Line)
+	}
+	if findings[0].Blocking == nil || !*findings[0].Blocking {
+		t.Fatalf("Translate dropped the first finding's blocking flag, got %v", findings[0].Blocking)
+	}
+	// The absences must survive as absences, not become zero values.
+	if findings[1].Blocking != nil {
+		t.Fatalf("an omitted blocking flag must stay absent, got %v", *findings[1].Blocking)
+	}
+	if findings[1].Line != nil {
+		t.Fatalf("an omitted line must stay absent, got %v", *findings[1].Line)
+	}
+	if findings[1].Path != "" {
+		t.Fatalf("expected no path on the second finding, got %q", findings[1].Path)
+	}
+
+	client := apiclient.New(server.URL, "test-token")
+	if err := client.PostJobEvent(context.Background(), "job-review", curated); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Hop two: this is where #38 lost `options`, so the assertions matter more
+	// here than at hop one.
+	got, ok := gotBody["findings"].([]any)
+	if !ok {
+		t.Fatalf("expected a findings array in the request body, got %v", gotBody["findings"])
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected two findings in the body, got %d", len(got))
+	}
+
+	first, ok := got[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected the first finding to be an object, got %T", got[0])
+	}
+	if first["path"] != "src/app/page.tsx" {
+		t.Fatalf("path did not survive the request body: %v", first["path"])
+	}
+	if first["body"] != "Missing null check" {
+		t.Fatalf("body did not survive the request body: %v", first["body"])
+	}
+	// JSON numbers decode as float64 through a `map[string]any`.
+	if line, ok := first["line"].(float64); !ok || line != 42 {
+		t.Fatalf("line did not survive the request body: %v", first["line"])
+	}
+	if blocking, ok := first["blocking"].(bool); !ok || !blocking {
+		t.Fatalf("blocking did not survive the request body: %v", first["blocking"])
+	}
+
+	second, ok := got[1].(map[string]any)
+	if !ok {
+		t.Fatalf("expected the second finding to be an object, got %T", got[1])
+	}
+	if second["body"] != "Requirement implemented nowhere" {
+		t.Fatalf("the second finding's body did not survive: %v", second["body"])
+	}
+	/*
+	 * The two absences that decide behaviour, asserted as absences.
+	 *
+	 * `blocking`: the API defaults an omitted flag to **true** (`finding.blocking
+	 * ?? true`) and documents why — on a `changes_requested` verdict an omitted flag
+	 * means "these are the blockers", and a `false` default would let a review pass
+	 * its gate while displaying the findings that should stop it. So marshalling a
+	 * plain `false` here would invert that decision, and the API's carefully-reasoned
+	 * default would be unreachable from the only producer that exists.
+	 *
+	 * `path`/`line`: omitting them is a legitimate finding about the change as a
+	 * whole, so an empty string or a zero line would be a fabricated location.
+	 */
+	for _, key := range []string{"blocking", "path", "line"} {
+		if _, present := second[key]; present {
+			t.Fatalf("an omitted %s must send no key, got %v", key, second[key])
+		}
+	}
+}
+
+/*
+ * The other half of that contract, and the one a careless change breaks.
+ *
+ * The API stores an absent `findings` as SQL NULL and an empty list as `[]`, and
+ * calls those **two different answers to "how many blocking issues"**: absent means
+ * *prose, the count is not knowable*, `[]` means *structured, and there are
+ * genuinely none*. A plain (non-pointer) slice collapses them — every review written
+ * as a paragraph would arrive claiming zero findings, which turns "we cannot say"
+ * into a confident statement of fact in the reassuring direction.
+ *
+ * So this asserts the absence *on the wire*, not just on the struct.
+ */
+func TestPostJobEvent_OmitsReviewFindingsWhenTheReviewWasProse(t *testing.T) {
+	var gotBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	// A review written as a paragraph, which is what every review before #73
+	// looked like and what the SKILL says remains a legitimate choice.
+	raw := `{"type":"tool_execution_end","toolName":"submit_review","result":{"details":{` +
+		`"kind":"submit_review",` +
+		`"verdict":"approved",` +
+		`"comment":"Implements the ADR as written."` +
+		`},"terminate":true}}`
+
+	curated, ok := rpc.Translate(rpc.Event{Type: "tool_execution_end", Raw: json.RawMessage(raw)})
+	if !ok {
+		t.Fatal("expected the submit_review tool call to translate")
+	}
+	if curated.Findings != nil {
+		t.Fatalf("a prose review must carry no findings list, got %v", curated.Findings)
+	}
+
+	client := apiclient.New(server.URL, "test-token")
+	if err := client.PostJobEvent(context.Background(), "job-prose-review", curated); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if _, present := gotBody["findings"]; present {
+		t.Fatalf("expected no findings key at all for a prose review, got %v", gotBody["findings"])
+	}
+	if gotBody["verdict"] != "approved" {
+		t.Fatalf("expected the verdict itself, got %v", gotBody["verdict"])
+	}
+}
+
+/*
+ * And the state between those two: a structured review that looked and found
+ * nothing. `[]` is a *claim* — "there are no findings" — which is only honest when
+ * the agent actually enumerated. It must reach the API as an empty array rather
+ * than collapsing back to absent, or a reviewer cannot tell "checked, nothing
+ * wrong" from "wrote a paragraph instead".
+ */
+func TestPostJobEvent_SendsAnEmptyReviewFindingsListAsAnEmptyArray(t *testing.T) {
+	var gotBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	raw := `{"type":"tool_execution_end","toolName":"submit_review","result":{"details":{` +
+		`"kind":"submit_review",` +
+		`"verdict":"approved",` +
+		`"comment":"Nothing to report.",` +
+		`"findings":[]` +
+		`},"terminate":true}}`
+
+	curated, ok := rpc.Translate(rpc.Event{Type: "tool_execution_end", Raw: json.RawMessage(raw)})
+	if !ok {
+		t.Fatal("expected the submit_review tool call to translate")
+	}
+	if curated.Findings == nil {
+		t.Fatal("an explicit empty list must stay present, not become absent")
+	}
+	if len(*curated.Findings) != 0 {
+		t.Fatalf("expected zero findings, got %d", len(*curated.Findings))
+	}
+
+	client := apiclient.New(server.URL, "test-token")
+	if err := client.PostJobEvent(context.Background(), "job-empty-findings", curated); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Present-and-empty, which is a different fact from absent.
+	got, present := gotBody["findings"]
+	if !present {
+		t.Fatal("an empty findings list must be sent, or the API cannot tell it from prose")
+	}
+	arr, ok := got.([]any)
+	if !ok {
+		t.Fatalf("expected an array, got %T (%v)", got, got)
+	}
+	if len(arr) != 0 {
+		t.Fatalf("expected an empty array, got %v", arr)
+	}
+}
