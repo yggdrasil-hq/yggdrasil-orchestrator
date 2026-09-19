@@ -20,6 +20,25 @@ import (
 // stuck one (defaultMaxConcurrentJobs is small — ADR 006 item 1).
 const usageFetchTimeout = 20 * time.Second
 
+// forkMessagesGrace bounds how long the terminal turn waits for
+// `get_fork_messages` *after* the two required answers have already arrived.
+//
+// **Why a separate, shorter grace rather than treating it as a third required
+// answer.** The fork points are ADR 032 item 2's input and worth having, but they
+// are not worth what awaiting them unconditionally would cost: this turn is the
+// only chance to capture the session file (item 1) and the run's accounting
+// (ADR 023), and a Pi that answers those two but not this one would otherwise
+// burn the full usageFetchTimeout and then report the *required* pair as a
+// failure — degrading session collection for every run to gain fork points for
+// some. So the required pair still decides the turn's outcome, and this bounds
+// only the extra wait.
+//
+// Two seconds is generous for one command whose answer Pi computes in-process
+// from the session tree it already holds — unlike anything that calls a model —
+// and the timer is only armed once both required answers are in, so it can never
+// extend the turn beyond `usageFetchTimeout`.
+const forkMessagesGrace = 2 * time.Second
+
 // sessionReport is what a live session tells us about itself at the end of a
 // run: its own accounting (ADR 023) and where its session file lives (ADR 032
 // item 1).
@@ -41,6 +60,16 @@ type sessionReport struct {
 	// in-memory, or a run that never got far enough to write one. collectSession
 	// treats an empty FilePath as `not_collected` rather than as a failure.
 	Session rpc.SessionFile
+	// Fork is item 2's answer: which previous user messages this session can be
+	// forked from, with Pi's own entry ids.
+	//
+	// **Zero-with-Asked=false is the ordinary case on a Pi that did not answer it**,
+	// and that is a different fact from `Asked=true` with no points — the same
+	// distinction Session.Asked carries for the session file, and for the same
+	// reason (ADR 032 item 5, applied to a second question). It is carried as
+	// `rpc.ForkMessages` rather than as a bare slice so the distinction survives
+	// this function rather than having to be re-invented by its caller.
+	Fork rpc.ForkMessages
 	// stateAnswered distinguishes "Pi answered get_state and reported no file"
 	// from "Pi has not answered yet". The two are different facts and only the
 	// first is a result: without this the loop below could return on a session
@@ -71,20 +100,34 @@ type sessionStatsFetcher func(ctx context.Context, rpcClient *rpc.Client, namesp
 // function returns, so this is the final moment the questions can be answered at
 // all.
 //
-// **Both commands go out in this one turn**, and the two answers are collected by
+// **All three commands go out in this one turn**, and the answers are collected by
 // matching each response's own `command` field rather than by position. That is
 // the whole reason this is one function: a second turn for the session file would
 // need a second attach and a second timeout, and would give the pod another
 // chance to be gone in between — while `get_state` costs one more line on a
-// stream that is already open. (Pi answers commands in the order they arrive, so
-// the two are not ordered by construction here; they are matched by name, which
-// is also what makes an interleaved unrelated response harmless.)
+// stream that is already open.
+//
+// **They are matched by name because they are genuinely not ordered.** A real Pi
+// 0.84.4 was sent `fork`, then `get_state`, then `get_fork_messages` on one turn
+// and answered in the order get_state, get_fork_messages, fork: a command that
+// touches the session tree answers later than ones that read it, so arrival order
+// is not send order. Matching by name is also what makes an interleaved unrelated
+// response harmless, and it is the same reason ParseSessionStats and
+// ParseSessionFile each check their own `command` field.
 //
 // **A missing session file is not an error.** A session created in-memory
 // legitimately has none, and ADR 032 item 5 needs that case to reach the caller as
 // `not_collected` rather than as a failure. So an empty `sessionFile` returns a
 // zero SessionFile with a nil error, and only a stream that ends before *any*
 // answer arrives is an error — because then nothing is known at all.
+//
+// **A missing fork-message answer is not an error either, and is not awaited as
+// one.** It is the third command on this turn and the least important of the
+// three: the session file is item 1's artifact and the accounting is ADR 023's, so
+// a Pi that answers those two and ignores this one must still have them reported.
+// The answer is therefore taken if it arrives within `forkMessagesGrace` of the
+// required pair, and otherwise left with `Asked=false` — which is the honest
+// answer, since nothing then established whether there are fork points.
 //
 // Every failure path is therefore reported to the caller rather than retried:
 // there is nothing left to retry against.
@@ -123,14 +166,46 @@ func fetchSessionStats(
 	if err := rpcClient.Send(rpc.Command{Type: rpc.CommandGetState}); err != nil {
 		return sessionReport{}, fmt.Errorf("failed to request session state: %w", err)
 	}
+	if err := rpcClient.Send(rpc.Command{Type: rpc.CommandGetForkMessages}); err != nil {
+		return sessionReport{}, fmt.Errorf("failed to request fork messages: %w", err)
+	}
 
-	// Both answers are awaited, but only the stats answer is *required*: it is
-	// the older contract (ADR 023) and a session that cannot report its accounting
-	// is a genuine failure to read. The state answer is awaited too, because it is
-	// what ADR 032 item 1 exists for, and returning before it arrives would make
-	// the session file depend on which response happened to win the race.
+	// Two answers are *required* — the stats (ADR 023's older contract) and the
+	// state (what ADR 032 item 1 exists for) — and the fork messages are awaited
+	// best-effort behind a short grace, so a Pi that answers the first two cannot
+	// lose them to a third command it ignored (see forkMessagesGrace).
+	//
+	// The loop returns only once the required pair is in; the grace only decides
+	// whether it waits a little longer for the third. A partial report is a result,
+	// not an error: the required facts are what make it usable.
 	var report sessionReport
 	var gotStats bool
+	// armed is the grace timer for the fork-messages answer, started once the
+	// required pair has arrived and never before — so it cannot extend the turn
+	// while something required is still outstanding.
+	var grace *time.Timer
+	var graceC <-chan time.Time
+	defer func() {
+		if grace != nil {
+			grace.Stop()
+		}
+	}()
+
+	// finish tears the turn down and returns the report as it stands, which is the
+	// one exit path for "the required pair arrived" — whether the fork answer came,
+	// ran out of grace, or the caller stopped waiting.
+	finish := func() (sessionReport, error) {
+		if err := closeUsageTurn(statsCtx, rpcClient, attachErr, namespace, podName); err != nil {
+			// The readings were read successfully, but the attach did not
+			// tear down cleanly. Report them anyway and let the caller log the
+			// teardown problem: discarding a real reading because of a late
+			// attach hiccup would lose data for no benefit — the pod is
+			// deleted next regardless.
+			log.Printf("worker: usage turn for pod %s/%s did not close cleanly: %v", namespace, podName, err)
+		}
+		return report, nil
+	}
+
 	for {
 		select {
 		case ev, ok := <-rpcClient.Events():
@@ -143,8 +218,12 @@ func fetchSessionStats(
 			} else if session, matched := rpc.ParseSessionFile(ev); matched {
 				report.Session = session
 				report.stateAnswered = true
-				// The loop keeps going until *both* have been seen, so the order Pi
-				// answers in does not change the result.
+			} else if fork, matched := rpc.ParseForkMessages(ev); matched {
+				report.Fork = fork
+				// Answered: return immediately rather than waiting out the grace.
+				if gotStats && report.stateAnswered {
+					return finish()
+				}
 			} else {
 				// Every other line on this stream is agent traffic this call
 				// has no interest in.
@@ -153,15 +232,27 @@ func fetchSessionStats(
 			if !gotStats || !report.stateAnswered {
 				continue
 			}
-			if err := closeUsageTurn(statsCtx, rpcClient, attachErr, namespace, podName); err != nil {
-				// The readings were read successfully, but the attach did not
-				// tear down cleanly. Report them anyway and let the caller log the
-				// teardown problem: discarding a real reading because of a late
-				// attach hiccup would lose data for no benefit — the pod is
-				// deleted next regardless.
-				log.Printf("worker: usage turn for pod %s/%s did not close cleanly: %v", namespace, podName, err)
+			// The required pair is in. The fork answer may already have arrived — a
+			// real Pi answers in a different order from the one commands are sent,
+			// so it often does — in which case there is nothing left to wait for.
+			if report.Fork.Asked {
+				return finish()
 			}
-			return report, nil
+			// Otherwise give it a bounded moment to arrive. `continue` rather than
+			// falling through, so a duplicate of an already-read answer cannot
+			// return early while the fork answer is still outstanding.
+			if grace == nil {
+				grace = time.NewTimer(forkMessagesGrace)
+				graceC = grace.C
+			}
+			continue
+
+		case <-graceC:
+			// The fork answer never came. `Asked` stays false, which is how the
+			// API tells "Pi said there are none" from "nobody found out"
+			// (ADR 032 item 5) — it must not be inferred from an empty list.
+			log.Printf("worker: no fork-message answer for pod %s/%s within %s; the session and its accounting are unaffected", namespace, podName, forkMessagesGrace)
+			return finish()
 
 		case err := <-attachErr:
 			if err == nil {

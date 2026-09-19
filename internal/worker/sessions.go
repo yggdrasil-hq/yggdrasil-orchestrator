@@ -43,6 +43,10 @@ const DefaultSessionMaxBytes int64 = 5_000_000
 // the same reason recordingPoster exists.
 type sessionPoster interface {
 	PostJobSession(ctx context.Context, artifact apiclient.SessionArtifact, data []byte) error
+	// PostJobForkPoints reports ADR 032 item 2's capture. On this interface rather
+	// than reached for directly because it is a second, separate call about the same
+	// run — see collectSession for why it cannot ride with the bytes.
+	PostJobForkPoints(ctx context.Context, jobID string, outcome string, points []rpc.ForkPoint) error
 }
 
 // sessionCollection captures everything needed to fetch one job's Pi session
@@ -72,7 +76,11 @@ type sessionCollection struct {
 	// sessionID is Pi's own id for this session, carried so the artifact can
 	// report it without a second round trip. Empty when Pi reported none.
 	sessionID string
-	maxBytes  int64
+	// fork is ADR 032 item 2's answer, captured on the same terminal turn as the
+	// session file. `Asked` is what makes an empty Points a fact rather than an
+	// absence of information, and it is carried to the API as its own outcome.
+	fork     rpc.ForkMessages
+	maxBytes int64
 }
 
 // SessionCollectionOutcome is what became of one job's session file, and it is
@@ -232,6 +240,22 @@ func collectSession(ctx context.Context, c sessionCollection) SessionCollectionO
 		return c.report(ctx, sessionArtifactFor(c.jobID, SessionNotCollected), nil)
 	}
 
+	// ADR 032 item 2's fork points, posted **before** the read rather than after it,
+	// and independently of how the read goes.
+	//
+	// **Why it is not gated on the session being collected.** These are the one thing
+	// here that cannot be re-obtained: `get_fork_messages` needs a live Pi process, and
+	// the pod is deleted as soon as this function returns, whereas the bytes are still
+	// on disk for as long as the read takes. So a transient upload failure (which
+	// downgrades the session to `unavailable`) must not also discard the fork points —
+	// they are unrecoverable, and storing them costs nothing. The API independently
+	// gates their *display* on the session being available (`canFork`), so a fork point
+	// with no stored session is inert rather than misleading.
+	//
+	// Best-effort in both directions: a failure here is logged and never fails the job,
+	// exactly like every other artifact post.
+	c.reportForkPoints(ctx)
+
 	data, err := c.read(ctx, c.namespace, c.podName, recordingContainer, c.filePath)
 	if err != nil {
 		// A read failure is `unavailable`, not `not_collected`: the file was
@@ -278,4 +302,41 @@ func (c sessionCollection) report(
 		}
 	}
 	return outcome
+}
+
+// reportForkPoints posts ADR 032 item 2's capture as its own call.
+//
+// **The outcome is derived from `Asked`, and that derivation is the whole point.**
+// A slice cannot express the difference between "asked and there are none" and
+// "nobody found out", so it is `Asked` — not `len(fork.Points)` — that chooses
+// between the two wire outcomes. Reading the length instead is the bug this function
+// is shaped to make hard: it would report an unanswered question as an answered one
+// with no points, which is the collapse ADR 032 item 5 exists to prevent, and it
+// would do it on the strength of a zero value.
+//
+// A failure to post is logged and dropped. The run's real outcome was relayed long
+// before this, and the API's `unknown` state already means exactly what happened:
+// this API was never told. So there is nothing to invent and nothing to retry
+// against — the same posture as every other side channel in this package.
+func (c sessionCollection) reportForkPoints(ctx context.Context) {
+	outcome := apiclient.ForkPointsUnavailable
+	var points []rpc.ForkPoint
+	if c.fork.Asked {
+		outcome = apiclient.ForkPointsCaptured
+		// A nil slice for "answered with none" and a non-nil empty one would marshal
+		// differently (`null` and `[]`), and the API accepts either — but normalising
+		// here keeps the payload one shape per outcome, which is what the API's
+		// validator is written against.
+		points = c.fork.Points
+		if points == nil {
+			points = []rpc.ForkPoint{}
+		}
+	}
+	if err := c.api.PostJobForkPoints(ctx, c.jobID, outcome, points); err != nil {
+		log.Printf(
+			"worker: failed to report fork points for job %s (outcome %s): %v — "+
+				"the session is unaffected, and the API will report these as unknown rather than as none",
+			c.jobID, outcome, err,
+		)
+	}
 }

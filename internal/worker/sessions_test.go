@@ -31,6 +31,15 @@ type fakeSessionPoster struct {
 	artifact apiclient.SessionArtifact
 	data     []byte
 	err      error
+
+	// The fork-points half (ADR 032 item 2). A separate call on the same poster, so
+	// it gets its own counters — a test asserting on `calls` for the session must not
+	// be satisfied by the fork-points post, which is exactly the confusion sharing one
+	// counter would create.
+	forkCalls   int
+	forkOutcome string
+	forkPoints  []rpc.ForkPoint
+	forkErr     error
 }
 
 func (f *fakeSessionPoster) PostJobSession(
@@ -42,6 +51,18 @@ func (f *fakeSessionPoster) PostJobSession(
 	f.artifact = artifact
 	f.data = data
 	return f.err
+}
+
+func (f *fakeSessionPoster) PostJobForkPoints(
+	_ context.Context,
+	_ string,
+	outcome string,
+	points []rpc.ForkPoint,
+) error {
+	f.forkCalls++
+	f.forkOutcome = outcome
+	f.forkPoints = points
+	return f.forkErr
 }
 
 // sessionFixture is a collection whose reader returns body, so each test states
@@ -60,7 +81,13 @@ func sessionFixture(poster *fakeSessionPoster, body []byte) sessionCollection {
 		// A successful ask, so fileUnknown is false — the fixture represents the
 		// normal case and each test that needs an unanswered ask sets it.
 		fileUnknown: false,
-		maxBytes:    1000,
+		// An answered fork-message question with one point, for the same reason: the
+		// fixture is the normal case, and the tests about the unanswered case set it.
+		fork: rpc.ForkMessages{
+			Asked:  true,
+			Points: []rpc.ForkPoint{{EntryID: "a1b2c3d4", Text: "first reply"}},
+		},
+		maxBytes: 1000,
 	}
 }
 
@@ -354,5 +381,123 @@ func TestSessionFileAskedIsSetOnlyByAnAnswer(t *testing.T) {
 	// distinction above reachable.
 	if _, ok := rpc.ParseSessionFile(rawEvent(t, `{"type":"response","command":"get_state","success":false}`)); ok {
 		t.Fatal("a failed response must not parse as an answer")
+	}
+}
+
+// The fork points are reported as `captured` when Pi answered, with the points it
+// gave — the ordinary case (ADR 032 item 2).
+func TestCollectSessionReportsCapturedForkPoints(t *testing.T) {
+	poster := &fakeSessionPoster{}
+	collectSession(context.Background(), sessionFixture(poster, []byte("jsonl")))
+
+	if poster.forkCalls != 1 {
+		t.Fatalf("expected one fork-points report, got %d", poster.forkCalls)
+	}
+	if poster.forkOutcome != apiclient.ForkPointsCaptured {
+		t.Fatalf("outcome = %q, want %q", poster.forkOutcome, apiclient.ForkPointsCaptured)
+	}
+	if len(poster.forkPoints) != 1 || poster.forkPoints[0].EntryID != "a1b2c3d4" {
+		t.Fatalf("points = %+v, want the one entry the fixture captured", poster.forkPoints)
+	}
+}
+
+// **An unanswered fork-message question is `unavailable` even when the captured
+// Points are non-empty**, and this test exists because the opposite is the easy
+// mistake: choosing the wire outcome from `len(points)` rather than from `Asked`.
+//
+// It cannot happen through the real capture path (an unanswered turn leaves the
+// whole rpc.ForkMessages at its zero value, so the length is zero too), which is
+// exactly why it is worth pinning: the guard is the *derivation*, and a derivation
+// that only works because its two inputs happen to agree today is one refactor away
+// from reporting "this run has no fork points" for a question nobody answered. ADR
+// 032 item 5 forbids that collapse, and this is the assertion that makes it a test
+// rather than a comment.
+func TestCollectSessionReportsUnansweredForkPointsAsUnavailableNotEmpty(t *testing.T) {
+	poster := &fakeSessionPoster{}
+	collection := sessionFixture(poster, []byte("jsonl"))
+	// Asked=false with points present: the inconsistent shape the real path cannot
+	// produce, used here to prove the outcome follows the flag and not the slice.
+	collection.fork = rpc.ForkMessages{
+		Asked:  false,
+		Points: []rpc.ForkPoint{{EntryID: "a1b2c3d4", Text: "first reply"}},
+	}
+
+	collectSession(context.Background(), collection)
+
+	if poster.forkOutcome != apiclient.ForkPointsUnavailable {
+		t.Fatalf("outcome = %q, want %q — the outcome must follow Asked, not the length "+
+			"of the points", poster.forkOutcome, apiclient.ForkPointsUnavailable)
+	}
+	if len(poster.forkPoints) != 0 {
+		t.Fatalf("points = %+v, want none: an unanswered question carries no list", poster.forkPoints)
+	}
+}
+
+// A session Pi answered about but that produced no file is `not_collected`, and the
+// fork points are not reported at all — there is no session to fork to, so recording
+// anything about resuming it would describe a capability that cannot exist.
+func TestCollectSessionDoesNotReportForkPointsWithoutASessionFile(t *testing.T) {
+	poster := &fakeSessionPoster{}
+	collection := sessionFixture(poster, nil)
+	collection.filePath = ""
+	collection.fileUnknown = false
+
+	got := collectSession(context.Background(), collection)
+
+	if got != SessionNotCollected {
+		t.Fatalf("outcome = %q, want %q", got, SessionNotCollected)
+	}
+	if poster.forkCalls != 0 {
+		t.Fatalf("reported fork points %d times for a run with no session file", poster.forkCalls)
+	}
+}
+
+// The fork-points post is a side channel: a failure there must not change the
+// session's outcome, because the two are separate reports about one run and the
+// session's is the one the user is shown.
+func TestCollectSessionSurvivesAFailedForkPointsPost(t *testing.T) {
+	poster := &fakeSessionPoster{forkErr: errors.New("API unreachable")}
+	got := collectSession(context.Background(), sessionFixture(poster, []byte("jsonl")))
+
+	if got != SessionCollected {
+		t.Fatalf("outcome = %q, want %q — a fork-points failure must not downgrade the "+
+			"session, which was stored successfully", got, SessionCollected)
+	}
+	if poster.calls != 1 {
+		t.Fatalf("session posts = %d, want 1", poster.calls)
+	}
+}
+
+// **An answered question with no points is `captured` with an empty list, not
+// `unavailable`** — and this is the case the mutation above it found missing.
+//
+// A real Pi 0.84.4 answers `get_fork_messages` on a session with no user messages
+// with `{"messages":[]}` (captured in internal/rpc/fork_messages_test.go), so this is
+// a fact Pi states rather than a failure: there is nothing to resume from. Reporting
+// it as `unavailable` would tell a user "we could not find out which points you can
+// resume from" when Pi in fact told us there are none — the same collapse in the
+// opposite direction from the unanswered case, and equally wrong. The wire outcome
+// therefore follows `Asked` alone.
+//
+// Found by mutating the derivation to also require `len(points) > 0`: every other
+// test still passed, because they all had either no points *and* Asked=false, or
+// points *and* Asked=true. This is the input that separates them.
+func TestCollectSessionReportsAnAnsweredEmptyForkPointListAsCaptured(t *testing.T) {
+	poster := &fakeSessionPoster{}
+	collection := sessionFixture(poster, []byte("jsonl"))
+	collection.fork = rpc.ForkMessages{Asked: true, Points: nil}
+
+	collectSession(context.Background(), collection)
+
+	if poster.forkOutcome != apiclient.ForkPointsCaptured {
+		t.Fatalf("outcome = %q, want %q — an empty list Pi answered with is a fact, "+
+			"not an unanswered question", poster.forkOutcome, apiclient.ForkPointsCaptured)
+	}
+	if poster.forkPoints == nil {
+		t.Fatal("points = nil, want an empty non-nil slice: a captured outcome must " +
+			"carry a list, or the API cannot tell it from an unanswered one")
+	}
+	if len(poster.forkPoints) != 0 {
+		t.Fatalf("points = %+v, want none", poster.forkPoints)
 	}
 }
