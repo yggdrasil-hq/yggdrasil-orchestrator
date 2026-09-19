@@ -149,12 +149,11 @@ func (o SessionCollectionOutcome) CollectsSession() bool {
 //
 // Extracted from the collection function so the mapping is unit-testable without
 // a cluster — the same reason usageReportFrom exists.
-func sessionArtifactFrom(jobID string, session rpc.SessionFile, byteSize int64) apiclient.SessionArtifact {
+func sessionArtifactFrom(jobID string, session rpc.SessionFile) apiclient.SessionArtifact {
 	return apiclient.SessionArtifact{
 		JobID:       jobID,
 		Outcome:     string(SessionCollected),
 		SessionID:   session.SessionID,
-		ByteSize:    byteSize,
 		PodFilePath: session.FilePath,
 	}
 }
@@ -252,7 +251,7 @@ func collectSession(ctx context.Context, c sessionCollection) SessionCollectionO
 	// outcome saying `collected` without the object beside it (or the reverse).
 	return c.report(ctx, sessionArtifactFrom(c.jobID, rpc.SessionFile{
 		FilePath: c.filePath, SessionID: c.sessionID,
-	}, int64(len(data))), data)
+	}), data)
 }
 
 // report posts one artifact and returns the outcome that was actually reported.
