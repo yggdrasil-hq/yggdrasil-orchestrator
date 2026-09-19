@@ -330,7 +330,10 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 			podName:   podName,
 			filePath:  sessionFile.FilePath,
 			sessionID: sessionFile.SessionID,
-			maxBytes:  cfg.SessionMaxBytes,
+			// Asked=false means the terminal read did not complete, so an empty
+			// filePath is "unknown" rather than "none" (ADR 032 item 5).
+			fileUnknown: !sessionFile.Asked,
+			maxBytes:    cfg.SessionMaxBytes,
 		})
 		cancelCollect()
 	}
@@ -635,6 +638,13 @@ func repoLocalDir(repo apiclient.FeatureSpecRepo) string {
 // it", which keeps the many tests that only care about session control from
 // having to supply a destination.
 //
+// The pointed-to struct's **Asked** field is set even when the terminal read
+// fails, and that is the load-bearing half: an unanswered question must not leave
+// the caller unable to tell "no session was written" from "the ask never
+// completed", which is the distinction ADR 032 item 5 turns on. So this
+// initialises it to "not asked" before the call and only the successful path
+// clears it.
+//
 // Each turn is its own k8s.Attach call (runTurn), not one continuous attach
 // for the whole session — see k8s.Attach's doc comment for why: client-go's
 // remotecommand doesn't reliably deliver a second stdin write within one
@@ -705,11 +715,19 @@ func driveAgentSession(
 			// function returns, because that needs a pod exec and belongs in the
 			// same window as the recording.
 			if report, statsErr := fetchStats(runCtx, rpcClient, namespace, podName); statsErr != nil {
+				// The session file path is *unknown*, not absent — sessionOut keeps
+				// its zero value, whose Asked=false is what makes collectSession
+				// report `unavailable` rather than asserting the run wrote no
+				// session (ADR 032 item 5).
 				log.Printf("worker: failed to capture token usage for job %s: %v", jobID, statsErr)
 			} else {
 				reportUsage(report.Stats, turnDuration)
 				if sessionOut != nil {
-					*sessionOut = report.Session
+					*sessionOut = rpc.SessionFile{
+						FilePath:  report.Session.FilePath,
+						SessionID: report.Session.SessionID,
+						Asked:     true,
+					}
 				}
 			}
 			if curated.Type == rpc.EventRunFailed {

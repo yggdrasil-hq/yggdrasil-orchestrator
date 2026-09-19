@@ -2,11 +2,26 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/apiclient"
+	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/rpc"
 )
+
+// rawEvent builds an rpc.Event from a JSONL line, the same helper the rpc
+// package's own tests use.
+func rawEvent(t *testing.T, line string) rpc.Event {
+	t.Helper()
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal([]byte(line), &envelope); err != nil {
+		t.Fatalf("bad fixture: %v", err)
+	}
+	return rpc.Event{Type: envelope.Type, Raw: json.RawMessage(line)}
+}
 
 // fakeSessionPoster records what collectSession reported, so a test can assert on
 // the artifact *and* the bytes together — which is the point of the single-call
@@ -42,7 +57,10 @@ func sessionFixture(poster *fakeSessionPoster, body []byte) sessionCollection {
 		podName:   "pod-1",
 		filePath:  "/root/.pi/agent/sessions/session.jsonl",
 		sessionID: "sess-abc",
-		maxBytes:  1000,
+		// A successful ask, so fileUnknown is false — the fixture represents the
+		// normal case and each test that needs an unanswered ask sets it.
+		fileUnknown: false,
+		maxBytes:    1000,
 	}
 }
 
@@ -107,6 +125,13 @@ func TestCollectSessionReportsEachFailingOutcomeDistinctly(t *testing.T) {
 		},
 		"an oversized artifact is unavailable": {
 			mutate: func(c *sessionCollection) { c.maxBytes = 4 },
+			want:   SessionUnavailable,
+		},
+		"an unanswered terminal read is unavailable, not not_collected": {
+			// The distinction that is easiest to get wrong, because from this
+			// struct's point of view it looks exactly like "no session": both
+			// leave an empty filePath. Only fileUnknown separates them.
+			mutate: func(c *sessionCollection) { c.fileUnknown = true; c.filePath = "" },
 			want:   SessionUnavailable,
 		},
 		"collection switched off is disabled": {
@@ -280,5 +305,51 @@ func TestSessionArtifactForCarriesNoIdentityForAFailingOutcome(t *testing.T) {
 		if artifact.SessionID != "" || artifact.PodFilePath != "" || artifact.ByteSize != 0 {
 			t.Errorf("outcome %q carried identity fields: %+v", outcome, artifact)
 		}
+	}
+}
+
+// The mutation this guards is the one the field was added for: treating an
+// unanswered ask as "no session". Both leave an empty filePath, so nothing else in
+// the struct can tell them apart — and the two need different words in front of a
+// user (ADR 032 item 5).
+func TestCollectSessionDistinguishesAnUnansweredAskFromNoSession(t *testing.T) {
+	unanswered := &fakeSessionPoster{}
+	collection := sessionFixture(unanswered, nil)
+	collection.filePath = ""
+	collection.fileUnknown = true
+	got := collectSession(context.Background(), collection)
+	if got != SessionUnavailable {
+		t.Fatalf("an unanswered terminal read reported %q, want %q", got, SessionUnavailable)
+	}
+
+	noSession := &fakeSessionPoster{}
+	collection = sessionFixture(noSession, nil)
+	collection.filePath = ""
+	collection.fileUnknown = false
+	got = collectSession(context.Background(), collection)
+	if got != SessionNotCollected {
+		t.Fatalf("a session Pi answered about reported %q, want %q", got, SessionNotCollected)
+	}
+
+	// And they are not the same value, which is the whole point.
+	if SessionUnavailable == SessionNotCollected {
+		t.Fatal("the two outcomes are indistinguishable")
+	}
+}
+
+// A session id Pi reported before the read failed is still worth carrying, so the
+// zeroing above is about the *path*, not the whole struct.
+func TestSessionFileAskedIsSetOnlyByAnAnswer(t *testing.T) {
+	ev := rawEvent(t, `{"type":"response","command":"get_state","success":true,"data":{"sessionFile":"/s.jsonl","sessionId":"abc"}}`)
+	session, ok := rpc.ParseSessionFile(ev)
+	if !ok || !session.Asked {
+		t.Fatalf("a parsed answer must record that it was asked: %+v ok=%v", session, ok)
+	}
+
+	// A failed response is not an answer, so it must not parse at all — the
+	// caller's zero value then means "not asked", which is what makes the
+	// distinction above reachable.
+	if _, ok := rpc.ParseSessionFile(rawEvent(t, `{"type":"response","command":"get_state","success":false}`)); ok {
+		t.Fatal("a failed response must not parse as an answer")
 	}
 }
