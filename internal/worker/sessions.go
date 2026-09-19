@@ -57,6 +57,18 @@ type sessionCollection struct {
 	namespace string
 	podName   string
 	filePath  string
+	// fileUnknown records that Pi was never successfully asked where its session
+	// file is, so an empty filePath must not be read as "there is none".
+	//
+	// This is the item-5 distinction applied to the *ask* rather than the read, and
+	// it is the case that is easiest to get wrong: the terminal turn can fail (a
+	// wedged exec, a stream that ends early, the timeout), which leaves no path and
+	// no error from this struct's point of view — indistinguishable, without this
+	// field, from a session that legitimately reported none. The two need different
+	// words in front of a user: "this run did not save a session" is a fact about
+	// the run, "this run's session could not be retrieved" is a fact about the
+	// retrieval.
+	fileUnknown bool
 	// sessionID is Pi's own id for this session, carried so the artifact can
 	// report it without a second round trip. Empty when Pi reported none.
 	sessionID string
@@ -210,6 +222,13 @@ func collectSession(ctx context.Context, c sessionCollection) SessionCollectionO
 	// and no point touching the pod. This is the pod-killed-early case, and
 	// distinguishing it here rather than letting the read fail is what makes
 	// `not_collected` honest rather than a guess.
+	if c.fileUnknown {
+		// Pi was never asked, or the ask failed, so whether a session exists is
+		// unknown. Reporting `not_collected` here would assert a fact about the run
+		// that nothing established — the whole reason this field exists.
+		log.Printf("worker: no session file reported for job %s: the terminal read did not complete", c.jobID)
+		return c.report(ctx, sessionArtifactFor(c.jobID, SessionUnavailable), nil)
+	}
 	if c.filePath == "" {
 		return c.report(ctx, sessionArtifactFor(c.jobID, SessionNotCollected), nil)
 	}

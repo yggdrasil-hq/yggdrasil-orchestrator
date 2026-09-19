@@ -32,6 +32,20 @@ const CommandGetState = "get_state"
 type SessionFile struct {
 	FilePath  string
 	SessionID string
+	// Asked records that Pi actually answered the question, so an empty FilePath
+	// is a *fact* rather than an absence of information.
+	//
+	// **This field is why the type is not just two strings.** Pi documents
+	// `sessionFile` as part of the state object, but a session created with
+	// `--no-session` (or `SessionManager.inMemory`) legitimately has none — and a
+	// terminal read that never completed also leaves the path empty. Those are
+	// different facts with different consequences (ADR 032 item 5: `not_collected`
+	// versus `unavailable`), and Go's zero value would make them identical.
+	//
+	// A separate field rather than a pointer to the whole struct because the two
+	// strings are still worth carrying when the ask failed — an id Pi reported
+	// before failing is not made useless by the failure.
+	Asked bool
 }
 
 // sessionStateResponse mirrors just enough of Pi's get_state response envelope
@@ -75,5 +89,6 @@ func ParseSessionFile(ev Event) (SessionFile, bool) {
 	return SessionFile{
 		FilePath:  parsed.Data.SessionFile,
 		SessionID: parsed.Data.SessionID,
+		Asked:     true,
 	}, true
 }
