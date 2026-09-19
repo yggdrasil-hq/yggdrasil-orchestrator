@@ -905,3 +905,143 @@ func TestPostJobScreenshot_UsesTheDocumentedRoute(t *testing.T) {
 		t.Fatalf("screenshot upload must not target the recording route, got %q", gotPath)
 	}
 }
+
+/*
+ * Issue #38's transport, tested as a **whole path** rather than hop by hop.
+ *
+ * The structured half of an `ask_user` question crosses two places that each
+ * drop unknown fields silently:
+ *
+ *	Pi event → rpc.Translate → rpc.CuratedEvent → PostJobEvent → JSON body
+ *	              (struct)                          (explicit field list)
+ *
+ * `Translate` builds a `CuratedEvent` literal, so a field it does not name is
+ * lost; `jobEventRequest` is an explicit field list, so a field missing there is
+ * lost *again*, one hop later. Either drop is invisible at runtime — the question
+ * still arrives, just without its choices — which is the same shape as #59's
+ * verdict, validated and acted on and then discarded.
+ *
+ * So these cases start from the raw Pi JSON and assert on the marshalled body. A
+ * test that stopped at `Translate` would not have caught the second drop, and one
+ * that only checked presence would not have caught an option list arriving with
+ * its labels stripped.
+ */
+func TestPostJobEvent_CarriesAStructuredQuestionThroughBothHops(t *testing.T) {
+	var gotBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	raw := `{"type":"tool_execution_end","toolName":"ask_user","result":{"details":{` +
+		`"kind":"ask_user",` +
+		`"question":"Which database should the API use?",` +
+		`"header":"Database",` +
+		`"multiSelect":false,` +
+		`"options":[` +
+		`{"label":"PostgreSQL","description":"Matches the existing API stack"},` +
+		`{"label":"SQLite"}` +
+		`]},"terminate":true}}`
+
+	curated, ok := rpc.Translate(rpc.Event{Type: "tool_execution_end", Raw: json.RawMessage(raw)})
+	if !ok {
+		t.Fatal("expected the ask_user tool call to translate")
+	}
+
+	// Hop one: the fields must exist on the curated event, not just be present in
+	// the JSON Pi sent.
+	if curated.QuestionHeader != "Database" {
+		t.Fatalf("Translate dropped the header, got %q", curated.QuestionHeader)
+	}
+	if curated.QuestionMultiSelect == nil || *curated.QuestionMultiSelect {
+		t.Fatalf("Translate dropped multiSelect, got %v", curated.QuestionMultiSelect)
+	}
+	if curated.QuestionOptions == nil || len(*curated.QuestionOptions) != 2 {
+		t.Fatalf("Translate dropped the options, got %v", curated.QuestionOptions)
+	}
+
+	client := apiclient.New(server.URL, "test-token")
+	if err := client.PostJobEvent(context.Background(), "job-structured", curated); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Hop two: and the values must survive the request body. Asserting the values
+	// rather than the keys is the point — `jobEventRequest` would happily send an
+	// empty options array if the slice were dropped.
+	if gotBody["header"] != "Database" {
+		t.Fatalf("expected header in the body, got %v", gotBody["header"])
+	}
+	// Present-and-false, not absent: the API reads presence of `options` as
+	// "structured", and an omitted multiSelect would be the API's problem to
+	// guess. It defaults to false, so a *missing* key here still means false —
+	// but a dropped one is indistinguishable from an unasked question, so it is
+	// asserted explicitly.
+	multiSelect, present := gotBody["multiSelect"]
+	if !present || multiSelect != false {
+		t.Fatalf("expected an explicit multiSelect=false in the body, got %v (present=%v)", multiSelect, present)
+	}
+
+	options, ok := gotBody["options"].([]any)
+	if !ok || len(options) != 2 {
+		t.Fatalf("expected two options in the body, got %v", gotBody["options"])
+	}
+	first, ok := options[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected the first option to be an object, got %T", options[0])
+	}
+	if first["label"] != "PostgreSQL" || first["description"] != "Matches the existing API stack" {
+		t.Fatalf("option values did not survive the marshalling: %v", first)
+	}
+	// The option with no description must send no description key rather than an
+	// empty string — the API normalises absent to null, and an empty string would
+	// render as a blank line under the label.
+	second := options[1].(map[string]any)
+	if _, present := second["description"]; present {
+		t.Fatalf("expected no description key for an option that gave none, got %v", second["description"])
+	}
+}
+
+func TestPostJobEvent_OmitsTheStructuredFieldsForAProseQuestion(t *testing.T) {
+	/*
+	 * The other half of the contract, and the one a careless change breaks: the
+	 * API decides between a picker and a text box by whether `options` is
+	 * *present*, so a prose question must send none of the three. Emitting
+	 * `multiSelect: false` or `options: []` here would make every plain grill
+	 * question render as a picker with nothing in it.
+	 */
+	var gotBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	raw := `{"type":"tool_execution_end","toolName":"ask_user","result":{"details":{` +
+		`"kind":"ask_user","question":"What problem does this solve?"},"terminate":true}}`
+
+	curated, ok := rpc.Translate(rpc.Event{Type: "tool_execution_end", Raw: json.RawMessage(raw)})
+	if !ok {
+		t.Fatal("expected the ask_user tool call to translate")
+	}
+	if curated.QuestionMultiSelect != nil || curated.QuestionOptions != nil {
+		t.Fatalf("a prose question must carry no structured fields, got %v / %v",
+			curated.QuestionMultiSelect, curated.QuestionOptions)
+	}
+
+	client := apiclient.New(server.URL, "test-token")
+	if err := client.PostJobEvent(context.Background(), "job-prose", curated); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if gotBody["question"] != "What problem does this solve?" {
+		t.Fatalf("expected the question itself, got %v", gotBody["question"])
+	}
+	for _, key := range []string{"header", "multiSelect", "options"} {
+		if _, present := gotBody[key]; present {
+			t.Fatalf("expected %q to be absent from a prose question, got %v", key, gotBody[key])
+		}
+	}
+}

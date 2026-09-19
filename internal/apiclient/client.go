@@ -436,6 +436,21 @@ type jobEventRequest struct {
 	SkipReason       string            `json:"skipReason,omitempty"`
 	Snapshot         map[string]string `json:"snapshot,omitempty"`
 	HasDesignSurface *bool             `json:"hasDesignSurface,omitempty"`
+	// QuestionHeader / QuestionMultiSelect / QuestionOptions are the structured
+	// half of an ask_user question (issue #38).
+	//
+	// **These were the second place the fields were dropped**, and the reason the
+	// round-trip test walks all the way to this marshalled body rather than
+	// stopping at `rpc.Translate`: this struct is an explicit field list, so a
+	// field that survives translation and is missing here is discarded with no
+	// error — the same shape as #59's verdict, one hop further along.
+	//
+	// Pointers for the reason `rpc.CuratedEvent` documents at length: the API reads
+	// the *presence* of `options` as "render a picker", so an absent field has to
+	// stay absent rather than becoming `false` or `[]`.
+	QuestionHeader      string                `json:"header,omitempty"`
+	QuestionMultiSelect *bool                 `json:"multiSelect,omitempty"`
+	QuestionOptions     *[]rpc.QuestionOption `json:"options,omitempty"`
 }
 
 // PostJobEvent relays one curated event (ADR 006 items 7-8) from a running
@@ -445,29 +460,32 @@ type jobEventRequest struct {
 // independent of whether this side-channel post succeeded.
 func (c *Client) PostJobEvent(ctx context.Context, jobID string, event rpc.CuratedEvent) error {
 	body, err := json.Marshal(jobEventRequest{
-		Type:             string(event.Type),
-		Question:         event.Question,
-		Markdown:         event.Markdown,
-		Message:          event.Message,
-		Status:           event.Status,
-		PRUrl:            event.PRUrl,
-		Summary:          event.Summary,
-		Verdict:          event.Verdict,
-		ActionItems:      event.ActionItems,
-		TestName:         event.TestName,
-		TestStatus:       event.TestStatus,
-		TestDetails:      event.TestDetails,
-		ScreenshotPath:   event.ScreenshotPath,
-		Passed:           event.Passed,
-		Failed:           event.Failed,
-		Skipped:          event.Skipped,
-		Total:            event.Total,
-		CoveragePercent:  event.CoveragePercent,
-		FailingTests:     event.FailingTests,
-		RecordingPath:    event.RecordingPath,
-		SkipReason:       event.SkipReason,
-		Snapshot:         event.Snapshot,
-		HasDesignSurface: event.HasDesignSurface,
+		Type:                string(event.Type),
+		Question:            event.Question,
+		Markdown:            event.Markdown,
+		Message:             event.Message,
+		Status:              event.Status,
+		PRUrl:               event.PRUrl,
+		Summary:             event.Summary,
+		Verdict:             event.Verdict,
+		ActionItems:         event.ActionItems,
+		TestName:            event.TestName,
+		TestStatus:          event.TestStatus,
+		TestDetails:         event.TestDetails,
+		ScreenshotPath:      event.ScreenshotPath,
+		Passed:              event.Passed,
+		Failed:              event.Failed,
+		Skipped:             event.Skipped,
+		Total:               event.Total,
+		CoveragePercent:     event.CoveragePercent,
+		FailingTests:        event.FailingTests,
+		RecordingPath:       event.RecordingPath,
+		SkipReason:          event.SkipReason,
+		Snapshot:            event.Snapshot,
+		HasDesignSurface:    event.HasDesignSurface,
+		QuestionHeader:      event.QuestionHeader,
+		QuestionMultiSelect: event.QuestionMultiSelect,
+		QuestionOptions:     event.QuestionOptions,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to encode job event: %w", err)
