@@ -601,10 +601,13 @@ type SessionArtifact struct {
 	// SessionID is Pi's own session id — what a `switch_session` resumes by — and
 	// is empty when Pi reported none.
 	SessionID string `json:"sessionId,omitempty"`
-	// ByteSize is the size of the uploaded JSONL, and is 0 when there was nothing
-	// to upload. It is derived from the bytes rather than sent separately, so it
-	// cannot disagree with them.
-	ByteSize int64 `json:"byteSize,omitempty"`
+	// There is deliberately **no ByteSize field.** The bytes are the request body,
+	// so the API knows the size from what it receives — and that number is
+	// authoritative, where a value sent alongside could disagree with the body it
+	// describes. An earlier draft carried one and never sent it, which is the
+	// "declared, marshalled, discarded" shape this suite has already had to fix
+	// several times; the field is gone rather than wired up, because the second
+	// source is the thing to avoid.
 	// PodFilePath is the pod-local path the artifact was read from — evidence of
 	// *which* file was read, not a storage key (the API derives the key from the
 	// job id, the way recordingKey does). Worthless once the pod is gone, and

@@ -88,8 +88,11 @@ func TestCollectSessionUploadsTheBytesAndReportsCollected(t *testing.T) {
 	if poster.artifact.SessionID != "sess-abc" {
 		t.Errorf("reported session id %q, want sess-abc", poster.artifact.SessionID)
 	}
-	if poster.artifact.ByteSize != int64(len("jsonl-bytes")) {
-		t.Errorf("reported size %d, want %d", poster.artifact.ByteSize, len("jsonl-bytes"))
+	// No size field: the bytes are the body, so the API derives it from what it
+	// receives rather than trusting a number sent alongside. Asserted by checking
+	// the body is what the API would measure.
+	if len(poster.data) == 0 {
+		t.Error("no bytes accompanied a collected outcome, so the API has nothing to size")
 	}
 	if poster.artifact.PodFilePath != "/root/.pi/agent/sessions/session.jsonl" {
 		t.Errorf("reported pod path %q", poster.artifact.PodFilePath)
@@ -302,7 +305,7 @@ func TestSessionArtifactForCarriesNoIdentityForAFailingOutcome(t *testing.T) {
 		SessionNotCollected, SessionUnavailable, SessionDisabled,
 	} {
 		artifact := sessionArtifactFor("job-1", outcome)
-		if artifact.SessionID != "" || artifact.PodFilePath != "" || artifact.ByteSize != 0 {
+		if artifact.SessionID != "" || artifact.PodFilePath != "" {
 			t.Errorf("outcome %q carried identity fields: %+v", outcome, artifact)
 		}
 	}

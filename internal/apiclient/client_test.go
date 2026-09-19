@@ -1309,7 +1309,6 @@ func TestPostJobSession_SendsRawBytesAndTheOutcomeAsQuery(t *testing.T) {
 		JobID:       "job-123",
 		Outcome:     "collected",
 		SessionID:   "01a0b867-991f-7a57-930f-4966d876d8a4",
-		ByteSize:    int64(len(payload)),
 		PodFilePath: "/root/.pi/agent/sessions/--workspace--/s.jsonl",
 	}, payload)
 	if err != nil {
