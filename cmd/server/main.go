@@ -86,6 +86,7 @@ func main() {
 		ReplyTimeout:          resolveReplyTimeout(),
 		RecordingMaxBytes:     resolveRecordingMaxBytes(),
 		ScreenshotMaxBytes:    resolveScreenshotMaxBytes(),
+		SessionMaxBytes:       resolveSessionMaxBytes(),
 
 		// Issue #19: absent by default, so a preview keeps the chart's declared
 		// image on every install that has not opted in. See the field's comment.
@@ -249,6 +250,30 @@ func resolveScreenshotMaxBytes() int64 {
 	if err != nil {
 		log.Printf("invalid SCREENSHOT_MAX_BYTES %q, using the default: %v", raw, err)
 		return worker.DefaultScreenshotMaxBytes
+	}
+	return n
+}
+
+// resolveSessionMaxBytes bounds the Pi session JSONL this replica will collect
+// from a finished job pod (ADR 032 item 1).
+//
+// Deliberately the same three cases as resolveRecordingMaxBytes above, including
+// the middle one: unset keeps the default, an explicit 0 or negative **disables**
+// collection, and an unparseable value falls back to the default rather than to
+// "off" — a typo in an env var must not silently drop every artifact.
+//
+// A separate knob from the recording's, which ADR 032 item 4 requires: a session
+// is text and far smaller than a video, so one shared value would either accept
+// an absurd session or refuse a normal recording.
+func resolveSessionMaxBytes() int64 {
+	raw := os.Getenv("SESSION_MAX_BYTES")
+	if raw == "" {
+		return worker.DefaultSessionMaxBytes
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		log.Printf("invalid SESSION_MAX_BYTES %q, using the default: %v", raw, err)
+		return worker.DefaultSessionMaxBytes
 	}
 	return n
 }

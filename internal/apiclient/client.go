@@ -576,6 +576,122 @@ func (c *Client) PostJobUsage(ctx context.Context, jobID string, usage JobUsage)
 	return nil
 }
 
+// SessionArtifact is what the Orchestrator reports about one job's Pi session
+// file (ADR 032 item 1), and it is the cross-service contract the next wave's
+// reader depends on.
+//
+// It lives here, in the apiclient package, rather than in internal/worker where
+// it is produced: this is the *wire* shape, and the two fields a reader branches
+// on (Outcome, and whether bytes accompanied it) are part of the API's contract,
+// not of the collection logic. The worker has its own `sessionArtifact` with the
+// same JSON tags and an explicit conversion, so a change to one is a compile
+// error at the other rather than a silent divergence.
+//
+// The bytes are deliberately **not** a field: they are the request body (see
+// PostJobSession), because a session is megabytes of JSONL and base64-in-JSON
+// would inflate it by a third for nothing.
+type SessionArtifact struct {
+	JobID string `json:"jobId"`
+	// Outcome is one of "collected", "not_collected", "unavailable", "disabled".
+	//
+	// A string rather than an enum type here on purpose: the API stores and
+	// returns it verbatim, so a Go type would buy nothing and would need a
+	// mapping table on the way out. The worker defines the named constants.
+	Outcome string `json:"outcome"`
+	// SessionID is Pi's own session id — what a `switch_session` resumes by — and
+	// is empty when Pi reported none.
+	SessionID string `json:"sessionId,omitempty"`
+	// ByteSize is the size of the uploaded JSONL, and is 0 when there was nothing
+	// to upload. It is derived from the bytes rather than sent separately, so it
+	// cannot disagree with them.
+	ByteSize int64 `json:"byteSize,omitempty"`
+	// PodFilePath is the pod-local path the artifact was read from — evidence of
+	// *which* file was read, not a storage key (the API derives the key from the
+	// job id, the way recordingKey does). Worthless once the pod is gone, and
+	// carried anyway for the one case it is for: a session that turns out not to
+	// hold what an operator expected.
+	PodFilePath string `json:"podFilePath,omitempty"`
+}
+
+// PostJobSession reports what became of a finished job's Pi session (ADR 032
+// item 1), uploading the JSONL bytes when there are any.
+//
+// **One call, always made, even when nothing was collected** — and that is the
+// design rather than an accident. ADR 032 item 5 requires "this run has no
+// session" to be distinguishable from "this run's session could not be
+// retrieved", and a route that is only called on success cannot express the
+// difference. So the outcome travels with every call and the body is simply empty
+// when the outcome is one of the failing three.
+//
+// The bytes are raw, matching PostJobRecording's shape and for the same two
+// reasons with the sizes shifted down: a session is text but routinely megabytes
+// (Pi appends tool results verbatim), so base64 would inflate it by a third for
+// nothing, and the API's JSON body parser has a 2 MB limit a long grill would
+// exceed before the handler ever ran. The API route carries its own raw parser at
+// the session size cap instead.
+//
+// The artifact's small fields ride as query parameters rather than as a JSON
+// envelope, because the body is already spoken for by the bytes — the same
+// arrangement, and the same reasoning, as PostJobScreenshot's `stepName`.
+//
+// Like PostJobUsage and PostJobRecording this is a side channel: the caller
+// decides what an error means, and a failure here must never change the job's
+// outcome. The API answers 202 (not 4xx) for an artifact it declines to store —
+// oversized, or a job kind that does not persist sessions — so a rejection is
+// reported as a normal error here and logged by the caller rather than treated as
+// a fault. A 201 means recorded.
+func (c *Client) PostJobSession(
+	ctx context.Context,
+	artifact SessionArtifact,
+	data []byte,
+) error {
+	query := url.Values{"outcome": {string(artifact.Outcome)}}
+	if artifact.SessionID != "" {
+		query.Set("sessionId", artifact.SessionID)
+	}
+	if artifact.PodFilePath != "" {
+		query.Set("podFilePath", artifact.PodFilePath)
+	}
+
+	endpoint := fmt.Sprintf(
+		"%s/internal/jobs/%s/session?%s",
+		c.baseURL, artifact.JobID, query.Encode(),
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/x-ndjson")
+	// The API enforces the authoritative cap; setting a body length lets it
+	// refuse an over-size artifact before buffering rather than mid-stream.
+	req.ContentLength = int64(len(data))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusCreated {
+		return nil
+	}
+	// 202 is the API's "declined, and here is why" — the same convention
+	// PostJobRecording reads, and worth surfacing verbatim for the same reason:
+	// the reason is what an operator acts on (raise the cap) and is not an error in
+	// this service.
+	if resp.StatusCode == http.StatusAccepted {
+		var declined struct {
+			Reason string `json:"reason"`
+		}
+		if decodeErr := json.NewDecoder(resp.Body).Decode(&declined); decodeErr == nil && declined.Reason != "" {
+			return fmt.Errorf("API declined the session for job %s: %s", artifact.JobID, declined.Reason)
+		}
+		return fmt.Errorf("API declined the session for job %s", artifact.JobID)
+	}
+	return fmt.Errorf("API returned status %d posting a session for job %s", resp.StatusCode, artifact.JobID)
+}
+
 // PostJobRecording uploads a job's screen recording (ADR 029) as the raw
 // bytes, not as JSON.
 //

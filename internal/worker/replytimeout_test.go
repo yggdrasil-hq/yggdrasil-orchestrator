@@ -336,7 +336,7 @@ func TestDriveAgentSession_FailsAnUnansweredQuestionRatherThanHanging(t *testing
 				received = append(received, ev)
 				mu.Unlock()
 			},
-			noStats, discardUsage,
+			noStats, discardUsage, nil,
 		)
 	}()
 
