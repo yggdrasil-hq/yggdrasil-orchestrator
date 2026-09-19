@@ -1288,3 +1288,128 @@ func TestPostJobEvent_SendsAnEmptyReviewFindingsListAsAnEmptyArray(t *testing.T)
 		t.Fatalf("expected an empty array, got %v", arr)
 	}
 }
+
+func TestPostJobSession_SendsRawBytesAndTheOutcomeAsQuery(t *testing.T) {
+	var gotAuthHeader, gotPath, gotMethod, gotQuery string
+	var gotBody []byte
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthHeader = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		gotMethod = r.Method
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	payload := []byte(`{"type":"session","id":"abc"}` + "\n")
+	err := client.PostJobSession(context.Background(), apiclient.SessionArtifact{
+		JobID:       "job-123",
+		Outcome:     "collected",
+		SessionID:   "01a0b867-991f-7a57-930f-4966d876d8a4",
+		ByteSize:    int64(len(payload)),
+		PodFilePath: "/root/.pi/agent/sessions/--workspace--/s.jsonl",
+	}, payload)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if gotMethod != http.MethodPost {
+		t.Fatalf("expected method %q, got %q", http.MethodPost, gotMethod)
+	}
+	if gotAuthHeader != "Bearer test-token" {
+		t.Fatalf("expected Authorization header %q, got %q", "Bearer test-token", gotAuthHeader)
+	}
+	if gotPath != "/internal/jobs/job-123/session" {
+		t.Fatalf("expected path %q, got %q", "/internal/jobs/job-123/session", gotPath)
+	}
+	// The bytes are the body, so every other field has to ride in the query —
+	// the same arrangement PostJobScreenshot uses for its step name.
+	if !bytes.Equal(gotBody, payload) {
+		t.Fatalf("expected the raw bytes to survive, got %q", gotBody)
+	}
+	query, err := url.ParseQuery(gotQuery)
+	if err != nil {
+		t.Fatalf("query did not parse: %v", err)
+	}
+	if query.Get("outcome") != "collected" {
+		t.Errorf("outcome = %q, want collected", query.Get("outcome"))
+	}
+	if query.Get("sessionId") != "01a0b867-991f-7a57-930f-4966d876d8a4" {
+		t.Errorf("sessionId = %q", query.Get("sessionId"))
+	}
+	if query.Get("podFilePath") != "/root/.pi/agent/sessions/--workspace--/s.jsonl" {
+		t.Errorf("podFilePath = %q", query.Get("podFilePath"))
+	}
+}
+
+// The failing outcomes are reported with an **empty body**, and this is the case
+// that pins ADR 032 item 5's wire shape: a route that were only called on success
+// could not express "the run has no session" at all. Asserted with a real request
+// because the failure mode is a client that quietly skips the call.
+func TestPostJobSession_ReportsAFailingOutcomeWithNoBytes(t *testing.T) {
+	var gotBody []byte
+	var gotQuery string
+	var calls int
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		gotBody, _ = io.ReadAll(r.Body)
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	err := client.PostJobSession(context.Background(), apiclient.SessionArtifact{
+		JobID:   "job-123",
+		Outcome: "not_collected",
+	}, nil)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	if calls != 1 {
+		t.Fatalf("expected the failing outcome to be reported, got %d calls", calls)
+	}
+	if len(gotBody) != 0 {
+		t.Errorf("expected no bytes for a session that was not collected, got %d", len(gotBody))
+	}
+	query, _ := url.ParseQuery(gotQuery)
+	if query.Get("outcome") != "not_collected" {
+		t.Errorf("outcome = %q, want not_collected", query.Get("outcome"))
+	}
+	// No identity for an artifact that does not exist: reporting an id or a path
+	// would suggest the session is there.
+	if query.Has("sessionId") || query.Has("podFilePath") {
+		t.Errorf("a failing outcome carried identity fields: %q", gotQuery)
+	}
+}
+
+// Until the API half lands (the next wave of #28 part 1), the route does not
+// exist and the API answers 404. That must surface as a normal error for the
+// caller to log rather than as a silent success — otherwise the outcome would
+// look reported while nothing was recorded, which is exactly the "looks finished,
+// does nothing" shape this burn-down keeps finding.
+func TestPostJobSession_TreatsAMissingRouteAsAnError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"Not found"}`))
+	}))
+	defer server.Close()
+
+	client := apiclient.New(server.URL, "test-token")
+	err := client.PostJobSession(context.Background(), apiclient.SessionArtifact{
+		JobID:   "job-123",
+		Outcome: "collected",
+	}, []byte("jsonl"))
+
+	if err == nil {
+		t.Fatal("expected a 404 to be reported as an error, not swallowed")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Errorf("expected the status in the error, got %q", err)
+	}
+}
