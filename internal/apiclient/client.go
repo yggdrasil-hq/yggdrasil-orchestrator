@@ -414,6 +414,17 @@ type jobEventRequest struct {
 	// Verdict is set for submit_review (ADR 015 item 14-16 / Track B6): the
 	// internal Agentic Review verdict "approved" | "changes_requested".
 	Verdict string `json:"verdict,omitempty"`
+	// Findings is set for submit_review when the reviewing agent listed its
+	// issues per location (issue #73).
+	//
+	// A pointer to a slice, like the CuratedEvent field it comes from, and
+	// `omitempty` so an absent list sends **no key at all**. The API reads
+	// `undefined` as SQL NULL and `[]` as an empty jsonb array, and treats those
+	// as different answers ("prose, count unknowable" versus "structured, none") —
+	// so a plain slice here would make every prose review arrive claiming zero
+	// findings. This is the hop #38 lost its `options` at, one struct after
+	// `Translate` had already been fixed.
+	Findings *[]rpc.ReviewFinding `json:"findings,omitempty"`
 	// ActionItems is set for request_action_item (ADR 015 item 8 / Track B3):
 	// the needed items the blocked implement skill reported, or the batch
 	// returned by submit_adr.
@@ -468,6 +479,7 @@ func (c *Client) PostJobEvent(ctx context.Context, jobID string, event rpc.Curat
 		PRUrl:               event.PRUrl,
 		Summary:             event.Summary,
 		Verdict:             event.Verdict,
+		Findings:            event.Findings,
 		ActionItems:         event.ActionItems,
 		TestName:            event.TestName,
 		TestStatus:          event.TestStatus,
