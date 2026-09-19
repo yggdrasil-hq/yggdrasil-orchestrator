@@ -695,9 +695,103 @@ func (c *Client) PostJobSession(
 	return fmt.Errorf("API returned status %d posting a session for job %s", resp.StatusCode, artifact.JobID)
 }
 
+// ForkPointOutcome is what became of this run's `get_fork_messages` question (ADR
+// 032 item 2), and the API stores it verbatim.
+//
+// **Two values, and neither of them is "there are none".** An unanswered question
+// (`unavailable`) and an answered one with an empty list are different facts — the
+// first means nobody found out, the second means Pi said this session has no
+// previous user messages to fork from. The API's read path turns a *missing* record
+// into a third state (`unknown`) rather than guessing, so a lost post reads as "we
+// were never told" and never as "there are none".
+const (
+	// ForkPointsCaptured — Pi answered, and Points is what it said (possibly empty).
+	ForkPointsCaptured = "captured"
+	// ForkPointsUnavailable — Pi was asked and did not answer: the terminal turn's
+	// read failed or the grace elapsed. Points carries nothing.
+	ForkPointsUnavailable = "unavailable"
+)
+
+// forkPointsRequest is the JSON body of PostJobForkPoints.
+//
+// `points` is omitted entirely for an unanswered question rather than sent as an
+// empty slice, so the payload cannot be misread as "there are none" by a reader
+// that looks at the array before the outcome.
+type forkPointsRequest struct {
+	Outcome string          `json:"outcome"`
+	Points  []rpc.ForkPoint `json:"points,omitempty"`
+}
+
+// PostJobForkPoints reports which previous user messages a finished job's session
+// can be forked from (ADR 032 item 2), which is what makes ADR 032 item 3's
+// non-destructive "resume from here" possible.
+//
+// **A second call, not a field on PostJobSession, and that is forced rather than
+// chosen.** That route's body is the raw JSONL artifact — deliberately, because a
+// session is routinely megabytes and base64-in-JSON would inflate it by a third —
+// so it cannot also carry a structured list, and the list is too large and too
+// variable to ride as a query parameter. The API carries a sibling route for it
+// (`POST /internal/jobs/:jobId/session/fork-points`), and the outcome travels in the
+// body beside the points it describes.
+//
+// **The cost of the split is one failure mode, and it is closed by the outcome.**
+// This call can fail while the session post succeeded, leaving a stored session and
+// no fork-point record — which the API reports as `unknown`, the honest answer, and
+// never as an empty list. A caller must therefore never treat this error as fatal:
+// like every artifact post, it is a side channel, and the run it describes has
+// already decided its own outcome.
+//
+// `points` must be nil for ForkPointsUnavailable and may be empty for
+// ForkPointsCaptured; the API refuses the two mismatches with a 202 and a reason.
+func (c *Client) PostJobForkPoints(
+	ctx context.Context,
+	jobID string,
+	outcome string,
+	points []rpc.ForkPoint,
+) error {
+	body, err := json.Marshal(forkPointsRequest{Outcome: outcome, Points: points})
+	if err != nil {
+		return fmt.Errorf("failed to encode fork points: %w", err)
+	}
+
+	endpoint := fmt.Sprintf(
+		"%s/internal/jobs/%s/session/fork-points",
+		c.baseURL, jobID,
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusCreated {
+		return nil
+	}
+	// 202 is the API's "declined, and here is why" — the same convention
+	// PostJobSession and PostJobRecording read, surfaced verbatim for the same reason:
+	// the reason is what an operator acts on.
+	if resp.StatusCode == http.StatusAccepted {
+		var declined struct {
+			Reason string `json:"reason"`
+		}
+		if decodeErr := json.NewDecoder(resp.Body).Decode(&declined); decodeErr == nil && declined.Reason != "" {
+			return fmt.Errorf("API declined the fork points for job %s: %s", jobID, declined.Reason)
+		}
+		return fmt.Errorf("API declined the fork points for job %s", jobID)
+	}
+	return fmt.Errorf("API returned status %d posting fork points for job %s", resp.StatusCode, jobID)
+}
+
 // PostJobRecording uploads a job's screen recording (ADR 029) as the raw
 // bytes, not as JSON.
-//
+// //
 // Binary rather than base64-in-JSON because a recording is orders of magnitude
 // larger than every other payload this client sends: base64 would inflate it by
 // a third in transit for no benefit, and the API's JSON body parser has a 2 MB

@@ -279,9 +279,13 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 	// driveAgentSession has no seam after its last turn. Empty when Pi reported no
 	// session file, which is `not_collected` rather than a failure (see
 	// collectSession).
-	var sessionFile rpc.SessionFile
+	//
+	// ADR 032 item 2's fork points arrive on the same turn and are held here for the
+	// same reason — plus a stronger one: they can *only* be read while the pod is
+	// alive, so this is not merely the earliest chance to capture them but the last.
+	var terminal terminalCapture
 
-	err = driveAgentSession(ctx, client.Interface, client.Config, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, cfg.replyTimeout(), sessionHandle, fetchStats, reportUsage, &sessionFile)
+	err = driveAgentSession(ctx, client.Interface, client.Config, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, cfg.replyTimeout(), sessionHandle, fetchStats, reportUsage, &terminal)
 
 	// ADR 029: collect the recording now — after the session has ended, but
 	// before this function returns and the deferred DeleteJob above destroys the
@@ -328,12 +332,16 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 			jobID:     job.ID,
 			namespace: namespace,
 			podName:   podName,
-			filePath:  sessionFile.FilePath,
-			sessionID: sessionFile.SessionID,
+			filePath:  terminal.Session.FilePath,
+			sessionID: terminal.Session.SessionID,
 			// Asked=false means the terminal read did not complete, so an empty
 			// filePath is "unknown" rather than "none" (ADR 032 item 5).
-			fileUnknown: !sessionFile.Asked,
-			maxBytes:    cfg.SessionMaxBytes,
+			fileUnknown: !terminal.Session.Asked,
+			// ADR 032 item 2's capture, on the same terms and with its own Asked
+			// flag — an unanswered fork-message question reaching the API as
+			// `unavailable` rather than as an empty list.
+			fork:     terminal.Fork,
+			maxBytes: cfg.SessionMaxBytes,
 		})
 		cancelCollect()
 	}
@@ -627,24 +635,31 @@ func repoLocalDir(repo apiclient.FeatureSpecRepo) string {
 // obtained. See the call site for why the capture is best-effort and why the
 // duration excludes reply waits.
 //
-// sessionOut is how ADR 032 item 1's artifact reaches the caller. The session
-// file *path* is read in the same terminal turn as the accounting, but the
-// *bytes* are read out of the pod after this function has returned (collectSession
-// runs in runAgentRPCJob's window before the deferred DeleteJob), so the path
-// cannot be returned from here. A pointer rather than a return value for the same
-// reason recordingPath is a variable in the caller: the artifact is collected
-// after the session function is done, and this is how the one fact that must
-// survive that boundary does. Nil is accepted and means "the caller does not want
-// it", which keeps the many tests that only care about session control from
-// having to supply a destination.
+// terminalOut is how ADR 032's terminal-turn captures reach the caller — item 1's
+// session file and item 2's fork points. Both are read in the same terminal turn as
+// the accounting, and both are needed *after* this function has returned
+// (collectSession runs in runAgentRPCJob's window before the deferred DeleteJob), so
+// neither can be a return value. A pointer for the same reason recordingPath is a
+// variable in the caller: the artifacts are collected after the session function is
+// done, and this is how the facts that must survive that boundary do. Nil is
+// accepted and means "the caller does not want them", which keeps the many tests
+// that only care about session control from having to supply a destination.
 //
-// The pointed-to struct's **Asked** field is set even when the terminal read
-// fails, and that is the load-bearing half: an unanswered question must not leave
-// the caller unable to tell "no session was written" from "the ask never
-// completed", which is the distinction ADR 032 item 5 turns on. So this
-// initialises it to "not asked" before the call and only the successful path
-// clears it.
+// **One struct rather than a pointer per fact**, because the two always travel
+// together: they come from one turn (Pi's stdin is per-attach, so there is no asking
+// afterwards), they describe one session, and a fourth pointer on an already long
+// parameter list is how a call site ends up passing nil for the one that mattered.
 //
+// Both fields' **Asked** flags are set even when the terminal read fails, and that is
+// the load-bearing half: an unanswered question must not leave the caller unable to
+// tell "there is nothing" from "the ask never completed", which is the distinction
+// ADR 032 item 5 turns on — for the session file *and* for the fork points. So both
+// start at "not asked" and only a successful answer clears it.
+type terminalCapture struct {
+	Session rpc.SessionFile
+	Fork    rpc.ForkMessages
+}
+
 // Each turn is its own k8s.Attach call (runTurn), not one continuous attach
 // for the whole session — see k8s.Attach's doc comment for why: client-go's
 // remotecommand doesn't reliably deliver a second stdin write within one
@@ -671,7 +686,7 @@ func driveAgentSession(
 	handle func(rpc.CuratedEvent),
 	fetchStats sessionStatsFetcher,
 	reportUsage func(rpc.SessionStats, time.Duration),
-	sessionOut *rpc.SessionFile,
+	terminalOut *terminalCapture,
 ) error {
 	rpcClient := rpc.NewClient()
 	defer rpcClient.Close()
@@ -715,18 +730,26 @@ func driveAgentSession(
 			// function returns, because that needs a pod exec and belongs in the
 			// same window as the recording.
 			if report, statsErr := fetchStats(runCtx, rpcClient, namespace, podName); statsErr != nil {
-				// The session file path is *unknown*, not absent — sessionOut keeps
-				// its zero value, whose Asked=false is what makes collectSession
-				// report `unavailable` rather than asserting the run wrote no
-				// session (ADR 032 item 5).
+				// Both captures are *unknown*, not absent — terminalOut keeps its zero
+				// value, whose Asked=false is what makes collectSession report
+				// `unavailable` rather than asserting the run wrote no session, and what
+				// makes the fork points report `unavailable` rather than an empty list
+				// (ADR 032 item 5, for both questions).
 				log.Printf("worker: failed to capture token usage for job %s: %v", jobID, statsErr)
 			} else {
 				reportUsage(report.Stats, turnDuration)
-				if sessionOut != nil {
-					*sessionOut = rpc.SessionFile{
-						FilePath:  report.Session.FilePath,
-						SessionID: report.Session.SessionID,
-						Asked:     true,
+				if terminalOut != nil {
+					*terminalOut = terminalCapture{
+						Session: rpc.SessionFile{
+							FilePath:  report.Session.FilePath,
+							SessionID: report.Session.SessionID,
+							Asked:     true,
+						},
+						// `report.Fork` already carries its own Asked, so an unanswered
+						// fork-message question is indistinguishable here from the stats
+						// failure above — deliberately, because both must reach the API as
+						// `unavailable`.
+						Fork: report.Fork,
 					}
 				}
 			}
