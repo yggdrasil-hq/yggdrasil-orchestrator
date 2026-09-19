@@ -245,7 +245,7 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 		statsCtx context.Context,
 		rpcClient *rpc.Client,
 		statsNamespace, statsPodName string,
-	) (rpc.SessionStats, error) {
+	) (sessionReport, error) {
 		return fetchSessionStats(statsCtx, client.Interface, client.Config, rpcClient, statsNamespace, statsPodName)
 	}
 	reportUsage := func(stats rpc.SessionStats, turnDuration time.Duration) {
@@ -272,7 +272,16 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 		client, namespace, podName, job.ID, string(job.Kind), handle,
 	).observe
 
-	err = driveAgentSession(ctx, client.Interface, client.Config, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, cfg.replyTimeout(), sessionHandle, fetchStats, reportUsage)
+	// ADR 032 item 1: where this run's Pi session file lives, captured off the
+	// terminal turn as it streams past. Held here rather than returned from
+	// driveAgentSession for exactly the reason recordingPath is — the artifact must
+	// be read *before* the deferred DeleteJob below destroys the pod, and
+	// driveAgentSession has no seam after its last turn. Empty when Pi reported no
+	// session file, which is `not_collected` rather than a failure (see
+	// collectSession).
+	var sessionFile rpc.SessionFile
+
+	err = driveAgentSession(ctx, client.Interface, client.Config, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, cfg.replyTimeout(), sessionHandle, fetchStats, reportUsage, &sessionFile)
 
 	// ADR 029: collect the recording now — after the session has ended, but
 	// before this function returns and the deferred DeleteJob above destroys the
@@ -290,6 +299,39 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 			podName:   podName,
 			maxBytes:  cfg.RecordingMaxBytes,
 		}, recordingPath)
+		cancelCollect()
+	}
+
+	// ADR 032 item 1: the Pi session file, on the same terms and in the same
+	// window — after the session has ended, before the deferred DeleteJob destroys
+	// the pod that holds it. `WithoutCancel` for the reason the recording
+	// collection gives.
+	//
+	// **Unlike the two collections above, this one's outcome is used rather than
+	// logged and dropped.** ADR 032 item 5 requires a caller to be able to tell
+	// "this run has no session" from "this run's session could not be retrieved",
+	// and this function is the only place that knows which happened — so the
+	// outcome is reported to the API with every call, including the failing ones
+	// (see collectSession). It still never fails the job: reporting is not failing,
+	// and the run's real outcome was relayed before this ran.
+	//
+	// Not guarded on `sessionFile.FilePath != ""` the way the recording is guarded
+	// on its path: an empty path is one of the outcomes worth *reporting*
+	// (`not_collected`), so the call happens either way and collectSession decides.
+	// A deployment that switched collection off skips this entirely, so it does not
+	// post a per-job record saying so.
+	if cfg.SessionMaxBytes > 0 {
+		collectCtx, cancelCollect := context.WithTimeout(context.WithoutCancel(ctx), sessionCollectTimeout)
+		collectSession(collectCtx, sessionCollection{
+			read:      podFileReaderFrom(client),
+			api:       cfg.APIClient,
+			jobID:     job.ID,
+			namespace: namespace,
+			podName:   podName,
+			filePath:  sessionFile.FilePath,
+			sessionID: sessionFile.SessionID,
+			maxBytes:  cfg.SessionMaxBytes,
+		})
 		cancelCollect()
 	}
 
@@ -582,6 +624,17 @@ func repoLocalDir(repo apiclient.FeatureSpecRepo) string {
 // obtained. See the call site for why the capture is best-effort and why the
 // duration excludes reply waits.
 //
+// sessionOut is how ADR 032 item 1's artifact reaches the caller. The session
+// file *path* is read in the same terminal turn as the accounting, but the
+// *bytes* are read out of the pod after this function has returned (collectSession
+// runs in runAgentRPCJob's window before the deferred DeleteJob), so the path
+// cannot be returned from here. A pointer rather than a return value for the same
+// reason recordingPath is a variable in the caller: the artifact is collected
+// after the session function is done, and this is how the one fact that must
+// survive that boundary does. Nil is accepted and means "the caller does not want
+// it", which keeps the many tests that only care about session control from
+// having to supply a destination.
+//
 // Each turn is its own k8s.Attach call (runTurn), not one continuous attach
 // for the whole session — see k8s.Attach's doc comment for why: client-go's
 // remotecommand doesn't reliably deliver a second stdin write within one
@@ -608,6 +661,7 @@ func driveAgentSession(
 	handle func(rpc.CuratedEvent),
 	fetchStats sessionStatsFetcher,
 	reportUsage func(rpc.SessionStats, time.Duration),
+	sessionOut *rpc.SessionFile,
 ) error {
 	rpcClient := rpc.NewClient()
 	defer rpcClient.Close()
@@ -638,16 +692,25 @@ func driveAgentSession(
 		}
 		handle(curated)
 		if curated.Terminal() {
-			// Last chance to read the session's accounting: the Pi process is
-			// about to be deleted along with its pod (runAgentRPCJob's deferred
-			// DeleteJob), and Pi's stdin is per-attach, so there is no asking
-			// afterwards. Best-effort by design — a job that did its real work
-			// must never be reported as failed because a bookkeeping call
-			// didn't land.
-			if stats, statsErr := fetchStats(runCtx, rpcClient, namespace, podName); statsErr != nil {
+			// Last chance to read the session's accounting and its session file:
+			// the Pi process is about to be deleted along with its pod
+			// (runAgentRPCJob's deferred DeleteJob), and Pi's stdin is
+			// per-attach, so there is no asking afterwards. Best-effort by
+			// design — a job that did its real work must never be reported as
+			// failed because a bookkeeping call didn't land.
+			//
+			// ADR 032 item 1's session file path arrives in this same answer and
+			// is copied out through sessionOut: the *path* is captured here, and
+			// the bytes are read out of the pod by runAgentRPCJob once this
+			// function returns, because that needs a pod exec and belongs in the
+			// same window as the recording.
+			if report, statsErr := fetchStats(runCtx, rpcClient, namespace, podName); statsErr != nil {
 				log.Printf("worker: failed to capture token usage for job %s: %v", jobID, statsErr)
 			} else {
-				reportUsage(stats, turnDuration)
+				reportUsage(report.Stats, turnDuration)
+				if sessionOut != nil {
+					*sessionOut = report.Session
+				}
 			}
 			if curated.Type == rpc.EventRunFailed {
 				// Unlike reportSessionError's EventRunFailed (a dead

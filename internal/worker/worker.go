@@ -150,6 +150,26 @@ type Config struct {
 	// divergent bound is worse than a logged decline.
 	ScreenshotMaxBytes int64
 
+	// SessionMaxBytes bounds the Pi session JSONL the Orchestrator will collect
+	// out of a finished job pod and upload (ADR 032 item 1). A value <= 0 disables
+	// session collection entirely, on the same terms as the two above: it is how a
+	// deployment that does not want sessions stored turns the feature off without
+	// touching the API.
+	//
+	// Same convention, and same reasoning, as RecordingMaxBytes: 0 means "off",
+	// not "use the default", so cmd/server/main.go resolves unset and unparseable
+	// values to DefaultSessionMaxBytes before this struct is built.
+	//
+	// **Deliberately its own number rather than the recording's**, which ADR 032
+	// item 4 calls out: a session is text and far smaller than a video, so
+	// inheriting 25 MB would advertise a ceiling no session reaches and make the
+	// "skipped, too large" path untestable in practice.
+	//
+	// Should agree with the API's SESSION_MAX_BYTES, and is duplicated for the same
+	// reason the other two are: this copy avoids shipping bytes only to be declined,
+	// while the API's is the authoritative one a caller cannot lie its way past.
+	SessionMaxBytes int64
+
 	// APIClient fetches decrypted project secrets at deploy time (ADR 003
 	// §16). Required for `deploy` jobs.
 	APIClient *apiclient.Client
