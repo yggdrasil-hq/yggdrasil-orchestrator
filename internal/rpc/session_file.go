@@ -46,6 +46,22 @@ type SessionFile struct {
 	// strings are still worth carrying when the ask failed — an id Pi reported
 	// before failing is not made useless by the failure.
 	Asked bool
+	// MessageCount is how many messages the active session holds, and it is the
+	// second half of ADR 032 item 3's switch verification.
+	//
+	// **It exists because `switch_session` cannot be trusted to fail.** Pointed at
+	// a path that does not exist, a real Pi 0.84.4 answers
+	// `{"success":true,"cancelled":false}` and leaves the session empty — so
+	// `sessionFile` alone would report the path *asked for* even when nothing was
+	// loaded. A non-zero count is the only signal that says the conversation is
+	// actually there. Both are checked (see the worker's verifySwitch), because
+	// each alone is satisfiable by a state the other rules out.
+	//
+	// Zero is a legitimate value for a session with no messages, which is why it is
+	// an int rather than a pointer: the *pair* of this and FilePath is what carries
+	// the distinction, and a session Pi reports as empty is exactly the case the
+	// verification rejects.
+	MessageCount int
 }
 
 // sessionStateResponse mirrors just enough of Pi's get_state response envelope
@@ -58,8 +74,9 @@ type sessionStateResponse struct {
 	Command string `json:"command"`
 	Success bool   `json:"success"`
 	Data    *struct {
-		SessionFile string `json:"sessionFile"`
-		SessionID   string `json:"sessionId"`
+		SessionFile  string `json:"sessionFile"`
+		SessionID    string `json:"sessionId"`
+		MessageCount int    `json:"messageCount"`
 	} `json:"data"`
 }
 
@@ -87,8 +104,9 @@ func ParseSessionFile(ev Event) (SessionFile, bool) {
 	}
 
 	return SessionFile{
-		FilePath:  parsed.Data.SessionFile,
-		SessionID: parsed.Data.SessionID,
-		Asked:     true,
+		FilePath:     parsed.Data.SessionFile,
+		SessionID:    parsed.Data.SessionID,
+		MessageCount: parsed.Data.MessageCount,
+		Asked:        true,
 	}, true
 }

@@ -10,9 +10,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/yggdrasil-hq/yggdrasil-orchestrator/internal/rpc"
 )
@@ -251,6 +253,23 @@ type SpecGrillContext struct {
 	// mid-conversation with no conclusion, so describing it as a continuation
 	// of a blocked implementation would be actively misleading.
 	RestartFromMessage bool `json:"restartFromMessage,omitempty"`
+	// ForkFromJobID and ForkEntryID mark ADR 032 item 3's "resume from here":
+	// the run is seeded from a *stored Pi session* rather than from a transcript,
+	// and branches at a Pi entry id.
+	//
+	// **Two ids, because neither is derivable from the other.** ForkFromJobID names
+	// the finished job whose session artifact is to be restored — that is where the
+	// bytes come from, and it is a Yggdrasil job id. ForkEntryID is Pi's own entry
+	// id for the branch point, from `get_fork_messages`; the two live in different
+	// id spaces and the ADR's trade-offs say so explicitly (an id *mapping* between
+	// them is exactly what item 2 rejects). Both are required together: a fork with
+	// no entry id has no branch point, and one with no job id has no bytes.
+	//
+	// Present only on a fork. Its absence is what keeps ADR 024's seeded rewind on
+	// its existing path — the two controls are separate gestures and share a job
+	// kind, not an implementation.
+	ForkFromJobID string `json:"forkFromJobId,omitempty"`
+	ForkEntryID   string `json:"forkEntryId,omitempty"`
 }
 
 // FetchDesignSpec fetches the project-scoped payload for a design_grill job.
@@ -444,7 +463,10 @@ type jobEventRequest struct {
 	// than run: "no_script" or "runner_unavailable" (issue #53). The API's schema
 	// is a closed enum over exactly these two values, so this must stay optional —
 	// absent is the pre-existing behaviour for every runner that does not report it.
-	SkipReason       string            `json:"skipReason,omitempty"`
+	SkipReason string `json:"skipReason,omitempty"`
+	// ForkStage is set for fork_failed (ADR 032 item 3): which of the fork's three
+	// steps stopped. A closed set the API validates, sent only on that one event.
+	ForkStage        string            `json:"forkStage,omitempty"`
 	Snapshot         map[string]string `json:"snapshot,omitempty"`
 	HasDesignSurface *bool             `json:"hasDesignSurface,omitempty"`
 	// QuestionHeader / QuestionMultiSelect / QuestionOptions are the structured
@@ -493,6 +515,7 @@ func (c *Client) PostJobEvent(ctx context.Context, jobID string, event rpc.Curat
 		FailingTests:        event.FailingTests,
 		RecordingPath:       event.RecordingPath,
 		SkipReason:          event.SkipReason,
+		ForkStage:           event.ForkStage,
 		Snapshot:            event.Snapshot,
 		HasDesignSurface:    event.HasDesignSurface,
 		QuestionHeader:      event.QuestionHeader,
@@ -1102,3 +1125,59 @@ func (c *Client) FetchProjectResourceQuota(ctx context.Context, projectID string
 	}
 	return &parsed, nil
 }
+
+// FetchJobSession reads back a stored job session's bytes (ADR 032 item 3).
+//
+// **This is the Orchestrator fetching, not the pod.** ADR 032 item 3 decided that
+// the restored session is *written into* the pod rather than pulled by it, and the
+// reasoning is about which process is allowed to talk to the API: a pod clones a
+// user's repository and runs their build code, so giving it an API token — even one
+// scoped to a single session — would add an outbound channel and a third secret to
+// the least-trusted process in the system. This client already holds the internal
+// token and already fetches a job's payload, its secrets and its chart; reading one
+// more artifact through the same path adds nothing to the pod.
+//
+// Returns the raw JSONL, and the status alongside it. The route answers 404 when
+// nothing was stored, when the stored outcome was a failure, or when the object is
+// gone, and 410 when retention reclaimed it — three different facts that the
+// *caller* turns into different refusals rather than flattening into one error,
+// which is why the status is reported rather than mapped to a bare error here.
+func (c *Client) FetchJobSession(ctx context.Context, jobID string) ([]byte, int, error) {
+	endpoint := fmt.Sprintf("%s/internal/jobs/%s/session/content", c.baseURL, jobID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to reach API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		// The body carries the API's own wording ("This session was removed after
+		// its retention window"), which is what a user is shown — so it is read even
+		// on a failure rather than discarded for the status alone.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, resp.StatusCode, fmt.Errorf(
+			"API returned status %d for the session of job %s: %s",
+			resp.StatusCode, jobID, strings.TrimSpace(string(body)),
+		)
+	}
+
+	// Bounded, because a reader must not be where a runaway response is buffered —
+	// and generously, because the API's own cap is the authority on what it stored,
+	// so this is only a guard against an unbounded body rather than a second policy.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxSessionReadBytes))
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("failed to read the session for job %s: %w", jobID, err)
+	}
+	return data, resp.StatusCode, nil
+}
+
+// maxSessionReadBytes bounds what FetchJobSession will buffer. Above the API's
+// default `SESSION_MAX_BYTES` (5 MB) by a wide factor, so a deployment that raised
+// the cap is not silently truncated here.
+const maxSessionReadBytes = 64 << 20

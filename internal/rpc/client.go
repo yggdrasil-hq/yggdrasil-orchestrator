@@ -28,6 +28,15 @@ type Command struct {
 	// StreamingBehavior is required by Pi's `prompt` command if the agent is
 	// already streaming when it's sent — "steer" or "followUp".
 	StreamingBehavior string `json:"streamingBehavior,omitempty"`
+	// SessionPath is switch_session's target (`{"type":"switch_session",
+	// "sessionPath":"…"}`) — the pod-local path of the stored session a fork job
+	// wrote in. Omitted for every other command, which is why it is `omitempty`: a
+	// `prompt` carrying a stray `sessionPath` would be a malformed command.
+	SessionPath string `json:"sessionPath,omitempty"`
+	// EntryID is fork's branch point (`{"type":"fork","entryId":"…"}`), a Pi
+	// session entry id as returned by get_fork_messages — a different id space
+	// from a grill job event id, which is why both are kept (ADR 032's trade-offs).
+	EntryID string `json:"entryId,omitempty"`
 }
 
 // Event is a single JSONL event received from Pi's stdout. Only Type is

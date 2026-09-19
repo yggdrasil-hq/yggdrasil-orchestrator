@@ -106,6 +106,21 @@ const (
 	//
 	// Never terminal: it is context for a reviewer, not a result.
 	EventMergeConflicts CuratedEventType = "merge_conflicts"
+
+	// EventForkFailed is ADR 032 item 3's preamble stopping before the first turn:
+	// the stored session could not be placed in the pod, would not load, or the
+	// chosen entry id was rejected.
+	//
+	// **Its own event type rather than a `run_failed` with a longer message.** A
+	// fork can stop at three different places, and each one asks a different thing
+	// of the operator: a *write* failure means the artifact never reached the
+	// container; a *switch* failure means it arrived and Pi loaded nothing from it;
+	// a *fork* failure means the session was fine and the resume point was not.
+	// Those are three different diagnoses, so they must not arrive as three
+	// sentences of identical shape — the same argument ADR 032 item 5 makes for
+	// `unavailable` versus `not_collected`, applied to dispatch. Terminal: the run
+	// never got as far as an agent turn.
+	EventForkFailed CuratedEventType = "fork_failed"
 )
 
 // CuratedEvent is one product-meaningful event translated from Pi's raw
@@ -171,7 +186,15 @@ type CuratedEvent struct {
 	// review over unverified work. Absent means "the runner did not say", which the
 	// API treats exactly as it did before the field existed.
 	SkipReason string
-	Snapshot   map[string]string
+	// ForkStage is set for EventForkFailed: which of the fork's three steps
+	// stopped ("write" | "switch" | "fork").
+	//
+	// A string rather than an enum shared with the worker: this package is the wire
+	// vocabulary and does not import the worker, and the API validates the closed
+	// set on receipt (the same arrangement `status` and `skipReason` use). Absent on
+	// every other event, which is what `omitempty` on the request field is for.
+	ForkStage string
+	Snapshot  map[string]string
 }
 
 // RequestedActionItem is one item feature_build reported it needs via
