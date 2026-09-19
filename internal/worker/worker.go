@@ -188,6 +188,20 @@ type Config struct {
 	PreviewTTL           time.Duration
 	PreviewSweepInterval time.Duration
 
+	// ReplyTimeout bounds how long one `ask_user` question may go unanswered
+	// before the run is failed (issue #82). Zero or negative takes
+	// `defaultReplyTimeout`.
+	//
+	// **There is deliberately no value that disables it.** `previewTTL`'s "0 means
+	// take the default" shape is followed exactly, and that is the point rather
+	// than an oversight: an unbounded wait is the bug this exists to close, so no
+	// configuration should be able to reproduce it. An install needing a longer
+	// grace period raises this; nothing should need an infinite one.
+	//
+	// It bounds **one wait, not the whole run** — see the wait in
+	// `driveAgentSession` for why that distinction is the substance of the fix.
+	ReplyTimeout time.Duration
+
 	// ImageRegistry is the registry a preview's image is built and pushed to,
 	// from which the preview's Deployment then pulls (ADR 003 §14: "a bundled
 	// registry alongside the bundled k3s cluster").
