@@ -236,6 +236,41 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 
 	initialPrompt := buildInitialPrompt(job.Kind, spec)
 
+	// ADR 032 item 3: "resume from here". A fork job restores a stored Pi session
+	// into the pod and branches it at a chosen entry *before* the first turn, and
+	// then its first prompt is the fork point's own text rather than the usual seed
+	// — because the restored session already carries the context the seed would be
+	// reconstructing, which is the whole difference from ADR 024's rewind.
+	//
+	// Runs after the pod is attachable and before the first turn, so the file is in
+	// place before anything names it and `sessionHandle`/`fetchStats` see a session
+	// that already exists. A refusal is relayed as its own event and then returned as
+	// an error, which is what makes runClaimedJob call q.Fail: the job genuinely did
+	// not do its work, and a fork that could not start has no session of its own to
+	// record either.
+	if spec.SpecContext != nil && spec.SpecContext.ForkFromJobID != "" {
+		forPrompt, refusal, forkErr := setupForkForJob(
+			ctx, client, cfg, namespace, podName, spec.SpecContext,
+		)
+		if forkErr != nil {
+			handle(rpc.CuratedEvent{
+				Type:      rpc.EventForkFailed,
+				ForkStage: string(ForkStageWrite),
+				Message:   fmt.Sprintf("failed to prepare the session to resume from: %v", forkErr),
+			})
+			return forkErr
+		}
+		if refusal != nil {
+			handle(rpc.CuratedEvent{
+				Type:      rpc.EventForkFailed,
+				ForkStage: string(refusal.Stage),
+				Message:   refusal.Reason,
+			})
+			return refusal
+		}
+		initialPrompt = forPrompt
+	}
+
 	// ADR 023: once the run is over, ask Pi for its own token/cost accounting
 	// and hand it to the API. Both halves are side channels — a capture or a
 	// post that fails is logged and dropped, never turned into a job failure —

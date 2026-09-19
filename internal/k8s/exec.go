@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -141,4 +142,105 @@ func ReadPodFile(
 		return nil, fmt.Errorf("read %s: file is empty", path)
 	}
 	return stdout.buf.Bytes(), nil
+}
+
+// WritePodFile writes data to one path inside a running pod's container.
+//
+// **This is the mirror of ReadPodFile, and the same three rules apply.** Its
+// comment explains why the read is an argv slice rather than a shell string, and
+// those reasons are not read-specific:
+//
+//   - **`tee`, never `sh -c 'cat > …'`.** The path comes from a stored artifact's
+//     own report rather than from an agent's tool call, but a path is a path: an
+//     argv slice hands it to `tee` verbatim, whereas a shell string would let a
+//     path containing a quote or a `;` become a *command*. The agent images do
+//     contain a shell (`node:22-slim` is Debian-based), which is exactly why the
+//     shell must not be used — the capability being present is not a reason to
+//     route through it.
+//   - **A bound, checked before the exec.** ReadPodFile bounds what the *pod*
+//     claims a file is, because that size is a claim the Orchestrator cannot
+//     verify. Here the bytes are the Orchestrator's own, so the bound is a
+//     caller-supplied policy cap (ADR 032 item 3 draws it from the API's
+//     `SESSION_MAX_BYTES`) — but it is still enforced, because the alternative is
+//     an unbounded write into a container.
+//   - **The same sentinel split.** A payload over the bound is *expected* and
+//     handled by the caller (skip the fork, report the reason); a pod that cannot
+//     be reached is not. Reusing `errTooLarge`/`ErrPodFileTooLarge` is what keeps
+//     that distinction identical on both sides of the mirror rather than
+//     re-invented per direction.
+//
+// **Why `tee` and not a redirect.** A redirect needs a shell; `tee -- <path>`
+// takes the path as its own argument and copies stdin to it, so the same
+// single-command posture as `cat` is available in the write direction. `tee`
+// writes the file with the container's own permissions, which is what the pod's
+// process needs to read it back.
+//
+// A missing `tee` (a container built `FROM scratch`, which no agent image is)
+// surfaces as an error from the exec itself, exactly as a missing `cat` does for
+// the read.
+func WritePodFile(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	restConfig *rest.Config,
+	namespace, podName, containerName, path string,
+	data []byte,
+	maxBytes int64,
+) error {
+	if path == "" {
+		return fmt.Errorf("no path given")
+	}
+	if maxBytes <= 0 {
+		return fmt.Errorf("maxBytes must be positive (got %d)", maxBytes)
+	}
+	// Checked before the exec rather than streamed and aborted, so an oversized
+	// payload is reported as `errTooLarge` by the same predicate a truncated read
+	// uses — one meaning for "this artifact does not fit", on both sides.
+	if int64(len(data)) > maxBytes {
+		return fmt.Errorf("write %s: %w (limit %d bytes)", path, errTooLarge, maxBytes)
+	}
+	if len(data) == 0 {
+		// Not an error, but refused: writing a zero-byte session file would make
+		// the path exist and Pi's switch-verify would then be deciding about a
+		// file this function invented rather than about a stored artifact. The
+		// caller already refuses empty sessions (`collected` requires bytes), so
+		// this is a belt-and-braces check against a future caller.
+		return fmt.Errorf("write %s: refusing to write an empty session", path)
+	}
+
+	req := clientset.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: containerName,
+			Command:   []string{"tee", "--", path},
+			Stdin:     true,
+			// `tee` echoes what it writes to stdout. Discarded rather than
+			// captured: the payload is already known to the caller, and holding a
+			// copy of a session-sized blob in memory to throw it away is the kind
+			// of cost that only shows up on the runs that matter.
+			Stdout: true,
+			Stderr: true,
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(restConfig, "POST", req.URL())
+	if err != nil {
+		return fmt.Errorf("failed to build exec executor for pod %s/%s: %w", namespace, podName, err)
+	}
+
+	var stderr bytes.Buffer
+	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdin:  bytes.NewReader(data),
+		Stdout: io.Discard,
+		Stderr: &stderr,
+	})
+	if err != nil {
+		if stderr.Len() > 0 {
+			return fmt.Errorf("failed to write %s into pod %s/%s: %w: %s",
+				path, namespace, podName, err, bytes.TrimSpace(stderr.Bytes()))
+		}
+		return fmt.Errorf("failed to write %s into pod %s/%s: %w", path, namespace, podName, err)
+	}
+	return nil
 }
