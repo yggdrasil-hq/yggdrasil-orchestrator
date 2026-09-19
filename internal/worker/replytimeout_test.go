@@ -246,6 +246,60 @@ func TestConfigReplyTimeout_DefaultsWhenUnset(t *testing.T) {
 }
 
 /*
+Issue #96: the API mirrors this bound, so the pairing is pinned from this side too.
+
+`api/src/config.test.ts` declares this repo's default locally and asserts its own
+constant equals it — which catches a change to the **API's** copy. It cannot catch a
+change to **this** default, because that suite cannot read this repo. So the
+mirror-image assertion lives here, following the precedent #63 set for
+`capabilities.DefaultReportInterval` against the API's trust window: whichever repo
+owns one side of a cross-repo pair declares the other's value locally, because
+neither suite can see the other repo.
+
+**What this catches, and what it does not.** It catches a *shipped default or
+variable name* drifting on either side — change one and not the other, and one
+repo's suite goes red naming the other repo, which is the property that makes a
+duplicate safe rather than merely documented. It cannot catch an operator setting
+`GRILL_REPLY_TIMEOUT` on this side only: the API cannot read this process's
+environment, which is why its read exposes `timeoutSource` so a client can hedge a
+countdown that may be an assumption. Both halves are stated here rather than left
+for a reader to assume the assertions prove more — the same honesty the API's own
+module comment applies from the other direction.
+*/
+func TestDefaultReplyTimeout_MatchesTheAPIsMirror(t *testing.T) {
+	// The API's copy, transcribed from `api/src/config.ts`'s
+	// `DEFAULT_GRILL_REPLY_TIMEOUT_MS` — and in the **API's own unit**, so a
+	// mismatch reports as a number to compare rather than as two durations a reader
+	// has to convert in their head.
+	const apiDefaultReplyTimeoutMs = 24 * 60 * 60 * 1000
+
+	if got := defaultReplyTimeout.Milliseconds(); got != apiDefaultReplyTimeoutMs {
+		t.Fatalf(
+			"this default (%s) must equal the API's mirror (%d ms, declared in api/src/config.ts): "+
+				"the API renders a wait countdown from its copy and cannot detect a change to this one",
+			defaultReplyTimeout, apiDefaultReplyTimeoutMs,
+		)
+	}
+}
+
+// The other half of the pairing, and the one a rename would break silently: a
+// different name here would leave a value that is still settable in one `.env` and
+// quietly ignored in the other, which is exactly the "duplicate that cannot be kept
+// in sync" the copy exists to avoid.
+func TestReplyTimeoutEnv_MatchesTheAPIsExpectation(t *testing.T) {
+	// The API's own constant, transcribed from `api/src/config.ts`'s
+	// `GRILL_REPLY_TIMEOUT_ENV` (which asserts its name on that side).
+	const apiReplyTimeoutEnv = "GRILL_REPLY_TIMEOUT"
+
+	if ReplyTimeoutEnv != apiReplyTimeoutEnv {
+		t.Fatalf(
+			"expected the variable name the API reads (%q), got %q — the two files would no longer be settable from one value",
+			apiReplyTimeoutEnv, ReplyTimeoutEnv,
+		)
+	}
+}
+
+/*
 The end-to-end half: a session whose question goes unanswered must **return**, and
 must fail the run with a legible reason.
 
