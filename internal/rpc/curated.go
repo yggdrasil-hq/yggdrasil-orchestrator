@@ -111,14 +111,30 @@ const (
 // CuratedEvent is one product-meaningful event translated from Pi's raw
 // RPC stream (or synthesized locally for EventRunFailed/EventRunCancelled).
 type CuratedEvent struct {
-	Type             CuratedEventType
-	Question         string // set for EventAskUser
-	Markdown         string // set for EventSubmitADR
-	HasDesignSurface *bool  // set when project_init answers the UI question
-	Message          string // set for EventRunFailed/EventRunCancelled/EventAgentText/EventMergeConflicts
-	Status           string // set for EventSubmitBuildResult: "success" | "failure"
-	PRUrl            string // set for EventSubmitBuildResult on success
-	Summary          string // set for EventSubmitBuildResult
+	Type     CuratedEventType
+	Question string // set for EventAskUser
+	// QuestionHeader / QuestionMultiSelect / QuestionOptions are set for
+	// EventAskUser when the agent offered the answer as a choice (issue #38),
+	// and are the *rendering* half of a question that Question already carries as
+	// prose.
+	//
+	// Pointers, not values, and deliberately: a question asked in prose has none of
+	// them, and Go's zero values would make "absent" indistinguishable from
+	// "present and false". That distinction is the whole contract — the API treats
+	// the presence of `options` as "render a picker" and its absence as "render a
+	// text box" — so `MultiSelect bool` would silently turn an explicit
+	// single-select into prose, and `Options []QuestionOption` would make an empty
+	// list look like no list. A `*bool` and a `*[]T` keep all three states distinct
+	// through the JSON round trip.
+	QuestionHeader      string
+	QuestionMultiSelect *bool
+	QuestionOptions     *[]QuestionOption
+	Markdown            string // set for EventSubmitADR
+	HasDesignSurface    *bool  // set when project_init answers the UI question
+	Message             string // set for EventRunFailed/EventRunCancelled/EventAgentText/EventMergeConflicts
+	Status              string // set for EventSubmitBuildResult: "success" | "failure"
+	PRUrl               string // set for EventSubmitBuildResult on success
+	Summary             string // set for EventSubmitBuildResult
 	// Verdict is set for EventSubmitReview: "approved" | "changes_requested".
 	Verdict string
 	// ActionItems is set for submit_adr and request_action_item: the Action
@@ -159,6 +175,18 @@ type RequestedActionItem struct {
 	DraftTestMarkdown string `json:"draftTestMarkdown,omitempty"`
 }
 
+// QuestionOption is one choice offered by a structured `ask_user` question
+// (issue #38).
+//
+// `Description` is optional because it often is — "PostgreSQL" needs no gloss,
+// while "SQLite" is only a real choice once you know it is "simplest for local
+// development". The API normalises an absent description to an explicit null, so
+// a client reads one shape rather than checking for a key per option.
+type QuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
 // Terminal reports whether this event ends the whole job run (ADR 006 item
 // 11): the Orchestrator should stop driving the session and tear the pod
 // down, rather than waiting for more events.
@@ -188,6 +216,19 @@ type contractToolResult struct {
 		Comment          string `json:"comment,omitempty"`
 		// Verdict carries submit_review's "approved" | "changes_requested".
 		Verdict string `json:"verdict,omitempty"`
+		// Header / MultiSelect / Options are the structured half of an ask_user
+		// question (issue #38), as emitted by
+		// `agent-images/extensions/yggdrasil-contract/src/index.ts`.
+		//
+		// `omitempty` on all three matters for the same reason the CuratedEvent
+		// fields are pointers: a prose question sends none of them, and the API
+		// distinguishes the two modes by whether `options` is present at all. A
+		// non-pointer `MultiSelect` with omitempty would drop an explicit `false`,
+		// and without omitempty it would send `false` for a prose question that
+		// never mentioned the field.
+		Header      string            `json:"header,omitempty"`
+		MultiSelect *bool             `json:"multiSelect,omitempty"`
+		Options     *[]QuestionOption `json:"options,omitempty"`
 		// ActionItems carries the needed items for request_action_item.
 		ActionItems     []RequestedActionItem `json:"actionItems,omitempty"`
 		TestName        string                `json:"name,omitempty"`
@@ -360,7 +401,22 @@ func translateToolExecutionEnd(ev Event) (CuratedEvent, bool) {
 
 	switch parsed.Result.Details.Kind {
 	case "ask_user":
-		return CuratedEvent{Type: EventAskUser, Question: parsed.Result.Details.Question}, true
+		// Issue #38: the structured half rides along with the prose question. All
+		// three are passed through as-is rather than normalised here — the API owns
+		// the shape (it rejects options without a header and defaults an absent
+		// multiSelect), and duplicating that policy in the transport would give two
+		// places to disagree about what a valid question is.
+		//
+		// A prose question carries none of them, and because the two structs above
+		// use pointers the absence survives: `nil` here means the tool never offered
+		// choices, which is exactly what the API needs to decide to render text.
+		return CuratedEvent{
+			Type:                EventAskUser,
+			Question:            parsed.Result.Details.Question,
+			QuestionHeader:      parsed.Result.Details.Header,
+			QuestionMultiSelect: parsed.Result.Details.MultiSelect,
+			QuestionOptions:     parsed.Result.Details.Options,
+		}, true
 	case "submit_adr":
 		return CuratedEvent{
 			Type:             EventSubmitADR,
