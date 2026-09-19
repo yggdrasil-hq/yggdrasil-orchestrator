@@ -35,6 +35,17 @@ model key (ADR 004). An indefinitely idle pod holding credentials is a standing
 surface, not only a stranded resource.
 */
 
+// ReplyTimeoutEnv is the environment variable that overrides defaultReplyTimeout.
+//
+// **Exported because the name is half of a cross-repo contract.** The API mirrors
+// this bound (`api/src/config.ts`, `DEFAULT_GRILL_REPLY_TIMEOUT_MS`) because it
+// renders a "waiting 18h" countdown from it, and it reads **the same variable
+// name** on purpose: one value an operator writes must be pasteable into both
+// `.env` files. The API asserts the name it expects (`GRILL_REPLY_TIMEOUT_ENV`);
+// `replytimeout_test.go` asserts this one matches it, so a rename here cannot
+// silently leave the value settable in one file and ignored in the other.
+const ReplyTimeoutEnv = "GRILL_REPLY_TIMEOUT"
+
 // defaultReplyTimeout bounds one unanswered question.
 //
 // **24h, and the number is the point rather than an implementation detail.** The

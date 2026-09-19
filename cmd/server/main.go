@@ -268,8 +268,13 @@ func resolvePreviewSweepInterval() time.Duration {
 // the bug being fixed — so an unparseable value falls back to the default rather
 // than to the pre-#82 behaviour, and an operator who needs longer sets a longer
 // duration. Same reasoning as `resolveCapabilityReportInterval`.
+//
+// The variable's name comes from the worker package rather than a literal here,
+// because the API reads the same name to render its wait countdown (issue #92) and
+// pins its expectation of it. A rename therefore has to be visible on both sides;
+// see `worker.ReplyTimeoutEnv`.
 func resolveReplyTimeout() time.Duration {
-	return resolveDuration("GRILL_REPLY_TIMEOUT")
+	return resolveDuration(worker.ReplyTimeoutEnv)
 }
 
 // resolveCapabilityReportInterval reads CAPABILITY_REPORT_INTERVAL, defaulting to
