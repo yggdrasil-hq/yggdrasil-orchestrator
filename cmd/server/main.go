@@ -83,6 +83,7 @@ func main() {
 		MaxConcurrentPreviews: resolveMaxConcurrentPreviews(),
 		PreviewTTL:            resolvePreviewTTL(),
 		PreviewSweepInterval:  resolvePreviewSweepInterval(),
+		ReplyTimeout:          resolveReplyTimeout(),
 		RecordingMaxBytes:     resolveRecordingMaxBytes(),
 		ScreenshotMaxBytes:    resolveScreenshotMaxBytes(),
 
@@ -254,6 +255,21 @@ func resolveScreenshotMaxBytes() int64 {
 
 func resolvePreviewSweepInterval() time.Duration {
 	return resolveDuration("PREVIEW_SWEEP_INTERVAL")
+}
+
+// resolveReplyTimeout reads GRILL_REPLY_TIMEOUT, the bound on one unanswered
+// `ask_user` question (issue #82). Zero (unset, unparseable, or non-positive) is
+// passed through as "use the worker's default", which is `previewTTL`'s shape and
+// keeps the default in one place — `worker.Config.replyTimeout`.
+//
+// **A typo must not remove the bound**, which is the reason this does not mirror
+// `resolveRecordingMaxBytes`'s "explicit 0 disables" case. There is no useful
+// configuration in which this process should wait *forever* for a human — that is
+// the bug being fixed — so an unparseable value falls back to the default rather
+// than to the pre-#82 behaviour, and an operator who needs longer sets a longer
+// duration. Same reasoning as `resolveCapabilityReportInterval`.
+func resolveReplyTimeout() time.Duration {
+	return resolveDuration("GRILL_REPLY_TIMEOUT")
 }
 
 // resolveCapabilityReportInterval reads CAPABILITY_REPORT_INTERVAL, defaulting to

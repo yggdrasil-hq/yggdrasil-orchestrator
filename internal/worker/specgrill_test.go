@@ -83,6 +83,17 @@ func (blockingReplyWaiter) WaitForReply(ctx context.Context, _ string) (string, 
 	return "", ctx.Err()
 }
 
+// testReplyTimeout is what every `driveAgentSession` call below passes for
+// `replyTimeout` (issue #82).
+//
+// Effectively infinite on purpose: all but one of these cases are testing
+// something *else* — the ask_user pause/resume around a real attached pod, a
+// terminal submit_adr, a mid-turn cancellation — and a reply deadline short
+// enough to fire during them would turn each into a timeout test, failing for a
+// reason unrelated to what it asserts. `TestDriveAgentSession_FailsAnUnansweredQuestion`
+// is the case that exercises the bound, and it passes its own short value.
+const testReplyTimeout = time.Hour
+
 // fixedReplyWaiter simulates a reply that's already sitting there waiting
 // to be claimed: it resolves immediately with a canned value.
 type fixedReplyWaiter struct{ reply string }
@@ -131,7 +142,7 @@ func TestDriveSpecGrillSession_SubmitADREndsSessionAndIsCurated(t *testing.T) {
 	namespace, podName, _ := startAttachablePod(t, ctx, script)
 
 	var received []rpc.CuratedEvent
-	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", testReplyTimeout, func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
 	},
 		noStats, discardUsage)
@@ -167,7 +178,7 @@ func TestDriveAgentSession_SubmitBuildResultSuccessEndsSessionCleanly(t *testing
 	namespace, podName, _ := startAttachablePod(t, ctx, script)
 
 	var received []rpc.CuratedEvent
-	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "Implement this feature: dark mode", func(ev rpc.CuratedEvent) {
+	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "Implement this feature: dark mode", testReplyTimeout, func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
 	},
 		noStats, discardUsage)
@@ -200,7 +211,7 @@ func TestDriveAgentSession_SubmitBuildResultFailureEndsSessionAsError(t *testing
 	namespace, podName, _ := startAttachablePod(t, ctx, script)
 
 	var received []rpc.CuratedEvent
-	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "Implement this feature: dark mode", func(ev rpc.CuratedEvent) {
+	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "Implement this feature: dark mode", testReplyTimeout, func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
 	},
 		noStats, discardUsage)
@@ -237,7 +248,7 @@ func TestDriveSpecGrillSession_AskUserIsNotTerminal(t *testing.T) {
 	var received []rpc.CuratedEvent
 	sessionDone := make(chan error, 1)
 	go func() {
-		sessionDone <- driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+		sessionDone <- driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", testReplyTimeout, func(ev rpc.CuratedEvent) {
 			mu.Lock()
 			received = append(received, ev)
 			mu.Unlock()
@@ -285,7 +296,7 @@ func TestDriveSpecGrillSession_ReplyResumesSessionAndReachesSubmitADR(t *testing
 	namespace, podName, _ := startAttachablePod(t, ctx, script)
 
 	var received []rpc.CuratedEvent
-	err = driveAgentSession(ctx, clientset.Interface, restConfig, fixedReplyWaiter{reply: "use-oauth"}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+	err = driveAgentSession(ctx, clientset.Interface, restConfig, fixedReplyWaiter{reply: "use-oauth"}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", testReplyTimeout, func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
 	},
 		noStats, discardUsage)
@@ -337,7 +348,7 @@ func TestDriveSpecGrillSession_TrailingEventsFromPriorTurnDontFailTheNextOne(t *
 	namespace, podName, _ := startAttachablePod(t, ctx, script)
 
 	var received []rpc.CuratedEvent
-	err = driveAgentSession(ctx, clientset.Interface, restConfig, fixedReplyWaiter{reply: "use-oauth"}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+	err = driveAgentSession(ctx, clientset.Interface, restConfig, fixedReplyWaiter{reply: "use-oauth"}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", testReplyTimeout, func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
 	},
 		noStats, discardUsage)
@@ -400,7 +411,7 @@ func TestDriveSpecGrillSession_TextDeltasAreForwardedLiveThenSupersededByAgentTe
 	namespace, podName, _ := startAttachablePod(t, ctx, script)
 
 	var received []rpc.CuratedEvent
-	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", testReplyTimeout, func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
 	},
 		noStats, discardUsage)
@@ -455,7 +466,7 @@ func TestDriveSpecGrillSession_AgentTextIsForwardedLiveNotTurnEnding(t *testing.
 	namespace, podName, _ := startAttachablePod(t, ctx, script)
 
 	var received []rpc.CuratedEvent
-	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", testReplyTimeout, func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
 	},
 		noStats, discardUsage)
@@ -497,7 +508,7 @@ func TestDriveSpecGrillSession_AttachFailureSurfacesAsRunFailed(t *testing.T) {
 	namespace, podName, _ := startAttachablePod(t, ctx, script)
 
 	var received []rpc.CuratedEvent
-	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, neverCancels{}, namespace, podName, "job-1", "New feature: dark mode", testReplyTimeout, func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
 	},
 		noStats, discardUsage)
@@ -591,7 +602,7 @@ func TestDriveSpecGrillSession_CancellationMidTurnEndsSessionAsCancelled(t *test
 
 	var received []rpc.CuratedEvent
 	start := time.Now()
-	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, delayedCancel{after: 500 * time.Millisecond}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, delayedCancel{after: 500 * time.Millisecond}, namespace, podName, "job-1", "New feature: dark mode", testReplyTimeout, func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
 	},
 		noStats, discardUsage)
@@ -623,7 +634,7 @@ func TestDriveSpecGrillSession_CancellationWhileAwaitingReplyEndsSessionAsCancel
 	namespace, podName, _ := startAttachablePod(t, ctx, script)
 
 	var received []rpc.CuratedEvent
-	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, delayedCancel{after: 500 * time.Millisecond}, namespace, podName, "job-1", "New feature: dark mode", func(ev rpc.CuratedEvent) {
+	err = driveAgentSession(ctx, clientset.Interface, restConfig, blockingReplyWaiter{}, delayedCancel{after: 500 * time.Millisecond}, namespace, podName, "job-1", "New feature: dark mode", testReplyTimeout, func(ev rpc.CuratedEvent) {
 		received = append(received, ev)
 	},
 		noStats, discardUsage)

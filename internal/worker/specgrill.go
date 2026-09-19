@@ -272,7 +272,7 @@ func runAgentRPCJob(ctx context.Context, q *queue.Queue, client *k8s.Client, job
 		client, namespace, podName, job.ID, string(job.Kind), handle,
 	).observe
 
-	err = driveAgentSession(ctx, client.Interface, client.Config, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, sessionHandle, fetchStats, reportUsage)
+	err = driveAgentSession(ctx, client.Interface, client.Config, cfg.Messages, q, namespace, podName, job.ID, initialPrompt, cfg.replyTimeout(), sessionHandle, fetchStats, reportUsage)
 
 	// ADR 029: collect the recording now — after the session has ended, but
 	// before this function returns and the deferred DeleteJob above destroys the
@@ -604,6 +604,7 @@ func driveAgentSession(
 	msgs replyWaiter,
 	cancels cancelWatcher,
 	namespace, podName, jobID, initialPrompt string,
+	replyTimeout time.Duration,
 	handle func(rpc.CuratedEvent),
 	fetchStats sessionStatsFetcher,
 	reportUsage func(rpc.SessionStats, time.Duration),
@@ -668,7 +669,7 @@ func driveAgentSession(
 			return nil
 		}
 
-		reply, err := msgs.WaitForReply(runCtx, jobID)
+		reply, err := waitForReplyOnce(runCtx, msgs, jobID, curated.Question, replyTimeout)
 		if err != nil {
 			return reportSessionError(handle, cancelled.Load(), err)
 		}
